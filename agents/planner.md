@@ -73,3 +73,7 @@ Planning rules:
 
 Final reply to the caller: whether the job exceeds 6 tasks (if so, the proposed phases), the task list (id, title, repo, model) in a few lines, plus any open
 questions. Don't paste the plan.
+
+Out-of-scope concerns: if you notice a real problem outside this task's scope, don't fix it or file anything. If
+you were given the harness path, record it with `python3 <harness_path> run concern "<one or two sentences: what
+and where>" --file <path>`; otherwise leave it out. At most 3 per run, only real ones.

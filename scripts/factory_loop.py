@@ -188,7 +188,8 @@ def run_loop(*, gate: Callable[[], str], fetch_issues: Callable[[], list[dict]],
              run_issue: Callable[[int], int], fetch_labels: Callable[[int], set[str]],
              raise_blocker: Callable[[str, int | None, str], None], log: Callable[[dict], None],
              max_issues: int = 20, should_stop: Callable[[], bool] = lambda: False,
-             land_pr: Callable[[int], str] | None = None) -> dict:
+             land_pr: Callable[[int], str] | None = None,
+             after_issue: Callable[[int], None] | None = None) -> dict:
     """Work the pool one issue at a time until it is empty. Returns {"results": [...], "stopped": reason|None}."""
     results, attempted, stopped = [], set(), None
     for i in fetch_issues():  # a crashed earlier run leaves issues in-progress; never guess, hand them back
@@ -228,5 +229,10 @@ def run_loop(*, gate: Callable[[], str], fetch_issues: Callable[[], list[dict]],
                 if outcome == "blocked":
                     set_state(n, "blocked")
         log({"kind": "harness_finished", "issue": n, "exit": code, "outcome": outcome})
+        if after_issue and outcome in ("awaiting-merge", "merged"):  # the PR exists: re-check what was set aside
+            try:
+                after_issue(n)
+            except Exception as e:  # housekeeping must never stop the factory
+                log({"kind": "after_issue_failed", "issue": n, "error": str(e)[:200]})
         results.append({"issue": n, "outcome": outcome})
     return {"results": results, "stopped": stopped}
