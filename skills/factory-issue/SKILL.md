@@ -32,15 +32,20 @@ changes where humans were involved.
 1. **No grill, no plan checkpoint.** Skip steps 1 and 4 of /ship: the documents were reviewed and answers recorded
    in `.factory/decisions.md` before the issue existed. Treat the plan as approved. Read that decisions file (if it exists; a project
    with no recorded decisions has none) and the issue's linked documents before planning; pass the relevant decisions to the planner and engineers.
-2. **Nobody to ask.** Never use AskUserQuestion. Where /ship says to ask the user or relay `NEEDS USER`, first see
-   whether `.factory/decisions.md` or the issue's documents settle it (quote the line when you use it). If they
-   do, continue. If they don't:
-   - run `H factory block N --situation "<at most 3 sentences>" --need "<one decision or action>"
-     [--option ... --option ... --recommend <k>] --detail "<run dir path or log>"`, then stop. Use `--kind QUESTION`
-     for a product or direction question only the user can settle, `BLOCKER` otherwise.
-   - Do the same, without trying a workaround, for: a dirty tree you didn't create, changed dependencies, gates
-     still failing after the retries /ship allows, an ESCALATE verdict, two failed fix attempts, a command the guard
-     blocked, or any error you can't fix by following /ship.
+2. **Nobody to ask.** Never use AskUserQuestion. Where /ship says to ask the user or relay `NEEDS USER`, send the
+   question to the `question-resolver` agent first (give it the question, issue #N, what was being done and the
+   paths of `.factory/decisions.md` and the issue's linked documents). It ends with one outcome line:
+   - `ANSWERED: ... | SOURCE: ...`: use the answer and quote the source line where you act on it. Continue.
+   - `ASSUMED: ... | WHY: ...`: record it with `H factory decide --question "<q>" --answer "<a>" --by assumed
+     --kind implementation --why "<why>"`, give the answer to whoever asked, and add an `## Assumptions` section
+     with the question and answer to the PR draft (`<run_dir>/pr-<repo>.md`) so it is visible in review. Continue.
+   - `ESCALATE: ...`: run `H factory block N --kind QUESTION --situation "<at most 3 sentences>" --need "<the
+     decision>" --option ... --option ... --recommend <k> --detail "<run dir path>"` using its options, then stop.
+     (Use `--kind BLOCKER` when it is an action, not a decision.)
+   If the resolver itself fails or gives no outcome line, treat it as ESCALATE.
+   Do the same as ESCALATE, without trying a workaround, for: a dirty tree you didn't create, changed
+   dependencies, gates still failing after the retries /ship allows, an ESCALATE verdict, two failed fix attempts,
+   a command the guard blocked, or any error you can't fix by following /ship.
 3. **Finish with a pull request.** When the verdict is DONE and the summary is written. Headless sessions can only
    run a command that matches a pre-approved pattern, and anything else is refused with no one to approve it. So
    **run every step below as its own Bash call: one plain command, no `&&`, `;` or `|`, no `cd`, no `2>&1`, no
