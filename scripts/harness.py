@@ -3795,9 +3795,12 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
                                    "--agent", SELECTOR_AGENT, *claude_args), cwd=str(ROOT), timeout=300)
         return r.stdout
 
+    # A skill's allowed-tools did not cover `git push` in print mode (bashMiss:no-rule-match), a CLI rule does.
+    ISSUE_ALLOWED = ["--allowedTools", "Bash(git push origin *)"]
+
     def run_issue(n):
         with open(sessions / f"issue-{n}-{int(time.time())}.log", "w", encoding="utf-8") as out:
-            return run_factory(str(ROOT), "manager", {}, claude_command("-p", ISSUE_PROMPT.format(n=n), *claude_args), out)
+            return run_factory(str(ROOT), "manager", {}, claude_command("-p", ISSUE_PROMPT.format(n=n), *claude_args, *ISSUE_ALLOWED), out)
 
     summary = fl.run_loop(
         gate=lambda: fl.usage_gate(lambda: usage.check(limits), log=factory_log,
