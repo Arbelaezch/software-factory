@@ -142,15 +142,24 @@ def wait_ci(status: Callable[[], str], sleep: Callable[[float], None] = time.sle
 
 
 def land(n: int, *, wait: Callable[[], str], fix: Callable[[], bool], merge: Callable[[], bool],
-         raise_blocker: Callable[[str, int | None, str], None], log: Callable[[dict], None]) -> str:
-    """Take a finished PR to merged, or to a blocker. Auto-merge policy: wait for CI; on a failure run the fixer
-    once and wait again; merge when green (or when the repo has no CI). Returns "merged" or "blocked"."""
+         raise_blocker: Callable[[str, int | None, str], None], log: Callable[[dict], None],
+         resolve: Callable[[], bool] | None = None) -> str:
+    """Take a finished PR to merged, or to a blocker. Auto-merge policy: wait for CI; a merge conflict goes to the
+    resolver once, a CI failure to the fixer once, each followed by another wait; merge when green (or when the repo
+    has no CI). Returns "merged" or "blocked"."""
     def block(why: str, need: str) -> str:
         raise_blocker(why, n, need)
         log({"kind": "land_blocked", "issue": n, "why": why})
         return "blocked"
 
     s = wait()
+    if s == "conflict" and resolve:
+        log({"kind": "conflict_found", "issue": n})
+        if not resolve():
+            return block("The PR has a merge conflict and the resolver could not push a resolution.",
+                         "Resolve the conflict by hand; the resolver's log is in .factory/sessions.")
+        log({"kind": "conflict_resolved", "issue": n})
+        s = wait()
     if s == "fail":
         log({"kind": "ci_failed", "issue": n})
         if not fix():
@@ -165,7 +174,7 @@ def land(n: int, *, wait: Callable[[], str], fix: Callable[[], bool], merge: Cal
     if s == "closed":
         return block("The PR was closed without merging.", "Reopen it or close the issue.")
     if s == "conflict":
-        return block("The PR has a merge conflict with the base branch.", "Resolve the conflict by hand (an automatic resolver is not built yet).")
+        return block("The PR still has a merge conflict with the base branch.", "Resolve the conflict by hand.")
     if s == "timeout":
         return block("CI did not finish in time.", "Check the PR's checks, then merge by hand or relabel `todo`.")
     if not merge():

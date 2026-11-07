@@ -298,8 +298,11 @@ How it is built (step 5, decided 2026/11/06)
   `Closes #N` and unlocks dependants. Failed CI: switch to the PR branch and start one headless `ci-fixer` session
   (marker role `ci-fixer`, `pr_branch`), which fixes, runs the checks, pushes and writes its diagnosis to
   `.factory/ci-fix-N.md`; the supervisor posts that as the PR comment, then waits for the new commit's checks
-  (results of the old head commit are ignored). A second failure, a merge conflict (until step 7), a closed PR, a CI
-  timeout or a refused merge labels the issue `blocked` and raises a blocker. The loop only calls `land` for
+  (results of the old head commit are ignored). A merge conflict goes the same way (step 7a): one headless `conflict-resolver`
+  session (marker `pr_branch` + `base_branch`) merges `origin/<base>`, keeps both sides' intent, runs the checks, pushes
+  and writes `.factory/conflict-N.md` for the PR comment; the order is conflict, then CI failure, each tried once.
+  A second failure, a conflict that remains, a closed PR, a CI timeout or a refused merge labels the issue `blocked`
+  and raises a blocker. The loop only calls `land` for
   issues that ended `awaiting-merge`, so a manual-policy run is unchanged.
 - Tunables are in `[factory]` in `scripts/defaults.toml` (usage limits, the unknown-reading limit, and the
   `claude_args` passed to each headless session; it defaults to `--permission-mode acceptEdits`).
