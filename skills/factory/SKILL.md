@@ -3,7 +3,7 @@ name: factory
 description: Talk to the software factory in plain language: start work on issues, see where it is, answer what it is blocked on, stop it. A thin front door; the work runs in a detached supervisor, so this session can be cleared or closed at any time.
 argument-hint: "[what you want, e.g. 'work on 12 and 13' | 'status' | 'stop']"
 disable-model-invocation: true
-allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/harness.py *) Bash(tail *) Monitor
+allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/harness.py *) Bash(tail *) Bash(grep *) Monitor
 ---
 
 # /factory: the front door
@@ -45,15 +45,18 @@ If a command fails or prints something unexpected, show the user the message and
 
 ## Watching
 
-When the supervisor is running, watch for events once per conversation:
-`Monitor` on `tail -n 0 -F ${CLAUDE_PROJECT_DIR}/.factory/events.log`. Don't start a second watch, and tell the
-user you are watching. You will be woken when a line arrives. Each line is one short fact:
+When the supervisor is running, watch for events once per conversation. Use exactly this `Monitor` command, which
+passes only the lines that need you (queued / picked / started are left out, so they never wake you):
+`tail -n 0 -F ${CLAUDE_PROJECT_DIR}/.factory/events.log | grep --line-buffered -E "BLOCKER|QUESTION|finished|paused|resumed|unreadable|stopped|orphaned"`
+Don't start a second watch, and tell the user you are watching, in one line. You will be woken when a line
+arrives. Each line is one short fact; answer in one or two sentences and never repeat the line back:
 
-- `picked / started / finished`: stay quiet unless the user asked for updates, or an issue finished
-  `awaiting-merge` (tell them: issue, PR link from `H factory status`).
+- `finished: awaiting-merge`: tell them the issue and the PR link from `H factory status`.
+- `finished: blocked`: say nothing if you already reported its `BLOCKER` / `QUESTION`; otherwise report it.
 - `BLOCKER` / `QUESTION`: tell the user right away, using `H factory status --issue N` for the full message.
 - `paused for plan usage`: one line, with the resume time. It continues by itself.
 - `usage unreadable`, `supervisor stopped`: tell the user what stopped and why, and what they could do.
+- Anything else that gets through: stay quiet.
 
 After an `awaiting-merge` or when the supervisor stops with nothing left to do, suggest `/clear` if this
 conversation has become long; say plainly that nothing is lost.
