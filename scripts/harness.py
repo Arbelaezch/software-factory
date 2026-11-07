@@ -3801,8 +3801,9 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
                                    "--agent", SELECTOR_AGENT, *claude_args), cwd=str(ROOT), timeout=300)
         return r.stdout
 
-    # A skill's allowed-tools did not cover `git push` in print mode (bashMiss:no-rule-match), a CLI rule does.
-    ISSUE_ALLOWED = ["--allowedTools", "Bash(git push origin *)"]
+    # A skill's allowed-tools did not cover `git push` or `gh pr create` in print mode (bashMiss:no-rule-match);
+    # CLI rules do.
+    ISSUE_ALLOWED = ["--allowedTools", "Bash(git push origin *)", "Bash(gh pr create *)"]
 
     def run_issue(n):
         with open(sessions / f"issue-{n}-{int(time.time())}.log", "w", encoding="utf-8") as out:
