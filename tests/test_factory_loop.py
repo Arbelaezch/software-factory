@@ -92,6 +92,78 @@ class GateTests(unittest.TestCase):
         self.assertEqual(out, "go")
 
 
+class CiTests(unittest.TestCase):
+    def test_ci_state(self):
+        run = lambda status, conclusion=None: {"status": status, "conclusion": conclusion}  # noqa: E731
+        self.assertEqual(fl.ci_state(None), "none")
+        self.assertEqual(fl.ci_state([run("COMPLETED", "SUCCESS"), run("COMPLETED", "SKIPPED")]), "pass")
+        self.assertEqual(fl.ci_state([run("COMPLETED", "SUCCESS"), run("IN_PROGRESS")]), "pending")
+        self.assertEqual(fl.ci_state([run("COMPLETED", "FAILURE"), run("COMPLETED", "SUCCESS")]), "fail")
+        self.assertEqual(fl.ci_state([run("COMPLETED", "FAILURE"), run("QUEUED")]), "pending")  # sees every failure
+        self.assertEqual(fl.ci_state([{"state": "SUCCESS"}]), "pass")  # a commit status
+        self.assertEqual(fl.ci_state([{"state": "PENDING"}]), "pending")
+        self.assertEqual(fl.ci_state([{"state": "FAILURE"}]), "fail")
+
+    def test_pr_state_puts_merged_closed_and_conflict_first(self):
+        ok = [{"status": "COMPLETED", "conclusion": "SUCCESS"}]
+        self.assertEqual(fl.pr_state({"state": "MERGED", "statusCheckRollup": ok}), "merged")
+        self.assertEqual(fl.pr_state({"state": "CLOSED"}), "closed")
+        self.assertEqual(fl.pr_state({"state": "OPEN", "mergeable": "CONFLICTING", "statusCheckRollup": ok}), "conflict")
+        self.assertEqual(fl.pr_state({"state": "OPEN", "mergeable": "UNKNOWN", "statusCheckRollup": ok}), "pass")
+
+    def wait(self, states, **kw):
+        it, clock = iter(states), [0.0]
+        def sleep(sec): clock[0] += sec  # noqa: E306
+        return fl.wait_ci(lambda: next(it), sleep=sleep, now=lambda: clock[0], poll=30, **kw), clock[0]
+
+    def test_wait_polls_until_done(self):
+        self.assertEqual(self.wait(["pending", "pending", "pass"]), ("pass", 60))
+
+    def test_no_checks_counts_only_after_the_grace_period(self):
+        self.assertEqual(self.wait(["none"] * 10, grace=90), ("none", 90))
+        self.assertEqual(self.wait(["none", "pending", "pass"], grace=90)[0], "pass")  # workflows registered late
+
+    def test_wait_times_out(self):
+        self.assertEqual(self.wait(["pending"] * 50, timeout=100), ("timeout", 120))
+
+    def land(self, waits, fix=True, merge=True):
+        it, calls = iter(waits), {"fix": 0, "merge": 0, "blockers": [], "log": []}
+        def do_fix(): calls["fix"] += 1; return fix  # noqa: E702, E306
+        def do_merge(): calls["merge"] += 1; return merge  # noqa: E702, E306
+        out = fl.land(5, wait=lambda: next(it), fix=do_fix, merge=do_merge,
+                      raise_blocker=lambda text, n, need: calls["blockers"].append(text), log=calls["log"].append)
+        return out, calls
+
+    def test_green_ci_merges(self):
+        out, c = self.land(["pass"])
+        self.assertEqual((out, c["fix"], c["merge"], c["blockers"]), ("merged", 0, 1, []))
+
+    def test_no_ci_merges(self):
+        self.assertEqual(self.land(["none"])[0], "merged")
+
+    def test_one_failure_is_fixed_once_then_merged(self):
+        out, c = self.land(["fail", "pass"])
+        self.assertEqual((out, c["fix"], c["merge"]), ("merged", 1, 1))
+        self.assertIn("ci_fix_pushed", [e["kind"] for e in c["log"]])
+
+    def test_a_second_failure_blocks_without_merging(self):
+        out, c = self.land(["fail", "fail"])
+        self.assertEqual((out, c["fix"], c["merge"], len(c["blockers"])), ("blocked", 1, 0, 1))
+
+    def test_a_fix_that_cannot_push_blocks(self):
+        out, c = self.land(["fail"], fix=False)
+        self.assertEqual((out, c["merge"], len(c["blockers"])), ("blocked", 0, 1))
+
+    def test_conflict_closed_timeout_and_refused_merge_block(self):
+        for waits, merge in ((["conflict"], True), (["closed"], True), (["timeout"], True), (["pass"], False)):
+            out, c = self.land(waits, merge=merge)
+            self.assertEqual((out, len(c["blockers"])), ("blocked", 1), waits)
+
+    def test_already_merged_is_not_merged_again(self):
+        out, c = self.land(["merged"])
+        self.assertEqual((out, c["merge"]), ("merged", 0))
+
+
 class LoopTests(unittest.TestCase):
     def make(self, issues, outcomes=None, gate=lambda: "go", select=None, **kw):
         labels = {i["number"]: {x["name"] for x in i["labels"]} for i in issues}
@@ -125,6 +197,18 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(result["results"], [{"issue": 2, "outcome": "blocked"}, {"issue": 1, "outcome": "awaiting-merge"}])
         self.assertEqual(calls["blockers"], [])
         self.assertIn(("harness_started"), [e["kind"] for e in calls["log"]])
+
+    def test_auto_merge_lands_awaiting_prs_and_blocks_the_ones_that_fail(self):
+        landed = []
+        result, calls, labels = self.make([issue(1), issue(2)], {1: "awaiting-merge", 2: "awaiting-merge"},
+                                          land_pr=lambda n: landed.append(n) or ("merged" if n == 1 else "blocked"))
+        self.assertEqual(landed, [1, 2])
+        self.assertEqual(result["results"], [{"issue": 1, "outcome": "merged"}, {"issue": 2, "outcome": "blocked"}])
+        self.assertIn((2, "blocked"), calls["states"])
+
+    def test_manual_policy_never_lands(self):
+        result, _, _ = self.make([issue(1)], {1: "awaiting-merge"})
+        self.assertEqual(result["results"], [{"issue": 1, "outcome": "awaiting-merge"}])
 
     def test_session_that_records_nothing_becomes_blocked(self):
         result, calls, labels = self.make([issue(1)])
@@ -184,9 +268,12 @@ class HarnessWiringTests(unittest.TestCase):
             h.cmd_factory_block(a, {})
 
     def test_done_labels_awaiting_merge(self):
+        import tempfile
         a = mock.Mock(issue=7, pr="https://x/pull/9", note=None, repo=None)
         states = []
-        with mock.patch.object(h, "factory_repo", lambda a, c: "o/r"), \
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(h, "ROOT", Path(tmp.name)), mock.patch.object(h, "factory_repo", lambda a, c: "o/r"), \
                 mock.patch.object(h, "set_issue_state", lambda s, n, st: states.append((n, st))), \
                 mock.patch.object(h, "pipeline_gaps", lambda n: []), \
                 mock.patch.object(h, "factory_comment"), mock.patch.object(h, "factory_log"), \
@@ -194,6 +281,7 @@ class HarnessWiringTests(unittest.TestCase):
             h.cmd_factory_done(a, {})
         self.assertEqual(states, [(7, "awaiting-merge")])
         self.assertIn("[DONE]", out.getvalue())
+        self.assertEqual(json.loads((Path(tmp.name) / ".factory" / "prs.json").read_text()), {"7": "https://x/pull/9"})
 
     def test_done_is_refused_when_the_run_skipped_plan_and_review(self):
         import tempfile
@@ -268,9 +356,6 @@ class HarnessWiringTests(unittest.TestCase):
         self.assertEqual([e for e in events if e in ("issue_picked", "harness_started", "harness_finished")],
                          ["issue_picked", "harness_started", "harness_finished"])
 
-    def test_auto_merge_is_not_built_yet(self):
-        with self.assertRaises(SystemExit):
-            h.cmd_factory_run(mock.Mock(merge="auto"), {})
 
 
 class FrontDoorTests(unittest.TestCase):

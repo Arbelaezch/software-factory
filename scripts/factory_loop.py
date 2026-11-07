@@ -90,11 +90,96 @@ def usage_gate(check: Callable[[], dict], sleep: Callable[[float], None] = time.
         sleep(retry_wait)
 
 
+FAIL_CONCLUSIONS = {"FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE", "ACTION_REQUIRED", "ERROR"}
+
+
+def ci_state(rollup: list[dict] | None) -> str:
+    """One word for a PR's checks (the `statusCheckRollup` of `gh pr view`): none, pending, fail or pass.
+    Pending wins over fail, so the fixer sees every failure at once."""
+    if not rollup:
+        return "none"
+    pending = failed = False
+    for c in rollup:
+        if "status" in c:  # a check run
+            if c.get("status") != "COMPLETED":
+                pending = True
+            elif str(c.get("conclusion", "")).upper() in FAIL_CONCLUSIONS:
+                failed = True
+        else:  # a commit status
+            st = str(c.get("state", "")).upper()
+            pending |= st in ("PENDING", "EXPECTED", "")
+            failed |= st in FAIL_CONCLUSIONS
+    return "pending" if pending else "fail" if failed else "pass"
+
+
+def pr_state(view: dict) -> str:
+    """merged, closed, conflict, or the checks' state, from `gh pr view --json state,mergeable,statusCheckRollup`."""
+    state = str(view.get("state", "")).upper()
+    if state == "MERGED":
+        return "merged"
+    if state == "CLOSED":
+        return "closed"
+    if str(view.get("mergeable", "")).upper() == "CONFLICTING":
+        return "conflict"
+    return ci_state(view.get("statusCheckRollup"))
+
+
+def wait_ci(status: Callable[[], str], sleep: Callable[[float], None] = time.sleep,
+            now: Callable[[], float] = time.time, poll: float = 30, timeout: float = 1800, grace: float = 90) -> str:
+    """Poll until the PR is no longer pending. "none" (no checks at all) only counts after `grace` seconds, since
+    workflows take a moment to register. Returns merged, closed, conflict, pass, fail, none or timeout."""
+    start = now()
+    while True:
+        s = status()
+        if s in ("merged", "closed", "conflict", "pass", "fail"):
+            return s
+        waited = now() - start
+        if s == "none" and waited >= grace:
+            return "none"
+        if waited >= timeout:
+            return "timeout"
+        sleep(poll)
+
+
+def land(n: int, *, wait: Callable[[], str], fix: Callable[[], bool], merge: Callable[[], bool],
+         raise_blocker: Callable[[str, int | None, str], None], log: Callable[[dict], None]) -> str:
+    """Take a finished PR to merged, or to a blocker. Auto-merge policy: wait for CI; on a failure run the fixer
+    once and wait again; merge when green (or when the repo has no CI). Returns "merged" or "blocked"."""
+    def block(why: str, need: str) -> str:
+        raise_blocker(why, n, need)
+        log({"kind": "land_blocked", "issue": n, "why": why})
+        return "blocked"
+
+    s = wait()
+    if s == "fail":
+        log({"kind": "ci_failed", "issue": n})
+        if not fix():
+            return block("CI failed and the fixer could not push a fix.", "Look at the PR's checks and the ci-fix log.")
+        log({"kind": "ci_fix_pushed", "issue": n})
+        s = wait()
+        if s == "fail":
+            return block("CI failed again after the one fix attempt.", "Read the fixer's PR comment and the failing check, then fix by hand or relabel `todo`.")
+    if s == "merged":
+        log({"kind": "merged", "issue": n})
+        return "merged"
+    if s == "closed":
+        return block("The PR was closed without merging.", "Reopen it or close the issue.")
+    if s == "conflict":
+        return block("The PR has a merge conflict with the base branch.", "Resolve the conflict by hand (an automatic resolver is not built yet).")
+    if s == "timeout":
+        return block("CI did not finish in time.", "Check the PR's checks, then merge by hand or relabel `todo`.")
+    if not merge():
+        return block("The PR could not be merged (branch protection or a required review?).", "Merge it by hand.")
+    log({"kind": "merged", "issue": n, "ci": s})
+    return "merged"
+
+
 def run_loop(*, gate: Callable[[], str], fetch_issues: Callable[[], list[dict]],
              select: Callable[[list[dict]], tuple[int, str]], set_state: Callable[[int, str], None],
              run_issue: Callable[[int], int], fetch_labels: Callable[[int], set[str]],
              raise_blocker: Callable[[str, int | None, str], None], log: Callable[[dict], None],
-             max_issues: int = 20, should_stop: Callable[[], bool] = lambda: False) -> dict:
+             max_issues: int = 20, should_stop: Callable[[], bool] = lambda: False,
+             land_pr: Callable[[int], str] | None = None) -> dict:
     """Work the pool one issue at a time until it is empty. Returns {"results": [...], "stopped": reason|None}."""
     results, attempted, stopped = [], set(), None
     for i in fetch_issues():  # a crashed earlier run leaves issues in-progress; never guess, hand them back
@@ -129,6 +214,10 @@ def run_loop(*, gate: Callable[[], str], fetch_issues: Callable[[], list[dict]],
             outcome = "blocked"
         else:
             outcome = next((s for s in STATE_LABELS if s in labels), "closed")
+            if outcome == "awaiting-merge" and land_pr:  # merge policy auto
+                outcome = land_pr(n)
+                if outcome == "blocked":
+                    set_state(n, "blocked")
         log({"kind": "harness_finished", "issue": n, "exit": code, "outcome": outcome})
         results.append({"issue": n, "outcome": outcome})
     return {"results": results, "stopped": stopped}
