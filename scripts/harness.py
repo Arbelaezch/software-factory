@@ -3804,7 +3804,7 @@ def cmd_factory_run(a, cfg):
     fl, usage = factory_modules()
     slug = factory_repo(a, cfg)
     fc = cfg.get("factory") or {}
-    a.merge = a.merge or fc.get("merge", "manual")
+    a.merge = a.merge or fc.get("merge", "auto")
 
     def fetch():
         return gh_json("issue", "list", "--repo", slug, "--state", "all", "--limit", "500",
@@ -4215,14 +4215,14 @@ def main(argv=None):
     f = fsub.add_parser("run", help="run the factory loop: one fresh headless session per issue")
     f.add_argument("--issues", type=lambda t: [int(x) for x in t.split(",") if x], help="comma-separated; queued as `todo` first")
     f.add_argument("--max-issues", type=int, default=20)
-    f.add_argument("--merge", choices=["manual", "auto"], help="auto: wait for CI and squash-merge (default: [factory] merge, else manual)")
+    f.add_argument("--merge", choices=["manual", "auto"], help="auto (default): wait for CI and squash-merge; manual: stop at awaiting-merge. Default is [factory] merge")
     f.add_argument("--dry-run", action="store_true", help="only show what could run")
     f.add_argument("--repo")
     f.set_defaults(fn=cmd_factory_run)
     f = fsub.add_parser("start", help="start the factory loop detached and return (what /factory uses)")
     f.add_argument("--issues", type=lambda t: [int(x) for x in t.split(",") if x])
     f.add_argument("--max-issues", type=int, default=20)
-    f.add_argument("--merge", choices=["manual", "auto"], help="auto: wait for CI and squash-merge each PR when green")
+    f.add_argument("--merge", choices=["manual", "auto"], help="auto (default): wait for CI and squash-merge each PR when green; manual: leave PRs for the user")
     f.add_argument("--repo")
     f.set_defaults(fn=cmd_factory_start)
     f = fsub.add_parser("stop", help="stop the detached loop after the current issue (--now: immediately)")
