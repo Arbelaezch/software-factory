@@ -3583,8 +3583,28 @@ def cmd_factory_block(a, cfg):
     factory_raise_blocker(cfg, slug, a.kind, a.issue, a.situation, a.need or "", a.option, a.recommend, a.detail or "")
 
 
+def pipeline_gaps(n: int) -> list[str]:
+    """What the newest run for issue n is missing that a real /ship pipeline leaves behind (plan and review)."""
+    runs = sorted((d for d in RUNS_DIR.glob("*") if (d / "run.json").is_file()), reverse=True)
+    for d in runs:
+        run = read_json(d / "run.json", {}) or {}
+        if (run.get("issue") or {}).get("number") == n:
+            gaps = []
+            if not (d / "tasks.json").is_file():
+                gaps.append("no plan (tasks.json): scout, plan and engineer stages did not run")
+            if int(run.get("review_rounds") or 0) < 1:
+                gaps.append("no review round")
+            return gaps
+    return [f"no harness run found for issue #{n}"]
+
+
 def cmd_factory_done(a, cfg):
-    """Called by a factory session whose PR is open: label the issue awaiting-merge and say so."""
+    """Called by a factory session whose PR is open: label the issue awaiting-merge and say so. Refused when the
+    run skipped the pipeline (plan, engineers, review), so a session can't take a shortcut and still report done."""
+    gaps = pipeline_gaps(a.issue)
+    if gaps:
+        sys.exit(f"Refusing `factory done {a.issue}`: " + "; ".join(gaps) + ". Run the full /ship pipeline for it "
+                 "(never write the code yourself), or record the problem with `factory block`.")
     slug = factory_repo(a, cfg)
     set_issue_state(slug, a.issue, "awaiting-merge")
     factory_raise_blocker(cfg, slug, "DONE", a.issue, a.note or f"The PR is open: {a.pr}", "", detail=a.pr)
