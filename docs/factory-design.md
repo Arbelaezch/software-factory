@@ -164,6 +164,11 @@ is narrow: the vision stays mine.
 Each project needs a vision source (a section in the MVP doc or a `VISION.md`). `question-resolver`
 treats it as authoritative for product questions.
 
+How it is wired (step 7b): `/factory-issue` sends every question that /ship would ask the user to the
+`question-resolver` agent (opus, read-only) first. `answered` continues with the quoted source; `assumed` is recorded
+with `factory decide --by assumed` and listed under `## Assumptions` in the PR description; `escalate` becomes
+`factory block --kind QUESTION` with the resolver's options. A missing or malformed outcome counts as escalate.
+
 ## 7. Talking to me
 
 All messages from the factory to me pass through `human-liaison`: questions, blockers, usage
