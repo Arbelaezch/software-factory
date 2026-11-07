@@ -3547,12 +3547,19 @@ def cmd_factory_pool(a, cfg):
     print(json.dumps(pool, indent=2))
 
 
+def queue_issue(slug: str, n: int) -> None:
+    """Label an issue `todo`; log it as queued only if it wasn't already (queue then start would say it twice)."""
+    already = "todo" in issue_labels(slug, n)
+    set_issue_state(slug, n, "todo")
+    if not already:
+        factory_log({"kind": "queued", "issue": n})
+
+
 def cmd_factory_queue(a, cfg):
     """The user names the issues to work on: label them `todo`."""
     slug = factory_repo(a, cfg)
     for n in a.numbers:
-        set_issue_state(slug, n, "todo")
-        factory_log({"kind": "queued", "issue": n})
+        queue_issue(slug, n)
         print(f"#{n} is in the pool")
 
 
@@ -3771,8 +3778,7 @@ def cmd_factory_run(a, cfg):
     try:
         ensure_labels(slug, set(FACTORY_LABELS))
         for n in a.issues or []:
-            set_issue_state(slug, n, "todo")
-            factory_log({"kind": "queued", "issue": n})
+            queue_issue(slug, n)
         summary = run_factory_loop(a, cfg, fl, usage, fc, slug, fetch)
         why = summary["stopped"] or "pool empty"
     finally:
