@@ -289,7 +289,8 @@ How it is built (step 5, decided 2026/11/06)
   event to `.factory/events.log`; the manager watches it with the Monitor tool and relays blockers and questions.
   `stop` finishes the current issue first; `stop --now` signals the supervisor, and the interrupted issue becomes
   `blocked` at the next start. Typing `harness factory run` directly still works but is not the intended path.
-- Merge policy is `--merge manual|auto` (`factory start`/`run`; default `[factory] merge`, which is `manual`). With
+- Merge policy is `--merge auto|manual` (`factory start`/`run`; default `[factory] merge`, which is `auto`: using the
+  factory means hands off; `/ship` on its own always leaves the merge to me). With
   `manual` the issue stops at `awaiting-merge` and I merge. With `auto` the supervisor itself (no tokens) lands each
   PR (step 6, decided 2026/11/07): `factory done` records the PR URL in `.factory/prs.json`; the supervisor polls
   `gh pr view` (checks, mergeable) every `ci_poll` seconds up to `ci_timeout`; "no checks" counts as no CI only

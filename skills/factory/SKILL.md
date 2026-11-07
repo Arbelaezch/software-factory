@@ -24,9 +24,9 @@ Event stream: `${CLAUDE_PROJECT_DIR}/.factory/events.log`
 
 - **"work on 12 and 13"** (or one issue, or "everything queued"): `H factory start --issues 12,13` (omit
   `--issues` to run whatever is already labelled `todo`). It returns at once. Then start watching (below).
-  Only issues the user names are queued; never queue others yourself. Add `--merge auto` only when the user
-  asks for the PRs to be merged for them ("and merge", "merge when green", "hands off"): the factory then
-  waits for CI, makes one fix attempt if it fails, and squash-merges. Otherwise PRs wait for the user.
+  Only issues the user names are queued; never queue others yourself. PRs merge themselves by default: the
+  factory waits for CI, makes one fix attempt if it fails, and squash-merges. Add `--merge manual` only when the user
+  wants to review and merge the PRs themselves ("let me merge", "don't merge", "I'll review").
 - **"status" / "where are we" / "what is it doing"**: `H factory status`. Summarise in a few lines: running or
   not, the current issue and its stage, what is blocked, what awaits merge. If the supervisor is running and you
   aren't watching yet, start watching.
