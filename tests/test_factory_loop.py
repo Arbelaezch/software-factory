@@ -126,13 +126,27 @@ class CiTests(unittest.TestCase):
     def test_wait_times_out(self):
         self.assertEqual(self.wait(["pending"] * 50, timeout=100), ("timeout", 120))
 
-    def land(self, waits, fix=True, merge=True):
-        it, calls = iter(waits), {"fix": 0, "merge": 0, "blockers": [], "log": []}
+    def land(self, waits, fix=True, merge=True, resolve=None):
+        it, calls = iter(waits), {"fix": 0, "merge": 0, "resolve": 0, "blockers": [], "log": []}
         def do_fix(): calls["fix"] += 1; return fix  # noqa: E702, E306
         def do_merge(): calls["merge"] += 1; return merge  # noqa: E702, E306
+        def do_resolve(): calls["resolve"] += 1; return resolve  # noqa: E702, E306
         out = fl.land(5, wait=lambda: next(it), fix=do_fix, merge=do_merge,
+                      resolve=None if resolve is None else do_resolve,
                       raise_blocker=lambda text, n, need: calls["blockers"].append(text), log=calls["log"].append)
         return out, calls
+
+    def test_a_conflict_is_resolved_once_then_ci_decides(self):
+        out, c = self.land(["conflict", "pass"], resolve=True)
+        self.assertEqual((out, c["resolve"], c["merge"]), ("merged", 1, 1))
+        out, c = self.land(["conflict", "fail", "pass"], resolve=True)  # then CI fails on the merged code: fixer runs
+        self.assertEqual((out, c["resolve"], c["fix"], c["merge"]), ("merged", 1, 1, 1))
+
+    def test_a_conflict_that_remains_or_cannot_be_pushed_blocks(self):
+        out, c = self.land(["conflict", "conflict"], resolve=True)
+        self.assertEqual((out, c["resolve"], c["merge"], len(c["blockers"])), ("blocked", 1, 0, 1))
+        out, c = self.land(["conflict"], resolve=False)
+        self.assertEqual((out, c["merge"], len(c["blockers"])), ("blocked", 0, 1))
 
     def test_green_ci_merges(self):
         out, c = self.land(["pass"])

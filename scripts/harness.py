@@ -3399,6 +3399,8 @@ def event_line(e: dict) -> str | None:
         "queued": lambda: f"#{n} queued",
         "ci_failed": lambda: f"#{n} CI failed; trying one fix",
         "ci_fix_pushed": lambda: f"#{n} fix pushed; waiting for CI again",
+        "conflict_found": lambda: f"#{n} has a merge conflict; trying to resolve it",
+        "conflict_resolved": lambda: f"#{n} conflict resolved; waiting for CI again",
         "supervisor_started": lambda: "supervisor started",
         "supervisor_stopped": lambda: f"supervisor stopped ({e.get('why')})",
     }.get(k, lambda: None)()
@@ -3800,6 +3802,16 @@ CI_FIX_PROMPT = """CI failed on {pr} (branch {branch}). You are the ci-fixer: fo
 attempt, push it, and write your diagnosis and what you changed to {note}. If you cannot fix it, write why to that file and do not push."""
 
 
+CONFLICT_RESOLVER_AGENT = "harness:conflict-resolver"
+CONFLICT_ALLOWED = ["--allowedTools", "Bash(git fetch origin *)", "Bash(git merge origin/*)", "Bash(git merge --abort)",
+                    "Bash(git push origin *)", "Bash(git add *)", "Bash(git commit -F *)", "Bash(git status *)",
+                    "Bash(git diff *)", "Bash(git log *)", "Bash(python3 *harness.py *)"]
+CONFLICT_PROMPT = """{pr} (branch {branch}) has a merge conflict with {base}. You are the conflict-resolver: follow your agent \
+instructions. Merge origin/{base} into the branch, resolve the conflict keeping both sides' intent, run the checks, push, \
+and write what you resolved and how to {note}. If you cannot resolve it safely, run `git merge --abort`, write why to \
+that file and do not push."""
+
+
 def cmd_factory_run(a, cfg):
     fl, usage = factory_modules()
     slug = factory_repo(a, cfg)
@@ -3856,7 +3868,7 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
               "grace": float(fc.get("ci_grace", 90))}
 
         def view(url):
-            return gh_json("pr", "view", url, "--json", "state,mergeable,statusCheckRollup,headRefName,headRefOid") or {}
+            return gh_json("pr", "view", url, "--json", "state,mergeable,statusCheckRollup,headRefName,headRefOid,baseRefName") or {}
 
         def land_pr(n):
             url = (read_json(ROOT / ".factory" / "prs.json", {}) or {}).get(str(n))
@@ -3874,27 +3886,35 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
                     return "pending"  # still the old commit's results
                 return fl.pr_state(v)
 
-            def fix():
+            def worker(kind, role, agent, allowed, prompt_tpl):
+                """One fixer-style session on the PR branch. True when it pushed a new head commit."""
                 v = view(url)
                 branch = v.get("headRefName")
                 if not branch or run_cmd(["git", "-C", str(ROOT), "switch", branch]).returncode != 0:
                     return False
                 fixed["stale_sha"] = v.get("headRefOid")
-                note = ROOT / ".factory" / f"ci-fix-{n}.md"
+                note = ROOT / ".factory" / f"{kind}-{n}.md"
                 note.unlink(missing_ok=True)
-                prompt = CI_FIX_PROMPT.format(pr=url, branch=branch, note=note)
-                with open(sessions / f"ci-fix-{n}-{int(time.time())}.log", "w", encoding="utf-8") as out:
-                    run_factory(str(ROOT), "ci-fixer", {"pr_branch": branch},
-                                claude_command("-p", prompt, "--agent", CI_FIXER_AGENT, *claude_args, *CI_FIX_ALLOWED), out)
-                if note.is_file():  # the worker can't comment (guard); the supervisor posts its diagnosis
+                base = v.get("baseRefName") or "main"
+                prompt = prompt_tpl.format(pr=url, branch=branch, base=base, note=note)
+                fields = {"pr_branch": branch, **({"base_branch": base} if role == "conflict-resolver" else {})}
+                with open(sessions / f"{kind}-{n}-{int(time.time())}.log", "w", encoding="utf-8") as out:
+                    run_factory(str(ROOT), role, fields, claude_command("-p", prompt, "--agent", agent, *claude_args, *allowed), out)
+                if note.is_file():  # the worker can't comment (guard); the supervisor posts its note
                     try:
                         gh("pr", "comment", url, "--body-file", str(note))
                     except RuntimeError as e:
-                        factory_log({"kind": "ci_fix_comment_failed", "issue": n, "error": str(e)[:200]})
+                        factory_log({"kind": f"{kind}_comment_failed", "issue": n, "error": str(e)[:200]})
                 pushed = view(url).get("headRefOid") != fixed["stale_sha"]
                 if not pushed:
                     fixed["stale_sha"] = None
                 return pushed
+
+            def fix():
+                return worker("ci-fix", "ci-fixer", CI_FIXER_AGENT, CI_FIX_ALLOWED, CI_FIX_PROMPT)
+
+            def resolve():
+                return worker("conflict", "conflict-resolver", CONFLICT_RESOLVER_AGENT, CONFLICT_ALLOWED, CONFLICT_PROMPT)
 
             def merge():
                 try:
@@ -3906,7 +3926,7 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
 
             return fl.land(
                 n, wait=lambda: fl.wait_ci(status, poll=ci["poll"], timeout=ci["timeout"], grace=ci["grace"]),
-                fix=fix, merge=merge,
+                fix=fix, resolve=resolve, merge=merge,
                 raise_blocker=lambda text, issue, need: factory_raise_blocker(cfg, slug, "BLOCKER", issue, text, need, detail=url),
                 log=factory_log)
         return land_pr
