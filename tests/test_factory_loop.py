@@ -1,6 +1,7 @@
 import contextlib
 import importlib.util
 import io
+import json
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -187,11 +188,31 @@ class HarnessWiringTests(unittest.TestCase):
         states = []
         with mock.patch.object(h, "factory_repo", lambda a, c: "o/r"), \
                 mock.patch.object(h, "set_issue_state", lambda s, n, st: states.append((n, st))), \
+                mock.patch.object(h, "pipeline_gaps", lambda n: []), \
                 mock.patch.object(h, "factory_comment"), mock.patch.object(h, "factory_log"), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             h.cmd_factory_done(a, {})
         self.assertEqual(states, [(7, "awaiting-merge")])
         self.assertIn("[DONE]", out.getvalue())
+
+    def test_done_is_refused_when_the_run_skipped_plan_and_review(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp)
+            for name, issue, extra in (("20260101-a", 7, {}), ("20260102-b", 8, {})):
+                d = runs / name
+                d.mkdir()
+                (d / "run.json").write_text(json.dumps({"issue": {"number": issue}, **extra}))
+            with mock.patch.object(h, "RUNS_DIR", runs):
+                self.assertEqual(len(h.pipeline_gaps(7)), 2)  # no tasks.json, no review round
+                self.assertIn("no harness run", h.pipeline_gaps(9)[0])
+                (runs / "20260101-a" / "tasks.json").write_text("{}")
+                (runs / "20260101-a" / "run.json").write_text(json.dumps({"issue": {"number": 7}, "review_rounds": 1}))
+                self.assertEqual(h.pipeline_gaps(7), [])
+                a = mock.Mock(issue=8, pr="x", note=None, repo=None)
+                with self.assertRaises(SystemExit) as cm:
+                    h.cmd_factory_done(a, {})
+                self.assertIn("Refusing", str(cm.exception))
 
     def test_run_starts_a_fresh_marked_session_per_issue(self):
         import json
