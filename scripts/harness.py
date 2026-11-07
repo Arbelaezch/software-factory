@@ -3397,6 +3397,8 @@ def event_line(e: dict) -> str | None:
         "usage_unknown": lambda: f"usage unreadable ({e.get('count')} in a row)",
         "orphan_blocked": lambda: f"#{n} was in progress when the factory stopped: blocked",
         "queued": lambda: f"#{n} queued",
+        "ci_failed": lambda: f"#{n} CI failed; trying one fix",
+        "ci_fix_pushed": lambda: f"#{n} fix pushed; waiting for CI again",
         "supervisor_started": lambda: "supervisor started",
         "supervisor_stopped": lambda: f"supervisor stopped ({e.get('why')})",
     }.get(k, lambda: None)()
@@ -3583,6 +3585,15 @@ def cmd_factory_block(a, cfg):
     factory_raise_blocker(cfg, slug, a.kind, a.issue, a.situation, a.need or "", a.option, a.recommend, a.detail or "")
 
 
+def record_pr(n: int, url: str | None) -> None:
+    """Remember an issue's PR URL in .factory/prs.json, so the supervisor can wait on and merge it."""
+    f = ROOT / ".factory" / "prs.json"
+    prs = read_json(f, {}) or {}
+    prs[str(n)] = url
+    f.parent.mkdir(exist_ok=True)
+    write_json(f, prs)
+
+
 def pipeline_gaps(n: int) -> list[str]:
     """What the newest run for issue n is missing that a real /ship pipeline leaves behind (plan and review)."""
     runs = sorted((d for d in RUNS_DIR.glob("*") if (d / "run.json").is_file()), reverse=True)
@@ -3606,6 +3617,7 @@ def cmd_factory_done(a, cfg):
         sys.exit(f"Refusing `factory done {a.issue}`: " + "; ".join(gaps) + ". Run the full /ship pipeline for it "
                  "(never write the code yourself), or record the problem with `factory block`.")
     slug = factory_repo(a, cfg)
+    record_pr(a.issue, a.pr)
     set_issue_state(slug, a.issue, "awaiting-merge")
     factory_raise_blocker(cfg, slug, "DONE", a.issue, a.note or f"The PR is open: {a.pr}", "", detail=a.pr)
 
@@ -3652,6 +3664,8 @@ def cmd_factory_start(a, cfg):
         cmd += ["--issues", ",".join(map(str, a.issues))]
     if a.repo:
         cmd += ["--repo", a.repo]
+    if a.merge:
+        cmd += ["--merge", a.merge]
     if shutil.which("caffeinate"):
         cmd = ["caffeinate", "-i", *cmd]
     with open(d / "supervisor.log", "a", encoding="utf-8") as out:
@@ -3778,12 +3792,19 @@ def read_json_lines(path: Path) -> list[dict]:
     return out
 
 
+CI_FIXER_AGENT = "harness:ci-fixer"
+CI_FIX_ALLOWED = ["--allowedTools", "Bash(git push origin *)", "Bash(git add *)", "Bash(git commit -F *)",
+                  "Bash(git status *)", "Bash(git diff *)", "Bash(gh run *)", "Bash(gh pr checks *)",
+                  "Bash(gh pr view *)", "Bash(python3 *harness.py *)"]
+CI_FIX_PROMPT = """CI failed on {pr} (branch {branch}). You are the ci-fixer: follow your agent instructions. Make one fix \
+attempt, push it, and write your diagnosis and what you changed to {note}. If you cannot fix it, write why to that file and do not push."""
+
+
 def cmd_factory_run(a, cfg):
     fl, usage = factory_modules()
-    if a.merge != "manual":
-        sys.exit("only --merge manual exists so far; auto-merge is build step 6")
     slug = factory_repo(a, cfg)
     fc = cfg.get("factory") or {}
+    a.merge = a.merge or fc.get("merge", "manual")
 
     def fetch():
         return gh_json("issue", "list", "--repo", slug, "--state", "all", "--limit", "500",
@@ -3829,7 +3850,69 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
         with open(sessions / f"issue-{n}-{int(time.time())}.log", "w", encoding="utf-8") as out:
             return run_factory(str(ROOT), "manager", {}, claude_command("-p", ISSUE_PROMPT.format(n=n), *claude_args, *ISSUE_ALLOWED), out)
 
+    def make_lander():
+        fixed = {"stale_sha": None}  # head commit the failed checks belong to, until the fixer pushes a new one
+        ci = {"poll": float(fc.get("ci_poll", 30)), "timeout": float(fc.get("ci_timeout", 1800)),
+              "grace": float(fc.get("ci_grace", 90))}
+
+        def view(url):
+            return gh_json("pr", "view", url, "--json", "state,mergeable,statusCheckRollup,headRefName,headRefOid") or {}
+
+        def land_pr(n):
+            url = (read_json(ROOT / ".factory" / "prs.json", {}) or {}).get(str(n))
+            if not url:
+                factory_raise_blocker(cfg, slug, "BLOCKER", n, "No PR URL was recorded for this issue.", "Merge it by hand.")
+                return "blocked"
+            fixed["stale_sha"] = None
+
+            def status():
+                try:
+                    v = view(url)
+                except RuntimeError:  # a flaky network call must not end the wait
+                    return "pending"
+                if fixed["stale_sha"] and v.get("headRefOid") == fixed["stale_sha"]:
+                    return "pending"  # still the old commit's results
+                return fl.pr_state(v)
+
+            def fix():
+                v = view(url)
+                branch = v.get("headRefName")
+                if not branch or run_cmd(["git", "-C", str(ROOT), "switch", branch]).returncode != 0:
+                    return False
+                fixed["stale_sha"] = v.get("headRefOid")
+                note = ROOT / ".factory" / f"ci-fix-{n}.md"
+                note.unlink(missing_ok=True)
+                prompt = CI_FIX_PROMPT.format(pr=url, branch=branch, note=note)
+                with open(sessions / f"ci-fix-{n}-{int(time.time())}.log", "w", encoding="utf-8") as out:
+                    run_factory(str(ROOT), "ci-fixer", {"pr_branch": branch},
+                                claude_command("-p", prompt, "--agent", CI_FIXER_AGENT, *claude_args, *CI_FIX_ALLOWED), out)
+                if note.is_file():  # the worker can't comment (guard); the supervisor posts its diagnosis
+                    try:
+                        gh("pr", "comment", url, "--body-file", str(note))
+                    except RuntimeError as e:
+                        factory_log({"kind": "ci_fix_comment_failed", "issue": n, "error": str(e)[:200]})
+                pushed = view(url).get("headRefOid") != fixed["stale_sha"]
+                if not pushed:
+                    fixed["stale_sha"] = None
+                return pushed
+
+            def merge():
+                try:
+                    gh("pr", "merge", url, "--squash", "--delete-branch")
+                    return True
+                except RuntimeError as e:
+                    factory_log({"kind": "merge_failed", "issue": n, "error": str(e)[:300]})
+                    return False
+
+            return fl.land(
+                n, wait=lambda: fl.wait_ci(status, poll=ci["poll"], timeout=ci["timeout"], grace=ci["grace"]),
+                fix=fix, merge=merge,
+                raise_blocker=lambda text, issue, need: factory_raise_blocker(cfg, slug, "BLOCKER", issue, text, need, detail=url),
+                log=factory_log)
+        return land_pr
+
     summary = fl.run_loop(
+        land_pr=make_lander() if a.merge == "auto" else None,
         gate=lambda: fl.usage_gate(lambda: usage.check(limits), log=factory_log,
                                    max_unknown=int(fc.get("unknown_limit", 3))),
         fetch_issues=fetch, select=lambda pool: fl.choose(pool, ask_selector),
@@ -4132,13 +4215,14 @@ def main(argv=None):
     f = fsub.add_parser("run", help="run the factory loop: one fresh headless session per issue")
     f.add_argument("--issues", type=lambda t: [int(x) for x in t.split(",") if x], help="comma-separated; queued as `todo` first")
     f.add_argument("--max-issues", type=int, default=20)
-    f.add_argument("--merge", choices=["manual", "auto"], default="manual")
+    f.add_argument("--merge", choices=["manual", "auto"], help="auto: wait for CI and squash-merge (default: [factory] merge, else manual)")
     f.add_argument("--dry-run", action="store_true", help="only show what could run")
     f.add_argument("--repo")
     f.set_defaults(fn=cmd_factory_run)
     f = fsub.add_parser("start", help="start the factory loop detached and return (what /factory uses)")
     f.add_argument("--issues", type=lambda t: [int(x) for x in t.split(",") if x])
     f.add_argument("--max-issues", type=int, default=20)
+    f.add_argument("--merge", choices=["manual", "auto"], help="auto: wait for CI and squash-merge each PR when green")
     f.add_argument("--repo")
     f.set_defaults(fn=cmd_factory_start)
     f = fsub.add_parser("stop", help="stop the detached loop after the current issue (--now: immediately)")

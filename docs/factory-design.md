@@ -289,7 +289,17 @@ How it is built (step 5, decided 2026/11/06)
   event to `.factory/events.log`; the manager watches it with the Monitor tool and relays blockers and questions.
   `stop` finishes the current issue first; `stop --now` signals the supervisor, and the interrupted issue becomes
   `blocked` at the next start. Typing `harness factory run` directly still works but is not the intended path.
-- Merging stays manual. `--merge auto` is refused until step 6.
+- Merge policy is `--merge manual|auto` (`factory start`/`run`; default `[factory] merge`, which is `manual`). With
+  `manual` the issue stops at `awaiting-merge` and I merge. With `auto` the supervisor itself (no tokens) lands each
+  PR (step 6, decided 2026/11/07): `factory done` records the PR URL in `.factory/prs.json`; the supervisor polls
+  `gh pr view` (checks, mergeable) every `ci_poll` seconds up to `ci_timeout`; "no checks" counts as no CI only
+  after `ci_grace` seconds. Green or no CI: `gh pr merge --squash --delete-branch`, which closes the issue through
+  `Closes #N` and unlocks dependants. Failed CI: switch to the PR branch and start one headless `ci-fixer` session
+  (marker role `ci-fixer`, `pr_branch`), which fixes, runs the checks, pushes and writes its diagnosis to
+  `.factory/ci-fix-N.md`; the supervisor posts that as the PR comment, then waits for the new commit's checks
+  (results of the old head commit are ignored). A second failure, a merge conflict (until step 7), a closed PR, a CI
+  timeout or a refused merge labels the issue `blocked` and raises a blocker. The loop only calls `land` for
+  issues that ended `awaiting-merge`, so a manual-policy run is unchanged.
 - Tunables are in `[factory]` in `scripts/defaults.toml` (usage limits, the unknown-reading limit, and the
   `claude_args` passed to each headless session; it defaults to `--permission-mode acceptEdits`).
 
@@ -374,8 +384,8 @@ marker with the wrong directory, and a subagent without push rights.
 2. Factory-mode guard with tests. Nothing else is safe without it.
 3. `notify()` with the terminal channel, and `human-liaison` with the standard format. (done)
 4. `factory-planner` and issue creation from an MVP doc, with my approval of the issue list. (done)
-5. Run loop with `issue-selector`, the ship recipe, manual merge, and the usage gate with pause and resume. (done; not yet run on a real project)
-6. Auto-merge, CI wait, `ci-fix` recipe.
+5. Run loop with `issue-selector`, the ship recipe, manual merge, and the usage gate with pause and resume. (done; run on callback #17)
+6. Auto-merge, CI wait, `ci-fix` recipe. (done; not yet run on a real project)
 7. `question-resolver`, `conflict-resolve`, `harness-cleanup`.
 8. Push notification channel.
 9. First real project: callback.
@@ -405,5 +415,5 @@ in `~/.claude-personal`, the README and `scripts/claude-accounts.sh`.
 
 - Phone push notifications do not arrive (section 7, "Phone access"). Revisit when fixed.
 - Wire the launcher into the run loop: the manager session and the per-role worker sessions still need to be started with `harness factory launch`.
-- `ci-fixer` is meant to comment on the PR, but `gh pr comment` is blocked for subagents and worker sessions.
+- `ci-fixer` can't comment on the PR itself (`gh pr comment` is blocked for worker sessions), so it writes its diagnosis to `.factory/ci-fix-N.md` and the supervisor posts it. Issue #21 (letting the worker comment) is no longer needed for v1.
 - Confirm what the usage probe reports when I am near or over a limit (the `status` field values are unseen).

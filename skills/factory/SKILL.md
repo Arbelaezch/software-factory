@@ -24,7 +24,9 @@ Event stream: `${CLAUDE_PROJECT_DIR}/.factory/events.log`
 
 - **"work on 12 and 13"** (or one issue, or "everything queued"): `H factory start --issues 12,13` (omit
   `--issues` to run whatever is already labelled `todo`). It returns at once. Then start watching (below).
-  Only issues the user names are queued; never queue others yourself.
+  Only issues the user names are queued; never queue others yourself. Add `--merge auto` only when the user
+  asks for the PRs to be merged for them ("and merge", "merge when green", "hands off"): the factory then
+  waits for CI, makes one fix attempt if it fails, and squash-merges. Otherwise PRs wait for the user.
 - **"status" / "where are we" / "what is it doing"**: `H factory status`. Summarise in a few lines: running or
   not, the current issue and its stage, what is blocked, what awaits merge. If the supervisor is running and you
   aren't watching yet, start watching.
@@ -52,6 +54,7 @@ Don't start a second watch, and tell the user you are watching, in one line. You
 arrives. Each line is one short fact; answer in one or two sentences and never repeat the line back:
 
 - `finished: awaiting-merge`: tell them the issue and the PR link from `H factory status`.
+- `finished: merged`: one line, the issue is merged and closed.
 - `finished: blocked`: say nothing if you already reported its `BLOCKER` / `QUESTION`; otherwise report it.
 - `BLOCKER` / `QUESTION`: tell the user right away, using `H factory status --issue N` for the full message.
 - `paused for plan usage`: one line, with the resume time. It continues by itself.
