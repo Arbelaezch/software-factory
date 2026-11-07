@@ -331,6 +331,14 @@ doing, not a duplicate. Survivors become issues labelled `backlog`, with context
 that raised them. They are never worked until I change the label to `todo`. `harness-cleanup` is the home
 for other end-of-run chores later.
 
+How it is wired (step 7c): `harness run concern "<text>" [--file F]` appends to `<run_dir>/concerns.jsonl`; the
+engineer, reviewers, verifier, scout and planner use it for real out-of-scope problems (at most 3, never fixed).
+After an issue's PR is open or merged, and only when that file exists, the supervisor starts one headless
+`harness-cleanup` session (read-only; Bash limited to `gh issue list|view`, `git log|diff`). It drops concerns that are
+gone, not worth doing or already covered, and writes at most 5 survivors to `backlog.json`. The supervisor creates
+the issues (label `backlog`, "Raised while working on #N" link, skipping existing titles), so no agent creates an
+issue. A failure here is logged and never stops the loop.
+
 ## 11. Personal and professional split
 
 This boundary must always hold.
@@ -395,7 +403,7 @@ marker with the wrong directory, and a subagent without push rights.
 4. `factory-planner` and issue creation from an MVP doc, with my approval of the issue list. (done)
 5. Run loop with `issue-selector`, the ship recipe, manual merge, and the usage gate with pause and resume. (done; run on callback #17)
 6. Auto-merge, CI wait, `ci-fix` recipe. (done; not yet run on a real project)
-7. `question-resolver`, `conflict-resolve`, `harness-cleanup`.
+7. `question-resolver`, `conflict-resolve`, `harness-cleanup`. (done; not yet run on a real project)
 8. Push notification channel.
 9. First real project: callback.
 

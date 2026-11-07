@@ -59,3 +59,7 @@ Include every finding id from the review file exactly once; `verdict` refuses in
 If a finding concerns a plan "Done when" criterion, say whether it is met.
 
 Final reply to the caller: counts (confirmed / rejected / uncertain / added) in one line. Nothing else.
+
+Out-of-scope concerns: if you notice a real problem outside this task's scope, don't fix it or file anything. If
+you were given the harness path, record it with `python3 <harness_path> run concern "<one or two sentences: what
+and where>" --file <path>`; otherwise leave it out. At most 3 per run, only real ones.

@@ -178,6 +178,38 @@ class CiTests(unittest.TestCase):
         self.assertEqual((out, c["merge"]), ("merged", 0))
 
 
+class CleanupTests(unittest.TestCase):
+    def test_concerns_are_appended_to_the_run(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            a = mock.Mock(text="the  retry loop\nnever backs off", file="app/q.py", run=None)
+            with mock.patch.object(h, "load_run", lambda r: (d, {"id": "r1"})), contextlib.redirect_stdout(io.StringIO()):
+                h.cmd_run_concern(a, {})
+                h.cmd_run_concern(mock.Mock(text="second", file=None, run=None), {})
+            rows = [json.loads(x) for x in (d / "concerns.jsonl").read_text().splitlines()]
+        self.assertEqual([r["text"] for r in rows], ["the retry loop never backs off", "second"])
+        self.assertEqual(rows[0]["file"], "app/q.py")
+
+    def test_file_backlog_creates_new_titles_only_with_the_backlog_label(self):
+        made = []
+        existing = [{"title": "Already filed"}]
+        with mock.patch.object(h, "ensure_labels"), mock.patch.object(h, "gh_json", lambda *a: existing), \
+                mock.patch.object(h, "gh", lambda *a, **k: made.append(a) or ""):
+            n = h.file_backlog("o/r", 17, [{"title": "Add backoff"}, {"title": "already filed", "body": "x"},
+                                           {"title": "  "}, "junk", {"title": "Add backoff", "body": "dup"}],
+                               "https://x/pull/9")
+        self.assertEqual(n, 1)
+        args = made[0]
+        self.assertEqual(args[:2], ("issue", "create"))
+        self.assertIn("backlog", args)
+        self.assertIn("Raised while working on #17 (https://x/pull/9)", args[args.index("--body") + 1])
+
+    def test_nothing_is_filed_without_survivors(self):
+        with mock.patch.object(h, "gh", side_effect=AssertionError("must not call gh")):
+            self.assertEqual(h.file_backlog("o/r", 1, [], None), 0)
+
+
 class LoopTests(unittest.TestCase):
     def make(self, issues, outcomes=None, gate=lambda: "go", select=None, **kw):
         labels = {i["number"]: {x["name"] for x in i["labels"]} for i in issues}
@@ -219,6 +251,17 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(landed, [1, 2])
         self.assertEqual(result["results"], [{"issue": 1, "outcome": "merged"}, {"issue": 2, "outcome": "blocked"}])
         self.assertIn((2, "blocked"), calls["states"])
+
+    def test_cleanup_runs_after_a_pr_exists_and_never_stops_the_loop(self):
+        seen = []
+        def after(n):
+            seen.append(n)
+            raise RuntimeError("boom")
+        result, calls, _ = self.make([issue(1), issue(2), issue(3)], {1: "awaiting-merge", 2: "blocked", 3: "awaiting-merge"},
+                                     after_issue=after)
+        self.assertEqual(seen, [1, 3])  # not for the blocked issue
+        self.assertEqual(len(result["results"]), 3)
+        self.assertEqual([e["kind"] for e in calls["log"]].count("after_issue_failed"), 2)
 
     def test_manual_policy_never_lands(self):
         result, _, _ = self.make([issue(1)], {1: "awaiting-merge"})

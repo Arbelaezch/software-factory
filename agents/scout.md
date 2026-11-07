@@ -49,3 +49,7 @@ Areas the task may touch that you did not open, so the planner knows what to ver
 
 Your final reply to the caller is one short paragraph: the output path and the 3 most important findings.
 Do not paste the file contents into your reply.
+
+Out-of-scope concerns: if you notice a real problem outside this task's scope, don't fix it or file anything. If
+you were given the harness path, record it with `python3 <harness_path> run concern "<one or two sentences: what
+and where>" --file <path>`; otherwise leave it out. At most 3 per run, only real ones.

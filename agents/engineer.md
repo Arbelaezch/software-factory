@@ -54,3 +54,7 @@ and anything the reviewer should know. Keep it under 40 lines.
 
 Your final reply to the caller (keep it under 10 lines): GATES PASS/FAIL, the files you changed,
 and any blocker. Don't paste code or diffs.
+
+Out-of-scope concerns: if you notice a real problem outside this task's scope, don't fix it or file anything. If
+you were given the harness path, record it with `python3 <harness_path> run concern "<one or two sentences: what
+and where>" --file <path>`; otherwise leave it out. At most 3 per run, only real ones.

@@ -581,6 +581,18 @@ def manager_usage(run: dict, cfg: dict) -> dict | None:
     return summarize_entries(entries, cfg, seen=set())
 
 
+def cmd_run_concern(a, cfg):
+    """Record an out-of-scope concern in the run (never fix it or file an issue mid-feature; harness-cleanup
+    re-checks the list after the PR)."""
+    d, run = load_run(a.run)
+    entry = {"ts": iso(), "text": " ".join(a.text.split())[:500]}
+    if a.file:
+        entry["file"] = a.file
+    with open(d / "concerns.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    print(f"concern recorded for run {run['id']}")
+
+
 def cmd_run_end(a, cfg):
     d, run = load_run(a.run)
     if run.get("status") != "running" and not a.force:
@@ -3399,6 +3411,7 @@ def event_line(e: dict) -> str | None:
         "queued": lambda: f"#{n} queued",
         "ci_failed": lambda: f"#{n} CI failed; trying one fix",
         "ci_fix_pushed": lambda: f"#{n} fix pushed; waiting for CI again",
+        "cleanup": lambda: f"#{n} cleanup filed {e.get('filed')} backlog issue(s)" if e.get("filed") else None,
         "conflict_found": lambda: f"#{n} has a merge conflict; trying to resolve it",
         "conflict_resolved": lambda: f"#{n} conflict resolved; waiting for CI again",
         "supervisor_started": lambda: "supervisor started",
@@ -3596,19 +3609,27 @@ def record_pr(n: int, url: str | None) -> None:
     write_json(f, prs)
 
 
-def pipeline_gaps(n: int) -> list[str]:
-    """What the newest run for issue n is missing that a real /ship pipeline leaves behind (plan and review)."""
-    runs = sorted((d for d in RUNS_DIR.glob("*") if (d / "run.json").is_file()), reverse=True)
-    for d in runs:
+def issue_run(n: int) -> tuple[Path, dict] | None:
+    """The newest run directory (and its run.json) for issue n."""
+    for d in sorted((d for d in RUNS_DIR.glob("*") if (d / "run.json").is_file()), reverse=True):
         run = read_json(d / "run.json", {}) or {}
         if (run.get("issue") or {}).get("number") == n:
-            gaps = []
-            if not (d / "tasks.json").is_file():
-                gaps.append("no plan (tasks.json): scout, plan and engineer stages did not run")
-            if int(run.get("review_rounds") or 0) < 1:
-                gaps.append("no review round")
-            return gaps
-    return [f"no harness run found for issue #{n}"]
+            return d, run
+    return None
+
+
+def pipeline_gaps(n: int) -> list[str]:
+    """What the newest run for issue n is missing that a real /ship pipeline leaves behind (plan and review)."""
+    found = issue_run(n)
+    if not found:
+        return [f"no harness run found for issue #{n}"]
+    d, run = found
+    gaps = []
+    if not (d / "tasks.json").is_file():
+        gaps.append("no plan (tasks.json): scout, plan and engineer stages did not run")
+    if int(run.get("review_rounds") or 0) < 1:
+        gaps.append("no review round")
+    return gaps
 
 
 def cmd_factory_done(a, cfg):
@@ -3802,6 +3823,33 @@ CI_FIX_PROMPT = """CI failed on {pr} (branch {branch}). You are the ci-fixer: fo
 attempt, push it, and write your diagnosis and what you changed to {note}. If you cannot fix it, write why to that file and do not push."""
 
 
+CLEANUP_AGENT = "harness:harness-cleanup"
+CLEANUP_ALLOWED = ["--allowedTools", "Bash(gh issue list *)", "Bash(gh issue view *)", "Bash(git log *)", "Bash(git diff *)"]
+CLEANUP_PROMPT = """Issue #{issue} is finished. Its out-of-scope concerns are in {run_dir}/concerns.jsonl. Follow your agent \
+instructions and write the survivors to {out} (a JSON list, `[]` when none survive)."""
+
+
+def file_backlog(slug: str, n: int, items: list, pr_url: str | None) -> int:
+    """Create a `backlog` issue for each {title, body} item, skipping titles that already exist. Returns how many."""
+    items = [i for i in items if isinstance(i, dict) and str(i.get("title", "")).strip()][:10]
+    if not items:
+        return 0
+    ensure_labels(slug, {"backlog"})
+    existing = {x["title"].strip().lower() for x in
+                gh_json("issue", "list", "--repo", slug, "--state", "all", "--limit", "500", "--json", "title") or []}
+    made = 0
+    for i in items:
+        title = " ".join(str(i["title"]).split())[:120]
+        if title.lower() in existing:
+            continue
+        body = (str(i.get("body", "")).strip() + f"\n\n---\nRaised while working on #{n}" + (f" ({pr_url})" if pr_url else "")
+                + ". Labelled `backlog`: the factory will not work on it until you relabel it `todo`.")
+        gh("issue", "create", "--repo", slug, "--title", title, "--body", body, "--label", "backlog")
+        existing.add(title.lower())
+        made += 1
+    return made
+
+
 CONFLICT_RESOLVER_AGENT = "harness:conflict-resolver"
 CONFLICT_ALLOWED = ["--allowedTools", "Bash(git fetch origin *)", "Bash(git merge origin/*)", "Bash(git merge --abort)",
                     "Bash(git push origin *)", "Bash(git add *)", "Bash(git commit -F *)", "Bash(git status *)",
@@ -3931,7 +3979,27 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
                 log=factory_log)
         return land_pr
 
+    def cleanup(n):
+        """After an issue's PR: have harness-cleanup re-check the run's out-of-scope concerns and file the
+        survivors as `backlog` issues (never worked until the user relabels them `todo`)."""
+        found = issue_run(n)
+        if not found or not (found[0] / "concerns.jsonl").is_file():
+            return
+        d = found[0]
+        out_file = d / "backlog.json"
+        out_file.unlink(missing_ok=True)
+        prompt = CLEANUP_PROMPT.format(run_dir=d, issue=n, out=out_file)
+        with open(sessions / f"cleanup-{n}-{int(time.time())}.log", "w", encoding="utf-8") as out:
+            run_factory(str(ROOT), "manager", {}, claude_command("-p", prompt, "--agent", CLEANUP_AGENT, *claude_args, *CLEANUP_ALLOWED), out)
+        try:
+            filed = file_backlog(slug, n, read_json(out_file, []) or [], (read_json(ROOT / ".factory" / "prs.json", {}) or {}).get(str(n)))
+        except (RuntimeError, OSError) as e:
+            factory_log({"kind": "cleanup_failed", "issue": n, "error": str(e)[:200]})
+            return
+        factory_log({"kind": "cleanup", "issue": n, "filed": filed})
+
     summary = fl.run_loop(
+        after_issue=cleanup,
         land_pr=make_lander() if a.merge == "auto" else None,
         gate=lambda: fl.usage_gate(lambda: usage.check(limits), log=factory_log,
                                    max_unknown=int(fc.get("unknown_limit", 3))),
@@ -4096,6 +4164,11 @@ def main(argv=None):
     s.add_argument("--run")
     s.add_argument("--force", action="store_true")
     s.set_defaults(fn=cmd_run_end)
+    s = rsub.add_parser("concern", help="record an out-of-scope concern; it is re-checked after the PR, never fixed mid-feature")
+    s.add_argument("text")
+    s.add_argument("--file", help="where it was seen")
+    s.add_argument("--run")
+    s.set_defaults(fn=cmd_run_concern)
     s = rsub.add_parser("show")
     s.add_argument("--run")
     s.set_defaults(fn=cmd_run_show)

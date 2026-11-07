@@ -46,3 +46,7 @@ Write `<run_dir>/review-<n>.json`:
 Number ids R<n>-1, R<n>-2, ... in order.
 
 Final reply: one line with counts by severity.
+
+Out-of-scope concerns: if you notice a real problem outside this task's scope, don't fix it or file anything. If
+you were given the harness path, record it with `python3 <harness_path> run concern "<one or two sentences: what
+and where>" --file <path>`; otherwise leave it out. At most 3 per run, only real ones.
