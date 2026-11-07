@@ -34,7 +34,7 @@ Event stream: `${CLAUDE_PROJECT_DIR}/.factory/events.log`
 - **The user answers** (picks an option or says what to do): record it with
   `H factory decide --question "<the question>" --answer "<their answer>" --by user --kind <product|implementation>
   --why "<their reasoning if given>"`, then re-queue the issue: `H factory queue N`. If the supervisor has stopped
-  (pool was empty), start it again with `H factory start`. If the answer is "skip it" or "not now", don't queue it.
+  (pool was empty), run `H factory start --issues N` instead: it queues the issue itself, so don't run both. If the answer is "skip it" or "not now", don't queue it.
 - **"stop" / "pause"**: `H factory stop` (after the current issue). Use `--now` only if they say now or it is
   clearly stuck; warn that the in-progress issue will be marked blocked at the next start.
 - **"continue" / "next batch"**: `H factory start`, with `--issues` if they name more.
