@@ -352,6 +352,12 @@ class HarnessWiringTests(unittest.TestCase):
                 self.assertEqual(len(h.pipeline_gaps(7)), 2)  # no tasks.json, no review round
                 self.assertIn("no harness run", h.pipeline_gaps(9)[0])
                 (runs / "20260101-a" / "tasks.json").write_text("{}")
+                self.assertEqual(h.pipeline_gaps(7), ["no review round"])
+                (runs / "20260101-a" / "review-1.raw.txt").write_text("x")  # not a review result
+                self.assertEqual(h.pipeline_gaps(7), ["no review round"])
+                (runs / "20260101-a" / "review-1.json").write_text("{}")  # the fallback reviewer's output
+                self.assertEqual(h.pipeline_gaps(7), [])
+                (runs / "20260101-a" / "review-1.json").unlink()
                 (runs / "20260101-a" / "run.json").write_text(json.dumps({"issue": {"number": 7}, "review_rounds": 1}))
                 self.assertEqual(h.pipeline_gaps(7), [])
                 a = mock.Mock(issue=8, pr="x", note=None, repo=None)
