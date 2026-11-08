@@ -48,8 +48,10 @@ changes where humans were involved.
    a command the guard blocked, or any error you can't fix by following /ship.
 3. **Finish with a pull request.** When the verdict is DONE and the summary is written. Headless sessions can only
    run a command that matches a pre-approved pattern, and anything else is refused with no one to approve it. So
-   **run every step below as its own Bash call: one plain command, no `&&`, `;` or `|`, no `cd`, no `2>&1`, no
-   multi-line `-m` message.** Use absolute paths instead of `cd`. (A first attempt that chained add, commit and
+   **run every step below as its own Bash call: one plain command, no `&&`, `;` or `|`, no `cd`, no `git -C`, no
+   `2>&1`, no multi-line `-m` message.** You already run in the project directory, so use plain `git status`,
+   `git add <relative path>` and so on; a `git -C <dir> ...` or `cd <dir> && ...` form is refused. Use absolute
+   paths only for files outside the project, such as the run directory. (A first attempt that chained add, commit and
    push in one call was refused for exactly this reason.)
    1. `git status`, then stage only the files in the diff: `git add <path> <path> ...` (never `-A` or `.`).
    2. Write the commit message to `<run_dir>/commit-msg.txt` with the Write tool: a first line that names the issue,
