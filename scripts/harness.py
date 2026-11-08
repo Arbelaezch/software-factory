@@ -3627,7 +3627,9 @@ def pipeline_gaps(n: int) -> list[str]:
     gaps = []
     if not (d / "tasks.json").is_file():
         gaps.append("no plan (tasks.json): scout, plan and engineer stages did not run")
-    if int(run.get("review_rounds") or 0) < 1:
+    # The external reviewer records the round in run.json; the claude-reviewer fallback only writes review-<n>.json.
+    reviewed = int(run.get("review_rounds") or 0) >= 1 or any(re.fullmatch(r"review-\d+\.json", f.name) for f in d.iterdir())
+    if not reviewed:
         gaps.append("no review round")
     return gaps
 
