@@ -403,7 +403,7 @@ class HarnessWiringTests(unittest.TestCase):
             events = [json.loads(x)["kind"] for x in (root / ".factory" / "log.jsonl").read_text().splitlines()]
             left = list((Path(tmp) / ".software-factory" / "markers").glob("*.json"))
         self.assertIn("args: -p /factory-issue 4 --permission-mode acceptEdits --add-dir", text)
-        self.assertIn('--allowedTools Bash(git push origin *) Bash(gh pr create *)', text)  # push is pre-approved for the issue session
+        self.assertIn('--allowedTools Bash(git push origin *) Bash(gh pr create *) Bash(git add *) Bash(git commit -F *) Bash(git status) Bash(git status *)', text)  # push is pre-approved for the issue session
         self.assertIn(str(SCRIPTS.parent), text)  # the plugin root is readable by the headless session
         self.assertIn("marker set: yes", text)
         self.assertEqual(text.splitlines()[-1].strip(), "1")  # exactly one marker while the session ran

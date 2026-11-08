@@ -3904,7 +3904,8 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
 
     # A skill's allowed-tools did not cover `git push` or `gh pr create` in print mode (bashMiss:no-rule-match);
     # CLI rules do.
-    ISSUE_ALLOWED = ["--allowedTools", "Bash(git push origin *)", "Bash(gh pr create *)"]
+    ISSUE_ALLOWED = ["--allowedTools", "Bash(git push origin *)", "Bash(gh pr create *)", "Bash(git add *)",
+                     "Bash(git commit -F *)", "Bash(git status)", "Bash(git status *)"]
 
     def run_issue(n):
         with open(sessions / f"issue-{n}-{int(time.time())}.log", "w", encoding="utf-8") as out:
