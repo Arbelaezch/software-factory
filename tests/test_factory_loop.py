@@ -446,6 +446,25 @@ class FrontDoorTests(unittest.TestCase):
                              raise_blocker=lambda *a: None, log=lambda e: None, should_stop=lambda: stop["now"])
         self.assertEqual((ran, result["stopped"]), ([1], "stop requested"))
 
+    def test_tree_is_parked_after_every_issue_even_a_blocked_one(self):
+        parked = []
+        result = fl.run_loop(gate=lambda: "go", fetch_issues=lambda: [issue(1), issue(2)],
+                             select=lambda pool: (pool[0]["number"], "x"), set_state=lambda n, s: None,
+                             run_issue=lambda n: 0, fetch_labels=lambda n: {"blocked"},
+                             raise_blocker=lambda *a: None, log=lambda e: None, park=parked.append)
+        self.assertEqual((parked, [r["issue"] for r in result["results"]]), ([1, 2], [1, 2]))
+
+    def test_a_failing_park_does_not_stop_the_loop(self):
+        def boom(n):
+            raise RuntimeError("nope")
+        events = []
+        result = fl.run_loop(gate=lambda: "go", fetch_issues=lambda: [issue(1), issue(2)],
+                             select=lambda pool: (pool[0]["number"], "x"), set_state=lambda n, s: None,
+                             run_issue=lambda n: 0, fetch_labels=lambda n: {"blocked"},
+                             raise_blocker=lambda *a: None, log=events.append, park=boom)
+        self.assertEqual(len(result["results"]), 2)
+        self.assertEqual([e["kind"] for e in events].count("park_failed"), 2)
+
     def test_events_log_gets_short_lines_for_the_events_that_matter(self):
         h.factory_log({"kind": "issue_picked", "issue": 4, "reason": "unblocks 2"})
         h.factory_log({"kind": "message", "message_kind": "BLOCKER", "issue": 4, "text": "Gates keep failing."})
