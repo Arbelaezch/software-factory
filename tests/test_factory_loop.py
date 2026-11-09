@@ -476,6 +476,27 @@ class FrontDoorTests(unittest.TestCase):
         self.assertTrue(lines[1].endswith("BLOCKER #4: Gates keep failing."))
         self.assertEqual(len((self.root / ".factory" / "log.jsonl").read_text().splitlines()), 4)
 
+    def test_blocked_finish_line_is_dropped_when_a_blocker_line_was_already_sent(self):
+        h.MESSAGED.clear()
+        h.factory_log({"kind": "harness_started", "issue": 5})
+        h.factory_log({"kind": "message", "message_kind": "BLOCKER", "issue": 5, "text": "Stuck."})
+        h.factory_log({"kind": "harness_finished", "issue": 5, "outcome": "blocked"})
+        h.factory_log({"kind": "harness_started", "issue": 6})
+        h.factory_log({"kind": "harness_finished", "issue": 6, "outcome": "blocked"})
+        lines = (self.root / ".factory" / "events.log").read_text().splitlines()
+        self.assertEqual([l.split(" ", 1)[1] for l in lines],
+                         ["started #5", "BLOCKER #5: Stuck.", "started #6", "#6 finished: blocked"])
+
+    def test_second_watcher_exits_silently(self):
+        import os
+        d = self.root / ".factory"
+        d.mkdir(exist_ok=True)
+        (d / "watch.json").write_text(json.dumps({"pid": os.getpid()}))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            h.cmd_factory_watch(None, {})  # would block forever if it did not see the live lock
+        self.assertEqual(buf.getvalue(), "")
+
     def test_supervisor_lock(self):
         import json
         import os

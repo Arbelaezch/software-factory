@@ -3419,13 +3419,23 @@ def event_line(e: dict) -> str | None:
     }.get(k, lambda: None)()
 
 
+MESSAGED: set = set()  # issues that got a BLOCKER / QUESTION line since they last started
+
+
 def factory_log(event: dict) -> None:
     """Append-only factory log in the target project (section 8), plus a short line in events.log for watchers."""
     d = ROOT / ".factory"
     d.mkdir(exist_ok=True)
     with open(d / "log.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps({"ts": iso(), **event}, ensure_ascii=False) + "\n")
+    k, n = event.get("kind"), event.get("issue")
+    if k == "harness_started":
+        MESSAGED.discard(n)
+    elif k == "message" and n is not None:
+        MESSAGED.add(n)
     line = event_line(event)
+    if k == "harness_finished" and event.get("outcome") == "blocked" and n in MESSAGED:
+        line = None  # the BLOCKER / QUESTION line already told the watcher; a second line only repeats it
     if line:
         with open(d / "events.log", "a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%H:%M:%S')} {line}\n")
@@ -3578,6 +3588,41 @@ def cmd_factory_queue(a, cfg):
     for n in a.numbers:
         queue_issue(slug, n)
         print(f"#{n} is in the pool")
+
+
+WATCH_PATTERN = re.compile(r"BLOCKER|QUESTION|finished|paused|resumed|unreadable|stopped|orphaned")
+
+
+def cmd_factory_watch(a, cfg):
+    """Print the events.log lines that need the user's attention, as they arrive (what /factory's Monitor runs).
+    Only one watcher runs per project: a second one exits at once and prints nothing, so no event is delivered twice."""
+    d = ROOT / ".factory"
+    d.mkdir(exist_ok=True)
+    lock = d / "watch.json"
+    try:
+        os.kill(int(json.loads(lock.read_text())["pid"]), 0)
+        return  # a live watcher already has it
+    except PermissionError:
+        return
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    lock.write_text(json.dumps({"pid": os.getpid(), "started": time.time()}))
+    log = d / "events.log"
+    try:
+        log.touch()
+        with open(log, encoding="utf-8") as f:
+            f.seek(0, os.SEEK_END)
+            while True:
+                line = f.readline()
+                if not line:
+                    if log.stat().st_size < f.tell():  # truncated or rotated
+                        f.seek(0)
+                    time.sleep(0.5)
+                    continue
+                if line.endswith("\n") and WATCH_PATTERN.search(line):
+                    print(line, end="", flush=True)
+    finally:
+        lock.unlink(missing_ok=True)
 
 
 def factory_raise_blocker(cfg, slug, kind, issue, situation, need, options=None, recommended=None, detail=""):
@@ -4353,6 +4398,8 @@ def main(argv=None):
     f.add_argument("--merge", choices=["manual", "auto"], help="auto (default): wait for CI and squash-merge each PR when green; manual: leave PRs for the user")
     f.add_argument("--repo")
     f.set_defaults(fn=cmd_factory_start)
+    f = fsub.add_parser("watch", help="stream the events that need the user (one watcher per project; a second exits silently)")
+    f.set_defaults(fn=cmd_factory_watch)
     f = fsub.add_parser("stop", help="stop the detached loop after the current issue (--now: immediately)")
     f.add_argument("--now", action="store_true")
     f.set_defaults(fn=cmd_factory_stop)
