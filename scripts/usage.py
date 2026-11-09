@@ -8,7 +8,7 @@ Two sources, both normalized to percent used (0-100) per window:
 Fails closed: if no fresh data is available the decision is "unknown", never "go".
 Standard library only.
 
-Usage: python3 usage.py [--probe] [--max-five-hour 80] [--max-weekly 90] [--max-age 300] [--json]
+Usage: python3 usage.py [--probe] [--max-five-hour 85] [--max-weekly 90] [--max-age 300] [--json]
 Exit codes: 0 go, 10 pause, 2 unknown.
 """
 from __future__ import annotations
@@ -125,7 +125,7 @@ def fmt_epoch(t) -> str:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--max-five-hour", type=float, default=80, help="pause at or above this %% of the 5-hour window")
+    ap.add_argument("--max-five-hour", type=float, default=85, help="pause at or above this %% of the 5-hour window")
     ap.add_argument("--max-weekly", type=float, default=90, help="pause at or above this %% of the weekly window")
     ap.add_argument("--max-age", type=float, default=300, help="seconds before the snapshot counts as stale")
     ap.add_argument("--probe", action="store_true", help="always take a fresh headless reading")
