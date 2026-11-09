@@ -3736,6 +3736,8 @@ def cmd_factory_start(a, cfg):
         cmd += ["--repo", a.repo]
     if a.merge:
         cmd += ["--merge", a.merge]
+    if a.until_limit:
+        cmd += ["--until-limit"]
     if shutil.which("caffeinate"):
         cmd = ["caffeinate", "-i", *cmd]
     with open(d / "supervisor.log", "a", encoding="utf-8") as out:
@@ -3812,7 +3814,7 @@ def cmd_factory_status(a, cfg):
         print("supervisor: not running")
     fc = cfg.get("factory") or {}
     u = usage.decide(usage.read_snapshot(max_age=900),
-                     {"five_hour": float(fc.get("max_five_hour", 80)), "seven_day": float(fc.get("max_weekly", 90))})
+                     {"five_hour": float(fc.get("max_five_hour", 85)), "seven_day": float(fc.get("max_weekly", 90))})
     print(f"usage: {u['decision']}" + (f" ({'; '.join(u['reasons'])})" if u["reasons"] else ""))
 
     issues = gh_json("issue", "list", "--repo", slug, "--state", "all", "--limit", "500",
@@ -3942,7 +3944,9 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
     plugin_root = str(Path(__file__).resolve().parent.parent)
     if "--add-dir" not in claude_args:  # headless sessions must read the plugin's skills (/ship) and agents
         claude_args += ["--add-dir", plugin_root]
-    limits = {"five_hour": float(fc.get("max_five_hour", 80)), "seven_day": float(fc.get("max_weekly", 90))}
+    limits = {"five_hour": float(fc.get("max_five_hour", 85)), "seven_day": float(fc.get("max_weekly", 90))}
+    if getattr(a, "until_limit", False):  # opt-in: work until a window is really full, then pause until it resets
+        limits = {"five_hour": 100.0, "seven_day": 100.0}
 
     def ask_selector(pool):
         r = run_cmd(claude_command("-p", "Pick the next issue. Candidates:\n" + json.dumps(pool, indent=1),
@@ -4390,12 +4394,14 @@ def main(argv=None):
     f.add_argument("--max-issues", type=int, default=20)
     f.add_argument("--merge", choices=["manual", "auto"], help="auto (default): wait for CI and squash-merge; manual: stop at awaiting-merge. Default is [factory] merge")
     f.add_argument("--dry-run", action="store_true", help="only show what could run")
+    f.add_argument("--until-limit", action="store_true", help="ignore the [factory] usage caps and keep going until the plan limit itself is hit")
     f.add_argument("--repo")
     f.set_defaults(fn=cmd_factory_run)
     f = fsub.add_parser("start", help="start the factory loop detached and return (what /factory uses)")
     f.add_argument("--issues", type=lambda t: [int(x) for x in t.split(",") if x])
     f.add_argument("--max-issues", type=int, default=20)
     f.add_argument("--merge", choices=["manual", "auto"], help="auto (default): wait for CI and squash-merge each PR when green; manual: leave PRs for the user")
+    f.add_argument("--until-limit", action="store_true", help="ignore the [factory] usage caps and keep going until the plan limit itself is hit")
     f.add_argument("--repo")
     f.set_defaults(fn=cmd_factory_start)
     f = fsub.add_parser("watch", help="stream the events that need the user (one watcher per project; a second exits silently)")

@@ -37,6 +37,10 @@ Event stream: `${CLAUDE_PROJECT_DIR}/.factory/events.log`
   `H factory decide --question "<the question>" --answer "<their answer>" --by user --kind <product|implementation>
   --why "<their reasoning if given>"`, then re-queue the issue: `H factory queue N`. If the supervisor has stopped
   (pool was empty), run `H factory start --issues N` instead: it queues the issue itself, so don't run both. If the answer is "skip it" or "not now", don't queue it.
+- **"keep going until the limit" / "use all my usage"** (only when the user says so; never by default): add
+  `--until-limit` to `H factory start`. It ignores the usual usage caps (85% of the 5-hour window, 90% weekly) and
+  pauses only when the plan limit itself is hit, resuming after the reset. Warn them in one line that an issue
+  running at the moment the limit hits may fail and be blocked. It applies to that start only.
 - **"stop" / "pause"**: `H factory stop` (after the current issue). Use `--now` only if they say now or it is
   clearly stuck; warn that the in-progress issue will be marked blocked at the next start.
 - **"continue" / "next batch"**: `H factory start`, with `--issues` if they name more.

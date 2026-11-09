@@ -313,7 +313,7 @@ How it is built (step 5, decided 2026/11/06)
   `claude_args` passed to each headless session; it defaults to `--permission-mode acceptEdits`).
 
 Usage gate
-- Uses `scripts/usage.py`. Defaults: pause at 80% of the 5-hour window and 90% of the weekly window.
+- Uses `scripts/usage.py`. Defaults: pause at 85% of the 5-hour window and 90% of the weekly window. `factory start --until-limit` (opt-in, per run) raises both caps to 100%: it works until the plan limit is really hit, then pauses until the window resets. An issue running when the limit hits may fail and be blocked.
 - Checked before every harness launch, and inside a run from the `rate_limit_event` in its stream output.
 - Pausing is silent. The factory sleeps until `resume_at` and continues without prompting.
 - The factory runs as a long-lived process on my Mac under `caffeinate`. If the lid closes it pauses and
