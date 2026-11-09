@@ -404,8 +404,8 @@ marker with the wrong directory, and a subagent without push rights.
 5. Run loop with `issue-selector`, the ship recipe, manual merge, and the usage gate with pause and resume. (done; run on callback #17)
 6. Auto-merge, CI wait, `ci-fix` recipe. (done; not yet run on a real project)
 7. `question-resolver`, `conflict-resolve`, `harness-cleanup`. (done; not yet run on a real project)
-8. Push notification channel.
-9. First real project: callback.
+8. Push notification channel (blocked by #9).
+9. First real project: callback. (in progress: issue #17 reached an open PR through the whole pipeline; see section 16)
 
 ## 13. Not in v1
 
@@ -431,6 +431,28 @@ in `~/.claude-personal`, the README and `scripts/claude-accounts.sh`.
 ## 15. Open items
 
 - Phone push notifications do not arrive (section 7, "Phone access"). Revisit when fixed.
-- Wire the launcher into the run loop: the manager session and the per-role worker sessions still need to be started with `harness factory launch`.
 - `ci-fixer` can't comment on the PR itself (`gh pr comment` is blocked for worker sessions), so it writes its diagnosis to `.factory/ci-fix-N.md` and the supervisor posts it. Issue #21 (letting the worker comment) is no longer needed for v1.
 - Confirm what the usage probe reports when I am near or over a limit (the `status` field values are unseen).
+
+## 16. Where things stand (2026/11/09) and what is next
+
+Steps 1 to 7 are built and merged. Step 9 has started on callback; a few real runs of issue #17 exposed these
+problems, all fixed: headless sessions need the plugin directory (`--add-dir`), commands must be plain and
+one-per-call (no `&&`, `|`, `cd`, `git -C`), a skill's `allowed-tools` does not hold up in print mode so the
+supervisor passes `--allowedTools` for `git add|commit -F|push|status` and `gh pr create`, a session must not skip
+the pipeline (`factory done` checks for a plan and a review), and the fallback reviewer's `review-N.json` counts as a review.
+Updating the plugin is not enough: restart the `/factory` session and stop any old supervisor, because the
+supervisor runs the plugin build it was started from.
+
+Not yet seen on a real run (only unit tested):
+- `factory done` accepting a run, the CI wait, and the auto-merge (callback PR #38 for #17 was merged by hand).
+- The `ci-fixer` and `conflict-resolver` sessions and their `--allowedTools` lists; the guard with `git merge origin/<base>`.
+- `question-resolver` (a session that hits a question), `harness-cleanup` and the backlog issues it files.
+- `/factory-plan` end to end, and the Monitor waking an idle manager session. Subagent permission denials in headless runs.
+
+Next, in order:
+1. Run a small second issue on callback with `/factory work on N`: checks done, CI wait and auto-merge, and the quiet event watch.
+2. Force the other paths once: a throwaway PR with a failing test (ci-fixer) and one that conflicts with the base (conflict-resolver).
+3. Run `/factory-plan` on a real MVP document, then let the factory build a short chain of dependent issues.
+4. Step 8 once #9 is solved: the push channel so blockers reach the phone.
+5. Optional: set `DEEPSEEK_API_KEY` so review uses the external reviewer instead of the Claude fallback; #7 (BM25 for the scout) stays open.
