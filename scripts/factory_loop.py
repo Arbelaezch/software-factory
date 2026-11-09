@@ -189,7 +189,8 @@ def run_loop(*, gate: Callable[[], str], fetch_issues: Callable[[], list[dict]],
              raise_blocker: Callable[[str, int | None, str], None], log: Callable[[dict], None],
              max_issues: int = 20, should_stop: Callable[[], bool] = lambda: False,
              land_pr: Callable[[int], str] | None = None,
-             after_issue: Callable[[int], None] | None = None) -> dict:
+             after_issue: Callable[[int], None] | None = None,
+             park: Callable[[int], None] | None = None) -> dict:
     """Work the pool one issue at a time until it is empty. Returns {"results": [...], "stopped": reason|None}."""
     results, attempted, stopped = [], set(), None
     for i in fetch_issues():  # a crashed earlier run leaves issues in-progress; never guess, hand them back
@@ -234,5 +235,10 @@ def run_loop(*, gate: Callable[[], str], fetch_issues: Callable[[], list[dict]],
                 after_issue(n)
             except Exception as e:  # housekeeping must never stop the factory
                 log({"kind": "after_issue_failed", "issue": n, "error": str(e)[:200]})
+        if park:  # leave the tree clean on the base branch so the next issue gets its own branch
+            try:
+                park(n)
+            except Exception as e:
+                log({"kind": "park_failed", "issue": n, "error": str(e)[:200]})
         results.append({"issue": n, "outcome": outcome})
     return {"results": results, "stopped": stopped}

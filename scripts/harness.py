@@ -3911,7 +3911,11 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
                      # Subagents (engineer, scout, ...) cannot prompt in print mode, so anything unlisted is denied.
                      "Bash(git diff *)", "Bash(git log *)", "Bash(git branch --show-current)",
                      "Bash(gh issue list *)", "Bash(gh issue view *)", "Bash(python3 *harness.py *)",
-                     "Bash(npm run *)", "Bash(npm test *)"]
+                     "Bash(npm run *)", "Bash(npm test *)",
+                     # Read-only checks for running the app in a browser (stall and two-tab checks).
+                     "Bash(docker ps)", "Bash(docker ps *)", "Bash(lsof -i *)", "Bash(lsof -nP -i *)",
+                     "Bash(curl http://localhost*)", "Bash(curl -s http://localhost*)",
+                     "Bash(curl http://127.0.0.1*)", "Bash(curl -s http://127.0.0.1*)"]
 
     def run_issue(n):
         with open(sessions / f"issue-{n}-{int(time.time())}.log", "w", encoding="utf-8") as out:
@@ -3986,6 +3990,30 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
                 log=factory_log)
         return land_pr
 
+    def park(n):
+        """After each issue, whatever its outcome: commit any leftover work to the issue's own branch (a local WIP
+        commit, never pushed) and switch back to the base branch, so the next issue starts from a clean tree on its
+        own new branch. Without this, a blocked issue left its edits in the tree and every later issue blocked on them."""
+        for rname, r in repos(cfg).items():
+            path = r["abs"]
+            if not is_git_repo(path):
+                continue
+            base = base_branch_for(cfg, rname)
+            cur = git(path, "branch", "--show-current").strip()
+            if cur and cur != base and git(path, "status", "--porcelain", "--", ".", ":(exclude).factory").strip():
+                run_cmd(["git", "-C", str(path), "add", "-A", "--", ".", ":(exclude).factory"])
+                c = run_cmd(["git", "-C", str(path), "commit", "-q", "-m",
+                             f"WIP: factory issue #{n} stopped with unfinished work (local only)"])
+                if c.returncode != 0:
+                    raise RuntimeError(f"{rname}: could not save the work on {cur}: {c.stderr.strip()}")
+                factory_log({"kind": "work_parked", "issue": n, "repo": rname, "branch": cur})
+            if cur != base:
+                sw = run_cmd(["git", "-C", str(path), "switch", base])
+                if sw.returncode != 0:
+                    raise RuntimeError(f"{rname}: could not switch to {base}: {sw.stderr.strip()}")
+            if run_cmd(["git", "-C", str(path), "remote", "get-url", "origin"]).returncode == 0:
+                run_cmd(["git", "-C", str(path), "pull", "--ff-only", "-q", "origin", base])  # pick up merged PRs
+
     def cleanup(n):
         """After an issue's PR: have harness-cleanup re-check the run's out-of-scope concerns and file the
         survivors as `backlog` issues (never worked until the user relabels them `todo`)."""
@@ -4006,7 +4034,7 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
         factory_log({"kind": "cleanup", "issue": n, "filed": filed})
 
     summary = fl.run_loop(
-        after_issue=cleanup,
+        after_issue=cleanup, park=park,
         land_pr=make_lander() if a.merge == "auto" else None,
         gate=lambda: fl.usage_gate(lambda: usage.check(limits), log=factory_log,
                                    max_unknown=int(fc.get("unknown_limit", 3))),
