@@ -3907,7 +3907,11 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
     # A skill's allowed-tools did not cover `git push` or `gh pr create` in print mode (bashMiss:no-rule-match);
     # CLI rules do.
     ISSUE_ALLOWED = ["--allowedTools", "Bash(git push origin *)", "Bash(gh pr create *)", "Bash(git add *)",
-                     "Bash(git commit -F *)", "Bash(git status)", "Bash(git status *)"]
+                     "Bash(git commit -F *)", "Bash(git status)", "Bash(git status *)",
+                     # Subagents (engineer, scout, ...) cannot prompt in print mode, so anything unlisted is denied.
+                     "Bash(git diff *)", "Bash(git log *)", "Bash(git branch --show-current)",
+                     "Bash(gh issue list *)", "Bash(gh issue view *)", "Bash(python3 *harness.py *)",
+                     "Bash(npm run *)", "Bash(npm test *)"]
 
     def run_issue(n):
         with open(sessions / f"issue-{n}-{int(time.time())}.log", "w", encoding="utf-8") as out:
