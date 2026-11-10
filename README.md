@@ -198,7 +198,7 @@ agents/           subagent definitions: scout, planner, engineer, claude-reviewe
 skills/           slash commands: /ship, /review-pr, /harness-init, /harness-report
 hooks/hooks.json  git guard, per-agent metrics, account check
 scripts/          harness.py (CLI), defaults.toml, claude-accounts.sh, usage.py, statusline_capture.py
-docs/             factory-design.md (planned factory layer)
+docs/             factory-design.md (planned factory layer), factory-allowlist.md (per-repo command allow list)
 ```
 
 ## Author

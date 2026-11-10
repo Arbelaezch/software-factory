@@ -577,5 +577,23 @@ def types_ns(**kw):
     return types.SimpleNamespace(**kw)
 
 
+class ProjectAllowRulesTests(unittest.TestCase):
+    def test_accepts_repo_entry_points(self):
+        ok, bad = h.project_allow_rules({"allowed_tools": [
+            "Bash(scripts/check.sh*)", "Bash(env/bin/python manage.py check_tailoring*)", "Bash(make verify-*)"]})
+        self.assertEqual(len(ok), 3)
+        self.assertEqual(bad, [])
+
+    def test_rejects_unsafe_rules(self):
+        rules = ["Read(*)", "Bash(*)", "Bash(git push *)", "Bash(gh pr merge *)", "Bash(python3 -c *)",
+                 "Bash(/usr/bin/python3 x.py)", "Bash(a.sh && b.sh)", "Bash(a.sh | tee x)", "Bash(rm -rf *)"]
+        ok, bad = h.project_allow_rules({"allowed_tools": rules})
+        self.assertEqual(ok, [])
+        self.assertEqual(len(bad), len(rules))
+
+    def test_missing_key(self):
+        self.assertEqual(h.project_allow_rules({}), ([], []))
+
+
 if __name__ == "__main__":
     unittest.main()
