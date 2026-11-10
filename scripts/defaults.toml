@@ -65,6 +65,7 @@ protected_branches = ["main", "master", "dev", "develop", "staging", "production
 [loop]
 max_review_rounds = 3          # after this many rounds with open issues -> escalate to you
 max_gate_retries = 2           # engineer retries when gates fail before escalating
+max_gate_blocks = 3            # times the stop hook sends an engineer back for a missing/stale gates run, then it lets it finish and flags the run
 fix_severities = ["blocking", "should_fix"]   # confirmed findings sent back to the engineer
 quick_max_review_rounds = 1    # used by `/ship --quick`
 

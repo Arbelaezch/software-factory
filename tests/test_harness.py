@@ -634,6 +634,7 @@ class GateEnforcementTests(unittest.TestCase):
         self.run_ = {"id": "r1", "mode": "full", "repos": {"app": {"base_commit": self.git("rev-parse", "HEAD")}}}
         self.cfg = {"repos": {"app": {"path": "app", "gates": [{"name": "tests", "cmd": "true", "kind": "pytest"}]}}}
         self.transcript = self.root / "agent.jsonl"
+        self.events = []
         self.patches = [mock.patch.object(h, "ROOT", self.root)]
         for p in self.patches:
             p.start()
@@ -700,6 +701,7 @@ class GateEnforcementTests(unittest.TestCase):
         payload = {"agent_type": agent, "agent_transcript_path": str(self.transcript), **payload}
         (self.root / ".harness" / "runs").mkdir(parents=True, exist_ok=True)
         with mock.patch.object(h, "current_run_id", lambda: "r1"), mock.patch.object(h, "RUNS_DIR", self.root), \
+                mock.patch.object(h, "log_event", self.events.append), \
                 mock.patch.object(h.sys, "stdin", io.StringIO(json.dumps(payload))), \
                 contextlib.redirect_stderr(io.StringIO()) as err:
             (self.root / "r1").mkdir(exist_ok=True)
@@ -720,6 +722,28 @@ class GateEnforcementTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("never ran the gates", err)
         self.assertEqual(self.run_hook({}, agent="harness:scout")[0], 0)
+
+    def test_hook_stops_blocking_after_the_limit_and_flags_the_run(self):
+        (self.repo / "a.py").write_text("x = 2\n")
+        self.edit_transcript(self.repo / "a.py")
+        results = [self.run_hook({"agent_id": "a1", "last_assistant_message": "GATES PASS"}) for _ in range(4)]
+        self.assertEqual([c for c, _ in results], [2, 2, 2, 0])
+        self.assertTrue(all("NEEDS USER: gates command denied" in e for c, e in results if c == 2))
+        self.assertIn("Block 3 of 3", results[2][1])
+        unenforced = json.loads((self.root / "r1" / "gate-unenforced.json").read_text())
+        self.assertEqual(unenforced[0]["agent_id"], "a1")
+        self.assertEqual([e["kind"] for e in self.events], ["gate_unenforced"])
+        # another engineer starts with its own count
+        self.assertEqual(self.run_hook({"agent_id": "a2", "last_assistant_message": "GATES PASS"})[0], 2)
+
+    def test_summary_lists_unenforced_gates(self):
+        h.write_json(self.d / "gate-unenforced.json", [{"agent_id": "a1", "problems": ["[app] never ran"], "blocks": 3}])
+        run = {**self.run_, "task": "t"}
+        with mock.patch.object(h, "load_run", lambda r=None: (self.d, run)), mock.patch.object(h, "read_events", lambda: []), \
+                mock.patch.object(h, "run_totals", lambda rid: {"claude_cost_usd_est": 0, "external_cost_usd": 0}), \
+                mock.patch.object(h, "write_pr_descriptions", lambda *a: []), contextlib.redirect_stdout(io.StringIO()) as out:
+            h.cmd_summary(mock.Mock(run=None), {**self.cfg, "git": {}})
+        self.assertIn("Gates NOT enforced", out.getvalue())
 
     def test_hook_allows_a_review_run(self):
         (self.repo / "a.py").write_text("x = 2\n")

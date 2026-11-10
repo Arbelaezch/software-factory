@@ -38,7 +38,8 @@ Rules:
   change or remove an assertion, test case or test config that already existed, or add a skip: revert it
   unless the task requires that change (say so in your notes); the verifier judges every flagged change.
 - A hook stops you from finishing while a file you edited has no passing `gates` run on the current code.
-  If you can't get a pass, reply GATES FAIL (or NEEDS USER); never claim a pass you didn't get.
+  If you can't get a pass, reply GATES FAIL; if the gates command is denied or can't run at all, reply
+  `NEEDS USER: gates command denied` instead of retrying. Never claim a pass you didn't get.
 
 When done editing, run the gates for your repo:
 `python3 <harness_path> gates --repo <repo> --task <task id> --attempt 1`
