@@ -409,7 +409,7 @@ class HarnessWiringTests(unittest.TestCase):
             events = [json.loads(x)["kind"] for x in (root / ".factory" / "log.jsonl").read_text().splitlines()]
             left = list((Path(tmp) / ".software-factory" / "markers").glob("*.json"))
         self.assertIn("args: -p /factory-issue 4 --permission-mode acceptEdits --add-dir", text)
-        self.assertIn('--allowedTools Bash(git push origin *) Bash(gh pr create *) Bash(git add *) Bash(git commit -F *) Bash(git status) Bash(git status *) Bash(git diff *) Bash(git log *) Bash(git branch --show-current) Bash(gh issue list *) Bash(gh issue view *) Bash(python3 *harness.py *) Bash(npm run *) Bash(npm test *)', text)  # push is pre-approved for the issue session
+        self.assertIn('--allowedTools Bash(git push origin *) Bash(gh pr create *) Bash(git add *) Bash(git commit -F *) Bash(git status) Bash(git status *) Bash(git diff *) Bash(git log *) Bash(git branch --show-current) Bash(gh issue list *) Bash(gh issue view *) Bash(gh pr checks *) Bash(python3 *harness.py *) Bash(npm run *) Bash(npm test *)', text)  # push is pre-approved for the issue session
         self.assertIn(str(SCRIPTS.parent), text)  # the plugin root is readable by the headless session
         self.assertIn("marker set: yes", text)
         self.assertEqual(text.splitlines()[-1].strip(), "1")  # exactly one marker while the session ran
@@ -575,6 +575,24 @@ class FrontDoorTests(unittest.TestCase):
 def types_ns(**kw):
     import types
     return types.SimpleNamespace(**kw)
+
+
+class ProjectAllowRulesTests(unittest.TestCase):
+    def test_accepts_repo_entry_points(self):
+        ok, bad = h.project_allow_rules({"allowed_tools": [
+            "Bash(scripts/check.sh*)", "Bash(env/bin/python manage.py check_tailoring*)", "Bash(make verify-*)"]})
+        self.assertEqual(len(ok), 3)
+        self.assertEqual(bad, [])
+
+    def test_rejects_unsafe_rules(self):
+        rules = ["Read(*)", "Bash(*)", "Bash(git push *)", "Bash(gh pr merge *)", "Bash(python3 -c *)",
+                 "Bash(/usr/bin/python3 x.py)", "Bash(a.sh && b.sh)", "Bash(a.sh | tee x)", "Bash(rm -rf *)"]
+        ok, bad = h.project_allow_rules({"allowed_tools": rules})
+        self.assertEqual(ok, [])
+        self.assertEqual(len(bad), len(rules))
+
+    def test_missing_key(self):
+        self.assertEqual(h.project_allow_rules({}), ([], []))
 
 
 if __name__ == "__main__":

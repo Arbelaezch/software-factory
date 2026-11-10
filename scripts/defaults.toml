@@ -167,4 +167,5 @@ claude_args = ["--permission-mode", "acceptEdits"]   # passed to every headless 
 merge = "auto"            # "auto": wait for CI, then squash-merge each PR (one ci-fixer attempt on a failure); "manual": stop at awaiting-merge. /ship is always manual
 ci_poll = 30              # seconds between CI checks
 ci_timeout = 1800         # give up waiting for CI after this many seconds
+allowed_tools = []        # extra Bash(...) rules for issue sessions; set per project, see docs/factory-allowlist.md
 ci_grace = 90             # seconds to wait for checks to appear before treating the repo as having no CI

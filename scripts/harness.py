@@ -3955,6 +3955,34 @@ def cmd_factory_run(a, cfg):
         factory_log({"kind": "supervisor_stopped", "why": why})
 
 
+# First words a repo may not allow-list: the factory's git/gh policy owns those, the rest escape the repo or the shell.
+ALLOW_FORBIDDEN = {"git", "gh", "sudo", "su", "rm", "rmdir", "mv", "dd", "chmod", "chown", "kill", "pkill", "killall",
+                   "ssh", "scp", "rsync", "curl", "wget", "nc", "bash", "sh", "zsh", "eval", "exec", "env", "xargs",
+                   "docker", "kubectl", "terraform", "pip", "pip3", "brew", "npm", "npx", "python", "python3", "node"}
+
+
+def project_allow_rules(fc: dict) -> tuple[list[str], list[str]]:
+    """Validate [factory].allowed_tools from a project's harness.toml. Returns (accepted, rejected-with-reason)."""
+    ok, bad = [], []
+    for rule in fc.get("allowed_tools") or []:
+        m = re.fullmatch(r"Bash\((.+)\)", str(rule).strip())
+        body = m.group(1).strip() if m else ""
+        words = body.split()
+        if not m:
+            bad.append(f"{rule}: only Bash(...) rules are allowed")
+        elif re.search(r"[;&|`<>\n]|\$\(", body):
+            bad.append(f"{rule}: no chaining, pipes, redirects or substitution; put the steps in a script")
+        elif not body.strip("* "):
+            bad.append(f"{rule}: a bare wildcard is not allowed")
+        elif words[0] in ALLOW_FORBIDDEN or (words[0].startswith("/") and Path(words[0]).name in ALLOW_FORBIDDEN):
+            bad.append(f"{rule}: `{words[0]}` is not allowed in a project list (use a script that wraps it)")
+        elif words[0].startswith("*"):
+            bad.append(f"{rule}: the command name cannot be a wildcard")
+        else:
+            ok.append(f"Bash({body})")
+    return ok, bad
+
+
 def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
 
     sessions = ROOT / ".factory" / "sessions"
@@ -3978,12 +4006,17 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
                      "Bash(git commit -F *)", "Bash(git status)", "Bash(git status *)",
                      # Subagents (engineer, scout, ...) cannot prompt in print mode, so anything unlisted is denied.
                      "Bash(git diff *)", "Bash(git log *)", "Bash(git branch --show-current)",
-                     "Bash(gh issue list *)", "Bash(gh issue view *)", "Bash(python3 *harness.py *)",
+                     "Bash(gh issue list *)", "Bash(gh issue view *)", "Bash(gh pr checks *)", "Bash(python3 *harness.py *)",
                      "Bash(npm run *)", "Bash(npm test *)",
                      # Read-only checks for running the app in a browser (stall and two-tab checks).
                      "Bash(docker ps)", "Bash(docker ps *)", "Bash(lsof -i *)", "Bash(lsof -nP -i *)",
                      "Bash(curl http://localhost*)", "Bash(curl -s http://localhost*)",
                      "Bash(curl http://127.0.0.1*)", "Bash(curl -s http://127.0.0.1*)"]
+
+    extra_allow, rejected_allow = project_allow_rules(fc)
+    for why in rejected_allow:
+        factory_log({"kind": "allow_rule_rejected", "why": why})
+    ISSUE_ALLOWED += extra_allow
 
     def run_issue(n):
         try:
