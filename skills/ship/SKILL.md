@@ -58,6 +58,8 @@ When unsure whether a repo is involved, include it; scouts are cheap. Quick mode
 
 ## 3. Plan
 Spawn the `harness:planner` subagent with the run directory. It writes `plan.md` and `tasks.json`.
+Then run `H validate plan`. If it prints `INVALID`, resume the planner once (SendMessage) with that message and
+rerun; if it is still invalid, show the user the message and ask how to proceed.
 If its reply says the job exceeds 6 tasks, show the user the proposed phases and ask (AskUserQuestion)
 whether to plan phase 1 only (Recommended) or keep everything in one run.
 
@@ -108,7 +110,8 @@ For round n = 1, 2, ...:
    spawn the `harness:claude-reviewer` subagent for round n; pass `model: sonnet` for rounds 2 and later,
    where it mainly re-checks known findings.
 2. Spawn the `harness:verifier` subagent for round n. It writes `verified-<n>.json`.
-3. `H verdict --round n`. If it prints `INVALID`, resume the verifier once (SendMessage) with that message,
+3. `H verdict --round n`. If it prints `INVALID` about `review-<n>.json`, do what it says (an outside
+   model's file: spawn the `harness:claude-reviewer` for round n; the fallback reviewer's own file: resume it once) and rerun. If it prints `INVALID` about `verified-<n>.json`, resume the verifier once (SendMessage) with that message,
    then rerun (the message may also ask for judgements on flagged test changes, listed in `tamper.json`). Otherwise
    it prints `DECISION: DONE | FIX | ESCALATE`. A flagged test change the verifier calls `tampered` goes to the engineer
    like any confirmed finding; if you, the user, accept a flagged change, record it with `H tamper clear <id> --reason "..."`.
