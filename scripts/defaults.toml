@@ -21,6 +21,9 @@ timeout_seconds = 900
 autodetect_lint = false
 # Lines of failing output shown to the agent (full logs are saved in the run dir).
 failure_tail_lines = 60
+# Globs (repo-relative) of existing test files that may change without a TEST TAMPERING flag.
+# A plan task can also allow paths with `tests_may_change` in tasks.json.
+tamper_allow = []
 
 # ---------------------------------------------------------------------------
 # Git and GitHub policy. Enforced by PreToolUse hooks on every Bash call.

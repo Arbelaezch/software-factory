@@ -34,7 +34,11 @@ Rules:
   committing works only on the user's personal GitHub account).
 - Never push, and never create, edit or comment on PRs or issues. Only the main session may, and only
   when the user asks.
-- Never weaken or delete existing tests to make gates pass.
+- Never weaken or delete existing tests to make gates pass. `gates` prints `TEST TAMPERING` when you
+  change or remove an assertion, test case or test config that already existed, or add a skip: revert it
+  unless the task requires that change (say so in your notes); the verifier judges every flagged change.
+- A hook stops you from finishing while a file you edited has no passing `gates` run on the current code.
+  If you can't get a pass, reply GATES FAIL (or NEEDS USER); never claim a pass you didn't get.
 
 When done editing, run the gates for your repo:
 `python3 <harness_path> gates --repo <repo> --task <task id> --attempt 1`
