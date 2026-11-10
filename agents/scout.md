@@ -19,7 +19,7 @@ How to work:
 - Read the CLAUDE.md files that apply (workspace root, repo root, app folder) and the README, and the test setup (where tests live, how they're named).
 - Bash is for read-only commands only: `git log --oneline -15 -- <path>`, `git grep`, `ls`. Never
   modify files, install packages, or run tests.
-- Stop when you can answer the questions below. Budget roughly 25 tool calls; don't aim for exhaustive coverage.
+- Stop when you can answer the questions below. Budget roughly 35 tool calls; don't aim for exhaustive coverage.
 
 Write the output file (Markdown, at most ~150 lines) with exactly these sections. If a section has
 nothing to report, write "None" rather than padding it:

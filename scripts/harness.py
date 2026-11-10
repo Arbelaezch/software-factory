@@ -2026,12 +2026,28 @@ def hook_engineer_gates(cfg):
     if not transcript:
         return
     problems = engineer_gate_problems(payload, cfg, d, run, transcript)
-    if problems:
-        print("[harness] You can't finish yet: " + "; ".join(problems) + f". Run `python3 {HARNESS_SCRIPT} gates "
-              "--repo <repo> --task <task id> --attempt <n>` and fix any new failures, then finish. If you "
-              "cannot get the gates to pass, reply GATES FAIL with the reason; if you're blocked, reply "
-              "NEEDS USER.", file=sys.stderr)
-        sys.exit(2)
+    if not problems:
+        return
+    limit = (cfg.get("loop") or {}).get("max_gate_blocks", 3)
+    blocks = read_json(d / "gate-blocks.json", {}) or {}
+    aid = payload.get("agent_id") or "unknown"
+    n = blocks.get(aid, 0) + 1
+    if n > limit:
+        # A denied or broken gates command makes every retry a tool call, which resets Claude Code's own
+        # consecutive-block cap, so stop blocking here and make sure the manager and the user can see it.
+        unenforced = read_json(d / "gate-unenforced.json", []) or []
+        unenforced.append({"agent_id": aid, "problems": problems, "blocks": n - 1, "at": iso()})
+        write_json(d / "gate-unenforced.json", unenforced)
+        log_event({"kind": "gate_unenforced", "run_id": rid, "stage": "engineer", "agent_id": aid, "problems": problems})
+        return
+    blocks[aid] = n
+    write_json(d / "gate-blocks.json", blocks)
+    print("[harness] You can't finish yet: " + "; ".join(problems) + f". Run `python3 {HARNESS_SCRIPT} gates "
+          "--repo <repo> --task <task id> --attempt <n>` and fix any new failures, then finish. If you "
+          "cannot get the gates to pass, reply GATES FAIL with the reason. If the gates command is denied "
+          "by permissions or can't run at all, don't keep retrying: reply `NEEDS USER: gates command "
+          f"denied` and say why. (Block {n} of {limit}.)", file=sys.stderr)
+    sys.exit(2)
 
 
 # --------------------------------------------------------------------------- test tampering
@@ -3064,6 +3080,13 @@ def cmd_summary(a, cfg):
     lines += ["## Cost", f"- Claude: ${t['claude_cost_usd_est']:.2f} API-equivalent "
               f"({(cfg.get('metrics') or {}).get('anthropic_billing', 'seat')} billing; manager cost is added at run end)",
               f"- Outside models: ${t['external_cost_usd']:.3f} actual", ""]
+    unenforced = read_json(d / "gate-unenforced.json", []) or []
+    if unenforced:
+        lines.append("## Gates NOT enforced")
+        lines.append("An engineer was allowed to finish without a passing gates run after repeated blocks; "
+                     "run `harness gates` yourself before trusting the result.")
+        lines += [f"- {u['agent_id']}: {'; '.join(u['problems'])}" for u in unenforced]
+        lines.append("")
     drafts = write_pr_descriptions(d, run, cfg, changed, gate_events)
     if drafts:
         lines += ["## PR descriptions (drafts)", *[f"- `{p}`" for p in drafts], ""]
