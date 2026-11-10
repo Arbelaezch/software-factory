@@ -772,6 +772,8 @@ def find_agent_transcript(payload: dict) -> Path | None:
 def hook_subagent_stop(cfg):
     payload = json.loads(sys.stdin.read() or "{}")
     rid = current_run_id()
+    if not rid and not (payload.get("agent_type") or "").startswith("harness:"):
+        return  # a subagent of the user's own session, not part of any run: nothing to attribute
     if rid and payload.get("transcript_path"):
         d = RUNS_DIR / rid
         run = read_json(d / "run.json", {})
@@ -3152,6 +3154,11 @@ def fmt_table(rows: list[list], headers: list[str]) -> str:
     return "\n".join([line, sep, *body])
 
 
+def unattributed_agent_events(events: list[dict]) -> list[dict]:
+    """Agent events that carry no usable usage: no agent type, or a transcript that could not be found."""
+    return [e for e in events if e.get("kind") == "agent" and (e.get("error") or e.get("stage") == "unknown")]
+
+
 def cmd_report(a, cfg):
     events = read_events()
     cutoff = now() - dt.timedelta(days=a.days)
@@ -3186,6 +3193,10 @@ def cmd_report(a, cfg):
     print(f"== Agents and models (last {a.days} days) ==")
     print(fmt_table(rows, ["stage", "model", "calls", "avg in", "avg out", "avg $", "total $", "billing", "avg time"])
           if rows else "(no usage recorded yet)")
+    lost = unattributed_agent_events(events)
+    if lost:
+        print(f"{len(lost)} agent event(s) have no usage data (transcript not found or no agent type); "
+              "they are excluded above.")
 
     gates = [e for e in events if e.get("kind") == "gate"]
     if gates:
@@ -4597,6 +4608,10 @@ def cmd_doctor(a, cfg):
         for g in gates:
             print(f"         gate {g['name']}: {g['cmd']}" + (f"  (cwd {g['cwd']})" if g.get("cwd", ".") != "." else "")
                   + ("  [auto-detected]" if auto else ""))
+    print("\nMetrics:")
+    lost = unattributed_agent_events(read_events())
+    line(not lost, "all agent events have usage data" if not lost else
+         f"{len(lost)} agent event(s) in {EVENTS_FILE.name} have no usage data (transcript not found or no agent type)")
     print("\nReviewer:")
     rc = cfg.get("reviewer") or {}
     prov = rc.get("provider", "deepseek")

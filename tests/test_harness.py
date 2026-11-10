@@ -614,6 +614,52 @@ class TamperScanTests(unittest.TestCase):
         self.assertEqual(self.kinds(diff), ["snapshot-loosened"])
 
 
+class SubagentStopTests(unittest.TestCase):
+    """hook_subagent_stop: only harness agents or agents inside a run are logged."""
+
+    def run_hook(self, payload, rid=None, path=None):
+        events = []
+        with mock.patch.object(h, "current_run_id", return_value=rid), \
+                mock.patch.object(h, "find_agent_transcript", return_value=path) as find, \
+                mock.patch.object(h, "log_event", events.append), \
+                mock.patch.object(h.time, "sleep"), \
+                mock.patch.object(h.sys, "stdin", io.StringIO(json.dumps(payload))):
+            h.hook_subagent_stop({})
+        return events, find
+
+    def test_non_harness_agent_outside_a_run_is_skipped(self):
+        for agent_type in ("Explore", "general-purpose", None):
+            events, find = self.run_hook({"agent_id": "a1", "agent_type": agent_type})
+            self.assertEqual(events, [])
+            find.assert_not_called()
+
+    def test_harness_agent_with_missing_transcript_logs_an_error(self):
+        events, _ = self.run_hook({"agent_id": "a1", "agent_type": "harness:scout"})
+        self.assertEqual([(e["stage"], e["error"]) for e in events], [("scout", "transcript not found")])
+
+    def test_agent_inside_a_run_with_missing_transcript_logs_an_error(self):
+        with mock.patch.object(h, "RUNS_DIR", Path(tempfile.gettempdir())):
+            events, _ = self.run_hook({"agent_id": "a1", "agent_type": "Explore"}, rid="r1")
+        self.assertEqual([(e["run_id"], e["stage"]) for e in events], [("r1", "Explore")])
+
+    def test_normal_case_logs_usage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tr = Path(tmp) / "agent.jsonl"
+            tr.write_text(json.dumps({"type": "assistant", "message": {
+                "id": "m1", "model": "claude-sonnet-5-5", "content": [], "usage": {"input_tokens": 5, "output_tokens": 2}}}) + "\n")
+            with mock.patch.object(h, "SEEN_DIR", Path(tmp) / "seen"):
+                events, _ = self.run_hook({"agent_id": "a1", "agent_type": "harness:engineer"}, path=tr)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["stage"], "engineer")
+        self.assertEqual(events[0]["gen_ai.usage.input_tokens"], 5)
+
+    def test_unattributed_events_are_counted(self):
+        evs = [{"kind": "agent", "stage": "unknown", "error": "transcript not found"},
+               {"kind": "agent", "stage": "scout", "error": "transcript not found"},
+               {"kind": "agent", "stage": "scout"}, {"kind": "gate"}]
+        self.assertEqual(len(h.unattributed_agent_events(evs)), 2)
+
+
 class GateEnforcementTests(unittest.TestCase):
     """The engineer SubagentStop hook, the tamper scan in a real repo, and the verdict that uses it."""
 
