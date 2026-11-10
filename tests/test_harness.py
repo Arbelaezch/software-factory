@@ -660,6 +660,134 @@ class SubagentStopTests(unittest.TestCase):
         self.assertEqual(len(h.unattributed_agent_events(evs)), 2)
 
 
+class ValidateTests(unittest.TestCase):
+    """harness validate: plan, review, verified and fix handoff files."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        (self.root / "app").mkdir()
+        (self.root / "app" / "a.py").write_text("x = 1\n")
+        self.cfg = {"repos": {"app": {"path": "app"}, "web": {"path": "web"}}}
+        p = mock.patch.object(h, "ROOT", self.root)
+        p.start()
+        self.addCleanup(p.stop)
+        self.d = self.root / "run"
+        self.d.mkdir()
+
+    def task(self, **kw):
+        return {"id": "T1", "title": "t", "repo": "app", "depends_on": [], "model": "sonnet",
+                "files": ["a.py"], "acceptance": ["tests pass"], **kw}
+
+    def plan(self, *tasks, repos=("app",)):
+        return {"goal": "g", "repos": list(repos), "tasks": list(tasks) or [self.task()]}
+
+    def finding(self, n=1, rnd=1, **kw):
+        return {"id": f"R{rnd}-{n}", "severity": "blocking", "repo": "app", "file": "a.py", "line": 3,
+                "title": "t", "detail": "d", **kw}
+
+    def has(self, errors, text):
+        self.assertTrue(any(text in e for e in errors), errors)
+
+    def test_valid_plan(self):
+        self.assertEqual(h.validate_plan(self.plan(self.task(), self.task(id="T2", depends_on=["T1"],
+                                                                         files=["new.py (create)"])), self.cfg), [])
+
+    def test_plan_failures(self):
+        cases = [
+            (self.plan(self.task(), self.task()), "duplicate id"),
+            (self.plan(self.task(repo="nope")), "unknown repo 'nope'"),
+            (self.plan(self.task(repo="web"), repos=("app",)), "not in the top-level"),
+            (self.plan(self.task(), repos=("app", "ghost")), "unknown repo 'ghost'"),
+            (self.plan(self.task(depends_on=["T9"])), "unknown task 'T9'"),
+            (self.plan(self.task(depends_on=["T1"])), "depends on itself"),
+            (self.plan(self.task(depends_on=["T2"]), self.task(id="T2", depends_on=["T1"])), "cycle"),
+            (self.plan(self.task(model="gpt")), "model must be"),
+            (self.plan(self.task(files=["missing.py"])), "does not exist"),
+            (self.plan(self.task(acceptance=[])), "acceptance"),
+            ({"tasks": []}, "at least one task"),
+        ]
+        for plan, text in cases:
+            with self.subTest(text):
+                self.has(h.validate_plan(plan, self.cfg), text)
+
+    def test_created_files_need_no_marker_when_present_and_marker_is_stripped_for_gates(self):
+        self.assertEqual(h.CREATE_MARK_RE.sub("", "new.py (create)"), "new.py")
+        h.write_json(self.d / "tasks.json", self.plan(self.task(files=["a.py", "new.py (create)"])))
+        self.assertEqual(h.planned_files(self.d, "app"), ["a.py", "new.py"])
+
+    def test_valid_review(self):
+        self.assertEqual(h.validate_review({"round": 1, "findings": [self.finding(1), self.finding(2, line=None)]}, 1), [])
+
+    def test_review_failures(self):
+        cases = [
+            ([self.finding(1, severity="major")], "severity must be"),
+            ([self.finding(1), self.finding(1)], "duplicate id"),
+            ([self.finding(1, rnd=2)], "id must look like R1-"),
+            ([self.finding(1, line="3")], "line must be an integer"),
+            ([self.finding(1, file="")], "file is required"),
+            ([self.finding(1, detail=None)], "detail is required"),
+            ([self.finding(1, status="open")], "status must be"),
+            (["nope"], "must be an object"),
+        ]
+        for findings, text in cases:
+            with self.subTest(text):
+                self.has(h.validate_review({"round": 1, "findings": findings}, 1), text)
+        self.has(h.validate_review({"findings": "x"}, 1), "findings")
+        self.has(h.validate_review({"round": 2, "findings": []}, 1), "expected 1")
+
+    def test_verified(self):
+        review = {"findings": [self.finding(1), self.finding(2)]}
+        ok = {"findings": [{"id": "R1-1", "verdict": "confirmed", "severity": "nit"},
+                           {"id": "R1-2", "verdict": "rejected"}],
+              "additional": [{"severity": "should_fix", "file": "a.py", "line": 1, "title": "t", "detail": "d"}]}
+        self.assertEqual(h.validate_verified(ok, 1, review), [])
+        self.has(h.validate_verified({"findings": ok["findings"][:1]}, 1, review), "does not judge R1-2")
+        self.has(h.validate_verified({"findings": [*ok["findings"], {"id": "R1-9", "verdict": "confirmed"}]}, 1, review),
+                 "not in review-1.json")
+        self.has(h.validate_verified({"findings": [{"id": "R1-1", "verdict": "maybe"}, ok["findings"][1]]}, 1, review),
+                 "verdict must be")
+        self.has(h.validate_verified({"findings": [*ok["findings"], ok["findings"][0]]}, 1, review), "judged twice")
+
+    def test_fix(self):
+        self.assertEqual(h.validate_fix({"round": 1, "findings": [self.finding(1), {**self.finding(1), "id": "V1-1"}]}, 1), [])
+        self.has(h.validate_fix({"round": 1, "findings": []}, 1), "nothing to fix")
+
+    def run_validate(self, what, rnd=None):
+        out = io.StringIO()
+        args = mock.Mock(what=what, round=rnd)
+        with mock.patch.object(h, "load_run", return_value=(self.d, {})), contextlib.redirect_stdout(out):
+            try:
+                h.cmd_validate(args, self.cfg)
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue()
+
+    def test_command_reports_ok_missing_and_invalid(self):
+        self.assertEqual(self.run_validate("plan")[0], 2)
+        h.write_json(self.d / "tasks.json", self.plan())
+        self.assertEqual(self.run_validate("plan"), (0, "OK: tasks.json\n"))
+        h.write_json(self.d / "tasks.json", self.plan(self.task(acceptance=[])))
+        code, out = self.run_validate("plan")
+        self.assertEqual(code, 2)
+        self.assertTrue(out.startswith("INVALID: tasks.json:"))
+        (self.d / "review-1.json").write_text("{not json")
+        self.assertIn("not valid JSON", self.run_validate("review", 1)[1])
+
+    def test_verdict_stops_on_a_malformed_review(self):
+        h.write_json(self.d / "review-1.json", {"round": 1, "findings": [self.finding(1, severity="major")]})
+        h.write_json(self.d / "verified-1.json", {"findings": []})
+        out = io.StringIO()
+        with mock.patch.object(h, "load_run", return_value=(self.d, {"id": "r1"})), contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as cm:
+                h.cmd_verdict(mock.Mock(round=1), {})
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("INVALID: review-1.json", out.getvalue())
+        self.assertIn("claude-reviewer", out.getvalue())
+
+
 class GateEnforcementTests(unittest.TestCase):
     """The engineer SubagentStop hook, the tamper scan in a real repo, and the verdict that uses it."""
 

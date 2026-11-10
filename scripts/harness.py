@@ -1771,7 +1771,7 @@ def planned_files(d: Path, rname: str) -> list[str]:
     files = []
     for t in plan.get("tasks", []):
         if t.get("repo") == rname:
-            files += [f for f in t.get("files", []) if isinstance(f, str)]
+            files += [CREATE_MARK_RE.sub("", f) for f in t.get("files", []) if isinstance(f, str)]
     return files
 
 
@@ -2541,6 +2541,189 @@ def cmd_review(a, cfg):
     print(f"Findings: {d}/review-{a.round}.json")
 
 
+CREATE_MARK_RE = re.compile(r"\s*\(create\)\s*$", re.I)
+TASK_MODELS = ("sonnet", "opus")
+
+
+def _nonempty_str(v) -> bool:
+    return isinstance(v, str) and bool(v.strip())
+
+
+def validate_plan(plan, cfg: dict) -> list[str]:
+    """Every problem with tasks.json, as readable strings (empty = good)."""
+    if not isinstance(plan, dict) or not isinstance(plan.get("tasks"), list) or not plan["tasks"]:
+        return ["tasks.json must be {\"repos\": [...], \"tasks\": [...]} with at least one task"]
+    rs = repos(cfg)
+    errors, ids = [], {}
+    listed = plan.get("repos")
+    if not isinstance(listed, list) or not listed or not all(isinstance(r, str) for r in listed):
+        errors.append("\"repos\" must be a non-empty list of repo names")
+        listed = []
+    for r in listed:
+        if r not in rs:
+            errors.append(f"repos: unknown repo {r!r} (known: {', '.join(rs)})")
+    for n, t in enumerate(plan["tasks"], 1):
+        if not isinstance(t, dict):
+            errors.append(f"task {n}: must be an object")
+            continue
+        tid = t.get("id")
+        who = f"task {tid!r}" if _nonempty_str(tid) else f"task {n}"
+        if not _nonempty_str(tid):
+            errors.append(f"{who}: id is required")
+        elif tid in ids:
+            errors.append(f"{who}: duplicate id")
+        else:
+            ids[tid] = t
+        if not _nonempty_str(t.get("title")):
+            errors.append(f"{who}: title is required")
+        repo = t.get("repo")
+        if repo not in rs:
+            errors.append(f"{who}: unknown repo {repo!r} (known: {', '.join(rs)})")
+        elif listed and repo not in listed:
+            errors.append(f"{who}: repo {repo!r} is not in the top-level \"repos\" list")
+        if t.get("model") not in TASK_MODELS:
+            errors.append(f"{who}: model must be one of {', '.join(TASK_MODELS)}")
+        deps = t.get("depends_on")
+        if not isinstance(deps, list) or not all(_nonempty_str(x) for x in deps):
+            errors.append(f"{who}: depends_on must be a list of task ids ([] if none)")
+        files = t.get("files")
+        if not isinstance(files, list) or not all(_nonempty_str(x) for x in files):
+            errors.append(f"{who}: files must be a list of paths")
+        elif repo in rs:
+            base = rs[repo]["abs"]
+            for f in files:
+                path = CREATE_MARK_RE.sub("", f).strip()
+                if path != f.strip() or (base / path).exists() or (ROOT / path).exists():
+                    continue
+                errors.append(f"{who}: file {path!r} does not exist; fix the path or mark it \"{path} (create)\"")
+        ac = t.get("acceptance")
+        if not isinstance(ac, list) or not ac or not all(_nonempty_str(x) for x in ac):
+            errors.append(f"{who}: acceptance needs at least one non-empty criterion")
+        tmc = t.get("tests_may_change")
+        if tmc is not None and (not isinstance(tmc, list) or not all(_nonempty_str(x) for x in tmc)):
+            errors.append(f"{who}: tests_may_change must be a list of path globs")
+    for tid, t in ids.items():
+        for dep in t.get("depends_on") if isinstance(t.get("depends_on"), list) else []:
+            if dep == tid:
+                errors.append(f"task {tid!r}: depends on itself")
+            elif dep not in ids:
+                errors.append(f"task {tid!r}: depends on unknown task {dep!r}")
+    if not errors:
+        left = {tid: set(t["depends_on"]) for tid, t in ids.items()}
+        while left:
+            ready = [k for k, v in left.items() if not (v & set(left))]
+            if not ready:
+                errors.append(f"dependencies form a cycle among {', '.join(sorted(left))}")
+                break
+            for k in ready:
+                del left[k]
+    return errors
+
+
+def _validate_finding(f, who: str) -> list[str]:
+    errors = []
+    if not isinstance(f, dict):
+        return [f"{who}: must be an object"]
+    if f.get("severity") not in SEVERITIES:
+        errors.append(f"{who}: severity must be one of {', '.join(SEVERITIES)}")
+    for field in ("file", "title", "detail"):
+        if not _nonempty_str(f.get(field)):
+            errors.append(f"{who}: {field} is required")
+    line = f.get("line")
+    if line is not None and (isinstance(line, bool) or not isinstance(line, int)):
+        errors.append(f"{who}: line must be an integer")
+    if f.get("status") not in (None, "new", "unresolved"):
+        errors.append(f"{who}: status must be new or unresolved")
+    return errors
+
+
+def _validate_findings_file(data, rnd: int, label: str, id_prefix: str | None = "R") -> list[str]:
+    if not isinstance(data, dict) or not isinstance(data.get("findings"), list):
+        return [f"{label} must be an object with a \"findings\" list"]
+    errors, seen = [], set()
+    if data.get("round") not in (None, rnd):
+        errors.append(f"round is {data.get('round')!r}, expected {rnd}")
+    for n, f in enumerate(data["findings"], 1):
+        fid = f.get("id") if isinstance(f, dict) else None
+        who = f"finding {fid!r}" if _nonempty_str(fid) else f"finding {n}"
+        if not _nonempty_str(fid):
+            errors.append(f"{who}: id is required")
+        elif fid in seen:
+            errors.append(f"{who}: duplicate id")
+        else:
+            seen.add(fid)
+            if id_prefix and not re.fullmatch(rf"{id_prefix}{rnd}-\d+", fid):
+                errors.append(f"{who}: id must look like {id_prefix}{rnd}-<number>")
+        errors += _validate_finding(f, who)
+    return errors
+
+
+def validate_review(review, rnd: int) -> list[str]:
+    return _validate_findings_file(review, rnd, f"review-{rnd}.json")
+
+
+def validate_fix(fix, rnd: int) -> list[str]:
+    # Fix files carry confirmed findings from final-<n>.json: reviewer (R), verifier-added (V) or tamper (T) ids.
+    errors = _validate_findings_file(fix, rnd, f"fix-{rnd}.json", id_prefix=None)
+    if not errors and not fix["findings"]:
+        errors.append("findings is empty; there is nothing to fix")
+    return errors
+
+
+def validate_verified(verified, rnd: int, review) -> list[str]:
+    if not isinstance(verified, dict) or not isinstance(verified.get("findings"), list):
+        return [f"verified-{rnd}.json must be an object with a \"findings\" list"]
+    errors, judged = [], set()
+    for n, v in enumerate(verified["findings"], 1):
+        vid = v.get("id") if isinstance(v, dict) else None
+        who = f"finding {vid!r}" if _nonempty_str(vid) else f"finding {n}"
+        if not isinstance(v, dict) or not _nonempty_str(vid):
+            errors.append(f"{who}: id is required")
+            continue
+        if vid in judged:
+            errors.append(f"{who}: judged twice")
+        judged.add(vid)
+        if v.get("verdict") not in ("confirmed", "rejected", "uncertain"):
+            errors.append(f"{who}: verdict must be confirmed, rejected or uncertain")
+        if v.get("severity") is not None and v["severity"] not in SEVERITIES:
+            errors.append(f"{who}: severity must be one of {', '.join(SEVERITIES)}")
+    if isinstance(review, dict):
+        want = [f.get("id") for f in review.get("findings") or [] if isinstance(f, dict) and f.get("id")]
+        missing = [i for i in want if i not in judged]
+        if missing:
+            errors.append(f"does not judge {', '.join(missing)} (every id from review-{rnd}.json exactly once)")
+        extra = sorted(judged - set(want))
+        if extra:
+            errors.append(f"judges ids that are not in review-{rnd}.json: {', '.join(extra)}")
+    for n, x in enumerate(verified.get("additional") or [], 1):
+        errors += _validate_finding(x, f"additional finding {n}")
+    return errors
+
+
+def cmd_validate(a, cfg):
+    d, _ = load_run()
+    rnd = a.round
+    if a.what != "plan" and rnd is None:
+        sys.exit(f"validate {a.what} needs --round")
+    fname = "tasks.json" if a.what == "plan" else f"{a.what}-{rnd}.json"
+    if not (d / fname).is_file():
+        print(f"INVALID: {d}/{fname} does not exist.")
+        sys.exit(2)
+    data = read_json(d / fname)
+    if data is None:
+        print(f"INVALID: {fname} is not valid JSON.")
+        sys.exit(2)
+    errors = (validate_plan(data, cfg) if a.what == "plan" else validate_review(data, rnd) if a.what == "review"
+              else validate_fix(data, rnd) if a.what == "fix"
+              else validate_verified(data, rnd, read_json(d / f"review-{rnd}.json")))
+    if errors:
+        shown = "; ".join(errors[:8]) + (f"; and {len(errors) - 8} more" if len(errors) > 8 else "")
+        print(f"INVALID: {fname}: {shown}. Ask the agent that wrote it (SendMessage) to fix these and rewrite the file, "
+              f"then rerun `validate {a.what}`.")
+        sys.exit(2)
+    print(f"OK: {fname}")
+
+
 def cmd_verdict(a, cfg):
     d, run = load_run()
     lcfg = cfg.get("loop") or {}
@@ -2548,6 +2731,11 @@ def cmd_verdict(a, cfg):
     verified = read_json(d / f"verified-{a.round}.json")
     if review is None:
         sys.exit(f"Missing {d}/review-{a.round}.json")
+    problems = validate_review(review, a.round)
+    if problems:
+        print(f"INVALID: review-{a.round}.json: {'; '.join(problems[:8])}. Spawn the harness:claude-reviewer "
+              f"subagent for round {a.round} (it overwrites the file), then rerun verdict.")
+        sys.exit(2)
     if verified is None:
         sys.exit(f"Missing {d}/verified-{a.round}.json (the verifier writes it)")
     by_id = {f["id"]: f for f in review.get("findings", [])}
@@ -4706,6 +4894,11 @@ def main(argv=None):
     s.add_argument("--round", type=int, required=True)
     s.add_argument("--provider")
     s.set_defaults(fn=cmd_review)
+
+    s = sub.add_parser("validate", help="check a handoff file (plan | review | verified | fix) before the next stage uses it")
+    s.add_argument("what", choices=["plan", "review", "verified", "fix"])
+    s.add_argument("--round", type=int, help="review round (not needed for plan)")
+    s.set_defaults(fn=cmd_validate)
 
     s = sub.add_parser("verdict", help="combine reviewer + verifier output and decide DONE/FIX/ESCALATE")
     s.add_argument("--round", type=int, required=True)

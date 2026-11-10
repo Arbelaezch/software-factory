@@ -48,6 +48,9 @@ Write two files.
  "tasks": [{"id": "T1", "title": "...", "repo": "backend", "depends_on": [], "model": "sonnet",
             "files": ["..."], "acceptance": ["..."]}]}
 ```
+A `files` entry for a file that doesn't exist yet ends with ` (create)`, e.g. `"src/export.py (create)"`;
+every other entry must exist. `harness validate plan` checks this, plus ids, repos, `depends_on`, `model`
+and `acceptance`.
 `repos` lists every repo any task touches (the names under [repos] in .claude/harness.toml).
 If a task must change existing tests (e.g. an assertion that encodes old behaviour), add
 `"tests_may_change": ["<repo-relative path globs>"]` to it; otherwise changes to existing tests are flagged.
