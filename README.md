@@ -73,6 +73,10 @@ which keeps its context small over long runs.
 - **Baseline-aware test gates.** Before any edits, Harness records the failures that already exist
   (jest, pytest, Django, tsc, eslint). Gates then fail only on *new* failures, so the pipeline works on
   real codebases whose test suites aren't green.
+- **Enforced gates and test protection.** A `SubagentStop` hook keeps an engineer from finishing while a file it
+  edited has no passing `gates` run on the current code (the run is tied to a hash of the working tree). `gates`
+  also flags edits to pre-existing tests (removed or altered assertions, skips, deleted tests, loosened
+  thresholds); the verifier must judge each flag before a run can be `DONE`.
 - **Git guard hook.** A `PreToolUse` hook parses every shell command from the manager and all subagents.
   Subagents can never push or write to GitHub. What the main session can do depends on the gh login:
   - **Write account** (`[github] write_accounts`, default `Arbelaezch`, my personal account): commit, push,

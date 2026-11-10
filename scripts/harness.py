@@ -10,7 +10,10 @@ Usage: python3 <plugin>/scripts/harness.py <command> [...]   (run with -h for de
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime as dt
+import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -1123,6 +1126,30 @@ def marker_tamper_denial(payload: dict, factory: dict | None) -> str | None:
     return "Factory marker files are managed by the launcher only." if hit else None
 
 
+PROTECTED_RUN_FILES = {"tamper-cleared.json", "gate-state.json", "tamper.json"}
+
+
+def enforcement_state_denial(payload: dict) -> str | None:
+    """Subagents can't clear their own test-tampering flags or edit the files the gate checks rest on
+    (run-dir gate state, tamper files, the project's harness.toml; an engineer also can't edit tasks.json,
+    where `tests_may_change` lives). Best effort for Bash, where text can be assembled in many ways."""
+    if not payload.get("agent_id"):
+        return None
+    ti = payload.get("tool_input") or {}
+    cmd = (ti.get("command") or "").replace("\\", "/")
+    if re.search(r"harness\.py\b.*\btamper\s+clear\b", cmd) or any(f in cmd for f in ("tamper-cleared", "gate-state.json")):
+        return "Only the user clears test-tampering flags, and gate state is written by `harness gates` alone."
+    for k in ("file_path", "notebook_path"):
+        target = (ti.get(k) or "").replace("\\", "/")
+        base = target.rsplit("/", 1)[-1]
+        if "/.harness/" in target and (base in PROTECTED_RUN_FILES or
+                                       (base == "tasks.json" and (payload.get("agent_type") or "").endswith("engineer"))):
+            return f"{base} is managed by the harness, not by agents."
+        if target.endswith(".claude/harness.toml"):
+            return "Agents don't edit the project's harness config."
+    return None
+
+
 GIT_CONFIG_READS = ("--get", "--get-all", "--get-regexp", "--list", "-l", "--show-origin", "--show-scope")
 
 
@@ -1424,7 +1451,7 @@ def hook_guard_bash(cfg):
     payload = json.loads(sys.stdin.read() or "{}")
     cmd = (payload.get("tool_input") or {}).get("command", "")
     factory = factory_context(payload)
-    reason = marker_tamper_denial(payload, factory) or \
+    reason = marker_tamper_denial(payload, factory) or enforcement_state_denial(payload) or \
         check_bash(cmd, cfg, payload.get("cwd"), subagent=is_subagent(payload, factory), factory=factory)
     if reason:
         log_event({"kind": "guard_block", "run_id": current_run_id(),
@@ -1472,7 +1499,7 @@ def cmd_hook(a, cfg):
         return  # not a harness project: hooks do nothing
     try:
         {"subagent-stop": hook_subagent_stop, "guard-bash": hook_guard_bash,
-         "session-start": hook_session_start}[a.event](cfg)
+         "session-start": hook_session_start, "engineer-gates": hook_engineer_gates}[a.event](cfg)
     except Exception as exc:  # a broken metrics hook must never break the session
         try:
             log_event({"kind": "hook_error", "hook": a.event, "error": repr(exc)[:500]})
@@ -1849,6 +1876,7 @@ def cmd_gates(a, cfg):
             print(f"[{rname}] no gates configured or detected; add some to `.claude/harness.toml`")
             continue
         files = changed_files(rname, rs[rname], run)
+        ran, repo_ok = 0, True
         for g in gates:
             cwd = rs[rname]["abs"] / g.get("cwd", ".")
             cmd = expand_gate_cmd(g["cmd"], files, rs[rname]["abs"], cwd)
@@ -1882,8 +1910,9 @@ def cmd_gates(a, cfg):
                 else:
                     note = "  (failed without recognisable failure lines, e.g. a crash or config error)"
             print(f"[{rname}] {g['name']}: {'PASS' if ok else 'FAIL'} ({secs}s){note}{'  [auto-detected]' if auto else ''}")
+            ran += 1
             if not ok:
-                all_ok = False
+                all_ok = repo_ok = False
                 if new_sigs:
                     print("New failures (not present before your changes):")
                     for x in new_sigs[:40]:
@@ -1895,8 +1924,271 @@ def cmd_gates(a, cfg):
             log_event({"kind": "gate", "run_id": run["id"], "stage": "gates", "repo": rname,
                        "gate": g["name"], "passed": ok, "duration_s": secs, "task": a.task,
                        "attempt": a.attempt, "new_failures": len(new_sigs), "preexisting_failures": pre})
+        record_gate_state(d, rname, rs[rname], run, ran, repo_ok)
+    report_tampering(cfg, run, d, targets)
     print("GATES: PASS" if all_ok else "GATES: FAIL")
     sys.exit(0 if all_ok else 1)
+
+
+# --------------------------------------------------------------------------- gate state (engineer stop hook)
+def tree_fingerprint(rname: str, rcfg: dict, run: dict) -> str:
+    """Hash of the repo's working-tree changes since the run's base commit (tracked diff plus the
+    untracked files the run created), so "gates passed" can be tied to the code they ran against."""
+    path = rcfg["abs"]
+    base = (run.get("repos", {}).get(rname) or {}).get("base_commit") or "HEAD"
+    digest = hashlib.sha256(git(path, "diff", "--binary", "--no-color", base).encode("utf-8", "replace"))
+    for u in sorted(run_untracked(path, rname, run)):
+        digest.update(u.encode("utf-8", "replace"))
+        try:
+            f = path / u
+            size = f.stat().st_size
+            digest.update(f.read_bytes() if size <= 2_000_000 else str(size).encode())
+        except OSError:
+            pass
+    return digest.hexdigest()[:16]
+
+
+def record_gate_state(d: Path, rname: str, rcfg: dict, run: dict, ran: int, passed: bool) -> None:
+    """Remember the latest gates run per repo: how many gates ran, whether they passed, and the tree
+    they ran against. The engineer SubagentStop hook compares this with the tree at stop time."""
+    state = read_json(d / "gate-state.json", {}) or {}
+    state[rname] = {"ran": ran, "passed": passed, "fingerprint": tree_fingerprint(rname, rcfg, run), "at": iso()}
+    write_json(d / "gate-state.json", state)
+
+
+def edited_repos(transcript: Path, cfg: dict) -> list[str]:
+    """Repos a subagent wrote to with Edit/Write/MultiEdit/NotebookEdit, from its transcript. (Edits made
+    through Bash, e.g. sed -i, are not seen; the manager's own `gates` run still covers those.)"""
+    rs = repos(cfg)
+    found: set[str] = set()
+    for e in iter_transcript(transcript):
+        content = (e.get("message") or {}).get("content")
+        if e.get("type") != "assistant" or not isinstance(content, list):
+            continue
+        for block in content:
+            if not (isinstance(block, dict) and block.get("type") == "tool_use"
+                    and block.get("name") in ("Edit", "Write", "MultiEdit", "NotebookEdit")):
+                continue
+            inp = block.get("input") or {}
+            target = inp.get("file_path") or inp.get("notebook_path")
+            for rname, r in rs.items():
+                if within(target, str(r["abs"])):
+                    found.add(rname)
+    return sorted(found)
+
+
+def engineer_gate_problems(payload: dict, cfg: dict, d: Path, run: dict, transcript: Path) -> list[str]:
+    """Why an engineer may not stop yet. Empty means it may."""
+    msg = payload.get("last_assistant_message") or ""
+    if re.search(r"(?im)^\W*(needs user|(the )?plan[ -]is[ -]wrong)", msg):
+        return []  # an escalation (it opens the reply or a line), not a completion that mentions the words
+    state = read_json(d / "gate-state.json", {}) or {}
+    rs = repos(cfg)
+    problems = []
+    for rname in edited_repos(transcript, cfg):
+        gates, _ = gates_for(rname, rs[rname], cfg)
+        if not gates:
+            continue
+        st = state.get(rname)
+        if st is None:
+            problems.append(f"[{rname}] you edited files but never ran the gates")
+        elif st.get("ran", 0) == 0:
+            continue  # no gate applies to the changed files
+        elif re.search(r"(?m)^\W*GATES FAIL", msg):
+            continue  # an honest failure report after the harness's own retry limit
+        elif not st.get("passed"):
+            problems.append(f"[{rname}] the last gates run failed")
+        elif st.get("fingerprint") != tree_fingerprint(rname, rs[rname], run):
+            problems.append(f"[{rname}] files changed after the last gates run")
+    return problems
+
+
+def hook_engineer_gates(cfg):
+    """SubagentStop for harness:engineer: exit 2 (stderr goes back to the agent) until the latest gates
+    run passed against the current code, or the engineer reports GATES FAIL / NEEDS USER. Fails open on
+    any error; Claude Code also overrides a stop hook after repeated consecutive blocks."""
+    payload = json.loads(sys.stdin.read() or "{}")
+    if (payload.get("agent_type") or "").split(":")[-1] != "engineer":
+        return
+    rid = current_run_id()
+    if not rid:
+        return
+    d = RUNS_DIR / rid
+    run = read_json(d / "run.json", {})
+    if run.get("mode") == "review":
+        return
+    transcript = None
+    for _ in range(5):  # transcripts are written asynchronously (see hook_subagent_stop)
+        transcript = find_agent_transcript(payload)
+        if transcript:
+            break
+        time.sleep(0.5)
+    if not transcript:
+        return
+    problems = engineer_gate_problems(payload, cfg, d, run, transcript)
+    if problems:
+        print("[harness] You can't finish yet: " + "; ".join(problems) + f". Run `python3 {HARNESS_SCRIPT} gates "
+              "--repo <repo> --task <task id> --attempt <n>` and fix any new failures, then finish. If you "
+              "cannot get the gates to pass, reply GATES FAIL with the reason; if you're blocked, reply "
+              "NEEDS USER.", file=sys.stderr)
+        sys.exit(2)
+
+
+# --------------------------------------------------------------------------- test tampering
+TEST_PATH_RE = re.compile(r"(^|/)(tests?|__tests__|specs?|e2e)/|(^|/)test_[^/]*\.py$|_test\.(py|go)$|"
+                          r"\.(test|spec)\.[cm]?[jt]sx?$|(^|/)conftest\.py$|\.snap$")
+TEST_CONFIG_RE = re.compile(r"(^|/)(jest|vitest|playwright|karma)\.config\.[^/]+$|(^|/)(pytest|tox)\.ini$|"
+                            r"(^|/)(setup\.cfg|\.coveragerc|pyproject\.toml|package\.json)$")
+CONFIG_RISK_RE = re.compile(r"coverageThreshold|fail[_-]under|testPathIgnorePatterns|modulePathIgnorePatterns|"
+                            r"testMatch|testRegex|addopts|norecursedirs|testpaths|collect_ignore|--ignore|"
+                            r"--deselect|passWithNoTests|\bbail\b")
+ASSERT_RE = re.compile(r"\bassert|\bexpect\(|\.should\b|pytest\.raises|\.to(Be|Equal|Throw|Match|Have|Contain|Strict)")
+CASE_RE = re.compile(r"^\s*(async\s+)?(def\s+test_\w+|(it|test|describe)(\.each)?\s*\()")
+SKIP_RE = re.compile(r"@pytest\.mark\.(skip|xfail)|@unittest\.(skip|expectedFailure)|pytest\.skip\(|\.skip\(|"
+                     r"\bx(it|describe|test)\(|\b(it|test|describe)\.(skip|todo|only)\b|\b(fit|fdescribe)\(|\.only\(")
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+\d+")
+
+
+def tamper_id(repo: str, file: str, kind: str, norm: str) -> str:
+    return "T-" + hashlib.sha1(f"{repo}|{file}|{kind}|{norm}".encode()).hexdigest()[:6]
+
+
+def scan_diff_for_tampering(rname: str, diff: str) -> list[dict]:
+    """Suspicious edits to PRE-EXISTING tests in a `git diff -U0 -M` (new files are never flagged).
+    Removed or altered assertions and test cases are counted net of identical added lines, so moved or
+    reformatted tests don't trip it; added skip/xfail/only markers; deleted test files; loosened
+    snapshots; and test-config changes that shrink what runs or what must pass."""
+    out: list[dict] = []
+    for chunk in split_diff_files(diff).values():
+        head = chunk.split("\n", 1)[0]
+        m = re.match(r"diff --git a/(.+?) b/(.+)$", head)
+        if not m or "\nnew file mode" in chunk:
+            continue
+        old, new = m.group(1), m.group(2)
+        is_test = bool(TEST_PATH_RE.search(old) or TEST_PATH_RE.search(new))
+        is_config = bool(TEST_CONFIG_RE.search(new)) and not is_test
+        if not (is_test or is_config):
+            continue
+        if "\ndeleted file mode" in chunk:
+            if is_test:
+                out.append({"repo": rname, "file": old, "line": None, "kind": "deleted-test-file",
+                            "text": "(file deleted)", "id": tamper_id(rname, old, "deleted-test-file", "")})
+            continue
+        removed: list[tuple[int, str]] = []
+        added: list[str] = []
+        lineno, in_hunk = 0, False
+        for ln in chunk.split("\n"):
+            hm = HUNK_RE.match(ln)
+            if hm:
+                lineno, in_hunk = int(hm.group(1)) - 1, True
+                continue
+            if not in_hunk:
+                continue  # file headers (---/+++ lines) come before the first hunk; inside one they are content
+            if ln.startswith("-"):
+                lineno += 1
+                removed.append((lineno, ln[1:]))
+            elif ln.startswith("+"):
+                added.append(ln[1:])
+        norm = lambda t: re.sub(r"\s+", "", t)
+        added_n = collections.Counter(norm(t) for t in added)
+        if is_config:
+            for t in [t for _, t in removed] + added:
+                if CONFIG_RISK_RE.search(t):
+                    out.append({"repo": rname, "file": new, "line": None, "kind": "test-config-changed",
+                                "text": t.strip()[:200], "id": tamper_id(rname, new, "test-config-changed", norm(t))})
+            continue
+        if new.endswith(".snap"):
+            net = [(n, t) for n, t in removed if t.strip() and not added_n.get(norm(t))]
+            if net:
+                out.append({"repo": rname, "file": new, "line": net[0][0], "kind": "snapshot-loosened",
+                            "text": f"{len(net)} snapshot line(s) removed or changed",
+                            "id": tamper_id(rname, new, "snapshot-loosened", "")})
+            continue
+        budget = added_n.copy()
+        for n, t in removed:
+            key = norm(t)
+            if budget.get(key, 0) > 0:
+                budget[key] -= 1
+                continue  # the same line came back elsewhere: moved or reformatted
+            if CASE_RE.search(t):
+                kind = "removed-test-case"
+            elif ASSERT_RE.search(t):
+                kind = "altered-assertion"
+            else:
+                continue
+            out.append({"repo": rname, "file": new, "line": n, "kind": kind, "text": t.strip()[:200],
+                        "id": tamper_id(rname, new, kind, key)})
+        removed_n = collections.Counter(norm(t) for _, t in removed)
+        for t in added:
+            key = norm(t)
+            if SKIP_RE.search(t) and not removed_n.get(key):
+                out.append({"repo": rname, "file": new, "line": None, "kind": "skip-marker", "text": t.strip()[:200],
+                            "id": tamper_id(rname, new, "skip-marker", key)})
+    return out
+
+
+def tamper_allowed(cfg: dict, d: Path, rname: str, file: str) -> bool:
+    """A file the plan or the project says may legitimately change: `tests_may_change` globs on a task in
+    tasks.json, or `[gates] tamper_allow` globs in harness.toml."""
+    globs = list((cfg.get("gates") or {}).get("tamper_allow") or [])
+    for t in (read_json(d / "tasks.json", {}) or {}).get("tasks", []):
+        if t.get("repo") == rname:
+            globs += [g for g in t.get("tests_may_change") or [] if isinstance(g, str)]
+    return any(fnmatch.fnmatch(file, g) for g in globs)
+
+
+def tamper_scan(cfg: dict, run: dict, d: Path, only: list[str] | None = None) -> list[dict]:
+    """Findings for the run's current diff, minus allowed files and ones the user already cleared.
+    Written to tamper.json so the verifier reads one small file."""
+    rs = repos(cfg)
+    cleared = read_json(d / "tamper-cleared.json", {}) or {}
+    findings, seen = [], set()
+    for rname in changed_repos(cfg, run):  # always every repo, so tamper.json is the whole picture
+        if rname not in rs:
+            continue
+        base = (run.get("repos", {}).get(rname) or {}).get("base_commit") or "HEAD"
+        diff = git(rs[rname]["abs"], "diff", "-U0", "--no-color", "-M", base)
+        for f in scan_diff_for_tampering(rname, diff):
+            if f["id"] in cleared or f["id"] in seen or tamper_allowed(cfg, d, rname, f["file"]):
+                continue  # identical findings share one id and one verdict
+            seen.add(f["id"])
+            findings.append(f)
+    write_json(d / "tamper.json", {"findings": findings})
+    return [f for f in findings if f["repo"] in only] if only else findings
+
+
+def report_tampering(cfg: dict, run: dict, d: Path, targets: list[str]) -> None:
+    try:
+        findings = tamper_scan(cfg, run, d, targets)
+    except Exception as exc:  # a scan problem must not hide the gate result
+        print(f"TEST TAMPERING: scan failed ({exc})")
+        return
+    if not findings:
+        return
+    print(f"TEST TAMPERING: {len(findings)} suspicious change(s) to pre-existing tests/test config (details: {d}/tamper.json).")
+    print("Revert any you can't justify by the task. The reviewer and verifier will judge the rest; don't weaken a test to pass.")
+    for f in findings[:10]:
+        print(f"  - {f['id']} {f['repo']}:{f['file']}{(':' + str(f['line'])) if f.get('line') else ''} {f['kind']}: {f['text']}")
+    if len(findings) > 10:
+        print(f"  ... and {len(findings) - 10} more")
+    log_event({"kind": "tamper", "run_id": run["id"], "stage": "gates", "count": len(findings)})
+
+
+def cmd_tamper(a, cfg):
+    d, run = load_run()
+    if a.action == "scan":
+        findings = tamper_scan(cfg, run, d)
+        for f in findings:
+            print(f"{f['id']} {f['repo']}:{f['file']}{(':' + str(f['line'])) if f.get('line') else ''} {f['kind']}: {f['text']}")
+        print(f"{len(findings)} finding(s)")
+        return
+    if not a.ids or not a.reason:
+        sys.exit("tamper clear needs one or more ids and --reason")
+    cleared = read_json(d / "tamper-cleared.json", {}) or {}
+    for tid in a.ids:
+        cleared[tid] = {"by": "user", "reason": a.reason, "at": iso()}
+    write_json(d / "tamper-cleared.json", cleared)
+    print(f"Cleared {', '.join(a.ids)}.")
 
 
 # --------------------------------------------------------------------------- diffs
@@ -2247,9 +2539,22 @@ def cmd_verdict(a, cfg):
         print(f"INVALID: verified-{a.round}.json does not judge {', '.join(missing)}. Ask the verifier "
               f"(SendMessage) to add them (every id from review-{a.round}.json exactly once), then rerun verdict.")
         sys.exit(2)
+    tamper = []
+    if run.get("mode") != "review":
+        try:
+            tamper = tamper_scan(cfg, run, d)
+        except Exception as exc:  # e.g. an unreachable base commit; don't block the review loop on the scan
+            print(f"WARNING: test-tampering scan failed ({exc}); this round was not checked for it.")
+    tamper_judged = {v.get("id"): v for v in verified.get("tamper") or [] if isinstance(v, dict)}
+    tamper_missing = [t["id"] for t in tamper if t["id"] not in tamper_judged]
+    if tamper_missing:
+        print(f"INVALID: verified-{a.round}.json does not judge test-tampering finding(s) {', '.join(tamper_missing)} "
+              f"(see {d}/tamper.json). Ask the verifier (SendMessage) to add a \"tamper\" list with "
+              f"{{\"id\", \"verdict\": \"justified|tampered\", \"reason\"}} for each, then rerun verdict.")
+        sys.exit(2)
     final = []
     stats = {"proposed": len(by_id), "confirmed": 0, "rejected": 0, "uncertain": 0, "unjudged": 0,
-             "unresolved_from_previous": 0, "verifier_added": 0}
+             "unresolved_from_previous": 0, "verifier_added": 0, "tamper_open": 0}
     for fid, f in by_id.items():
         v = judged.get(fid)
         if not v:
@@ -2269,6 +2574,16 @@ def cmd_verdict(a, cfg):
         final.append({**extra, "id": f"V{a.round}-{j}", "severity": sev, "verdict": "confirmed",
                       "source": "verifier"})
         stats["verifier_added"] += 1
+    for t in tamper:
+        v = tamper_judged[t["id"]]
+        if v.get("verdict") == "justified" and v.get("reason"):
+            continue
+        stats["tamper_open"] += 1
+        final.append({"id": t["id"], "severity": "blocking", "source": "tamper", "repo": t["repo"], "file": t["file"],
+                      "line": t.get("line"), "title": f"Pre-existing test changed ({t['kind']})",
+                      "detail": t["text"], "verdict": "confirmed" if v.get("verdict") == "tampered" else "uncertain",
+                      "verifier_reason": v.get("reason", ""),
+                      "suggestion": "Restore the original test or assertion; fix the code instead of the test."})
     fix_sev = set(lcfg.get("fix_severities", ["blocking", "should_fix"]))
     to_fix = [f for f in final if f["verdict"] == "confirmed" and f["severity"] in fix_sev]
     # An uncertain blocking finding can't be sent to the engineer (unproven), so a human has to judge it.
@@ -4317,7 +4632,7 @@ def main(argv=None):
     s.set_defaults(fn=cmd_run_show)
 
     s = sub.add_parser("hook", help="(used by .claude/settings.json)")
-    s.add_argument("event", choices=["subagent-stop", "guard-bash", "guard-github", "session-start"])
+    s.add_argument("event", choices=["subagent-stop", "guard-bash", "guard-github", "session-start", "engineer-gates"])
     s.set_defaults(fn=cmd_hook)
 
     s = sub.add_parser("branch", help="fetch origin and create the work branch from origin/<base>")
@@ -4337,6 +4652,12 @@ def main(argv=None):
     s.add_argument("--task", help="task id (for metrics)")
     s.add_argument("--attempt", type=int, help="engineer attempt number; 1 = first try after implementing (for metrics)")
     s.set_defaults(fn=cmd_gates)
+
+    s = sub.add_parser("tamper", help="suspicious edits to pre-existing tests in this run (scan | clear <id>... --reason)")
+    s.add_argument("action", choices=["scan", "clear"])
+    s.add_argument("ids", nargs="*")
+    s.add_argument("--reason")
+    s.set_defaults(fn=cmd_tamper)
 
     s = sub.add_parser("diff", help="show the run's diff across repos")
     s.add_argument("--stat", action="store_true")

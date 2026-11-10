@@ -49,6 +49,8 @@ Write two files.
             "files": ["..."], "acceptance": ["..."]}]}
 ```
 `repos` lists every repo any task touches (the names under [repos] in .claude/harness.toml).
+If a task must change existing tests (e.g. an assertion that encodes old behaviour), add
+`"tests_may_change": ["<repo-relative path globs>"]` to it; otherwise changes to existing tests are flagged.
 
 Planning rules:
 - Order tasks so contracts are built before consumers: data model/migration -> API -> shared libraries

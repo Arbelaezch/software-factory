@@ -41,6 +41,12 @@ listed they merge together, so check they agree with each other. To find consume
 endpoint, API field or component in the *other* repos, search their base branch (e.g. dev or main):
 `git -C <repo path> grep -n <pattern> origin/<base>`. In additional findings, set "repo" to the PR's repo.
 
+If `<run_dir>/tamper.json` lists findings, the engineer changed pre-existing tests or test config
+(removed or altered assertions, skips, deleted tests, loosened thresholds). Judge each against the plan: add
+`"tamper": [{"id": "T-...", "verdict": "justified|tampered", "reason": "..."}]` to the file below, one entry per
+id. `justified` only when the task or plan requires that exact change; a test weakened to make the code pass
+is `tampered`.
+
 Then do one bounded pass (at most 5 more tool calls) for what the first reviewer missed that they
 wouldn't normally catch: tests that don't actually assert the new behaviour, plan "Done when"
 criteria that aren't met, and the project-specific checks. Add at most 3 issues, only ones you have
@@ -52,10 +58,12 @@ Write `<run_dir>/verified-<n>.json`:
 {"round": n,
  "findings": [{"id": "R1-1", "verdict": "confirmed|rejected|uncertain", "severity": "blocking|should_fix|nit",
                "reason": "<one or two sentences with the evidence>"}],
+ "tamper": [{"id": "T-1a2b3c", "verdict": "justified|tampered", "reason": "<evidence>"}],
  "additional": [{"severity": "...", "repo": "...", "file": "...", "line": 0, "title": "...",
                  "detail": "...", "suggestion": "..."}]}
 ```
-Include every finding id from the review file exactly once; `verdict` refuses incomplete files.
+Include every finding id from the review file exactly once, and every id in `tamper.json` (omit `tamper` if
+there is none); `verdict` refuses incomplete files.
 If a finding concerns a plan "Done when" criterion, say whether it is met.
 
 Final reply to the caller: counts (confirmed / rejected / uncertain / added) in one line. Nothing else.

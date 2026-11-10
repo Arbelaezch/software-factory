@@ -557,5 +557,268 @@ class ResumeParkedBranchTests(unittest.TestCase):
         self.assertEqual(self.resume(14), [])
 
 
+class TamperScanTests(unittest.TestCase):
+    def scan(self, diff):
+        return h.scan_diff_for_tampering("app", diff)
+
+    def kinds(self, diff):
+        return sorted(f["kind"] for f in self.scan(diff))
+
+    def test_altered_and_removed_assertions_and_cases(self):
+        diff = ("diff --git a/tests/test_a.py b/tests/test_a.py\n--- a/tests/test_a.py\n+++ b/tests/test_a.py\n"
+                "@@ -3,3 +3,2 @@\n-    assert total == 5\n+    assert total == 6\n-def test_old():\n")
+        found = self.scan(diff)
+        self.assertEqual(sorted(f["kind"] for f in found), ["altered-assertion", "removed-test-case"])
+        self.assertEqual(found[0]["file"], "tests/test_a.py")
+        self.assertTrue(all(f["id"].startswith("T-") for f in found))
+
+    def test_moved_or_reformatted_lines_are_not_flagged(self):
+        diff = ("diff --git a/tests/test_a.py b/tests/test_a.py\n--- a/tests/test_a.py\n+++ b/tests/test_a.py\n"
+                "@@ -1,1 +1,1 @@\n-    assert x   ==   1\n+    assert x == 1\n")
+        self.assertEqual(self.scan(diff), [])
+
+    def test_pure_additions_and_new_files_are_fine(self):
+        added = ("diff --git a/tests/test_a.py b/tests/test_a.py\n--- a/tests/test_a.py\n+++ b/tests/test_a.py\n"
+                 "@@ -1,0 +2,2 @@\n+def test_new():\n+    assert 1\n")
+        new_file = ("diff --git a/tests/test_b.py b/tests/test_b.py\nnew file mode 100644\n--- /dev/null\n"
+                    "+++ b/tests/test_b.py\n@@ -0,0 +1,1 @@\n+@pytest.mark.skip\n")
+        self.assertEqual(self.scan(added + new_file), [])
+
+    def test_skip_markers_and_deleted_test_files(self):
+        skip = ("diff --git a/src/a.test.ts b/src/a.test.ts\n--- a/src/a.test.ts\n+++ b/src/a.test.ts\n"
+                "@@ -1,1 +1,2 @@\n+it.skip('x', () => {})\n")
+        gone = "diff --git a/tests/test_c.py b/tests/test_c.py\ndeleted file mode 100644\n--- a/tests/test_c.py\n+++ /dev/null\n"
+        self.assertEqual(self.kinds(skip + gone), ["deleted-test-file", "skip-marker"])
+
+    def test_content_lines_that_look_like_headers_are_scanned(self):
+        diff = ("diff --git a/tests/test_a.py b/tests/test_a.py\n--- a/tests/test_a.py\n+++ b/tests/test_a.py\n"
+                "@@ -1,2 +1,1 @@\n--- assert x == 1\n")
+        self.assertEqual(self.kinds(diff), ["altered-assertion"])
+
+    def test_non_test_files_are_ignored(self):
+        diff = ("diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n"
+                "@@ -1,1 +1,1 @@\n-    assert ok\n+    pass\n")
+        self.assertEqual(self.scan(diff), [])
+
+    def test_config_only_flags_risky_lines(self):
+        risky = ("diff --git a/jest.config.js b/jest.config.js\n--- a/jest.config.js\n+++ b/jest.config.js\n"
+                 "@@ -1,1 +1,1 @@\n-  coverageThreshold: 90,\n+  coverageThreshold: 10,\n")
+        calm = ("diff --git a/package.json b/package.json\n--- a/package.json\n+++ b/package.json\n"
+                "@@ -1,1 +1,1 @@\n-  \"left-pad\": \"1.0.0\",\n+  \"left-pad\": \"1.1.0\",\n")
+        self.assertEqual(self.kinds(risky), ["test-config-changed", "test-config-changed"])
+        self.assertEqual(self.scan(calm), [])
+
+    def test_snapshot_loosening(self):
+        diff = ("diff --git a/__snapshots__/a.snap b/__snapshots__/a.snap\n--- a/__snapshots__/a.snap\n"
+                "+++ b/__snapshots__/a.snap\n@@ -1,2 +1,1 @@\n-exports[`a`] = `x`\n")
+        self.assertEqual(self.kinds(diff), ["snapshot-loosened"])
+
+
+class GateEnforcementTests(unittest.TestCase):
+    """The engineer SubagentStop hook, the tamper scan in a real repo, and the verdict that uses it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / "app"
+        (self.repo / "tests").mkdir(parents=True)
+        self.git = lambda *a: subprocess.run(["git", "-C", str(self.repo), *a], check=True, capture_output=True, text=True).stdout.strip()
+        self.git("init", "-q", "-b", "main")
+        (self.repo / "tests" / "test_a.py").write_text("def test_a():\n    assert 1 == 1\n")
+        (self.repo / "a.py").write_text("x = 1\n")
+        self.git("add", ".")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init")
+        self.d = self.root / "run"
+        self.d.mkdir()
+        self.run_ = {"id": "r1", "mode": "full", "repos": {"app": {"base_commit": self.git("rev-parse", "HEAD")}}}
+        self.cfg = {"repos": {"app": {"path": "app", "gates": [{"name": "tests", "cmd": "true", "kind": "pytest"}]}}}
+        self.transcript = self.root / "agent.jsonl"
+        self.patches = [mock.patch.object(h, "ROOT", self.root)]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def edit_transcript(self, *paths):
+        blocks = [{"type": "tool_use", "name": "Edit", "input": {"file_path": str(p)}} for p in paths]
+        self.transcript.write_text(json.dumps({"type": "assistant", "message": {"content": blocks}}) + "\n")
+
+    def problems(self, msg="GATES PASS"):
+        return h.engineer_gate_problems({"last_assistant_message": msg}, self.cfg, self.d, self.run_, self.transcript)
+
+    def record(self, ran=1, passed=True):
+        h.record_gate_state(self.d, "app", h.repos(self.cfg)["app"], self.run_, ran, passed)
+
+    def test_no_edits_means_nothing_to_enforce(self):
+        self.transcript.write_text("")
+        self.assertEqual(self.problems(), [])
+
+    def test_blocked_until_gates_pass_on_the_current_tree(self):
+        (self.repo / "a.py").write_text("x = 2\n")
+        self.edit_transcript(self.repo / "a.py")
+        self.assertIn("never ran the gates", self.problems()[0])
+        self.record(passed=False)
+        self.assertIn("last gates run failed", self.problems()[0])
+        self.record(passed=True)
+        self.assertEqual(self.problems(), [])
+        (self.repo / "a.py").write_text("x = 3\n")  # edited after the passing run
+        self.assertIn("changed after the last gates run", self.problems()[0])
+
+    def test_untracked_new_files_count_toward_the_fingerprint(self):
+        self.edit_transcript(self.repo / "new.py")
+        (self.repo / "new.py").write_text("a = 1\n")
+        self.record()
+        (self.repo / "new.py").write_text("a = 2\n")
+        self.assertIn("changed after", self.problems()[0])
+
+    def test_escalations_and_honest_failures_may_stop(self):
+        (self.repo / "a.py").write_text("x = 2\n")
+        self.edit_transcript(self.repo / "a.py")
+        self.assertEqual(self.problems("NEEDS USER: which db?"), [])
+        self.assertEqual(self.problems("the plan is wrong: T2 is impossible"), [])
+        self.assertIn("never ran", self.problems("GATES FAIL: flaky")[0])  # claiming failure needs a real run
+        # the words only count when they open the reply or a line, not when a completion mentions them
+        self.assertIn("never ran", self.problems("Done. Note the plan is wrong about X but I worked around it")[0])
+        self.assertIn("never ran", self.problems("GATES PASS. No NEEDS USER items, no GATES FAIL.")[0])
+        self.assertEqual(self.problems("GATES PASS\nNEEDS USER: which db?"), [])
+        self.record(passed=False)
+        self.assertEqual(self.problems("GATES FAIL: flaky"), [])
+
+    def test_a_repo_with_no_applicable_gate_is_not_enforced(self):
+        (self.repo / "a.py").write_text("x = 2\n")
+        self.edit_transcript(self.repo / "a.py")
+        self.record(ran=0)
+        self.assertEqual(self.problems(), [])
+        self.cfg["repos"]["app"]["gates"] = []
+        self.assertEqual(h.engineer_gate_problems({}, self.cfg, self.d, self.run_, self.transcript), [])
+
+    def test_edits_outside_any_repo_are_ignored(self):
+        self.edit_transcript(self.root / "run" / "notes-T1.md")
+        self.assertEqual(self.problems(), [])
+
+    def run_hook(self, payload, agent="harness:engineer"):
+        payload = {"agent_type": agent, "agent_transcript_path": str(self.transcript), **payload}
+        (self.root / ".harness" / "runs").mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(h, "current_run_id", lambda: "r1"), mock.patch.object(h, "RUNS_DIR", self.root), \
+                mock.patch.object(h.sys, "stdin", io.StringIO(json.dumps(payload))), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            (self.root / "r1").mkdir(exist_ok=True)
+            h.write_json(self.root / "r1" / "run.json", self.run_)
+            for f in ("gate-state.json",):
+                if (self.d / f).exists():
+                    (self.root / "r1" / f).write_text((self.d / f).read_text())
+            try:
+                h.hook_engineer_gates(self.cfg)
+            except SystemExit as e:
+                return e.code, err.getvalue()
+            return 0, err.getvalue()
+
+    def test_hook_exits_2_with_a_reason_and_only_for_engineers(self):
+        (self.repo / "a.py").write_text("x = 2\n")
+        self.edit_transcript(self.repo / "a.py")
+        code, err = self.run_hook({"last_assistant_message": "GATES PASS"})
+        self.assertEqual(code, 2)
+        self.assertIn("never ran the gates", err)
+        self.assertEqual(self.run_hook({}, agent="harness:scout")[0], 0)
+
+    def test_hook_allows_a_review_run(self):
+        (self.repo / "a.py").write_text("x = 2\n")
+        self.edit_transcript(self.repo / "a.py")
+        self.run_["mode"] = "review"
+        self.assertEqual(self.run_hook({})[0], 0)
+
+    def test_hook_is_registered_for_engineers_only_and_synchronously(self):
+        hooks = json.loads((Path(__file__).parent.parent / "hooks" / "hooks.json").read_text())["hooks"]["SubagentStop"]
+        gate = [g for g in hooks if "engineer-gates" in json.dumps(g)]
+        self.assertEqual(len(gate), 1)
+        self.assertEqual(gate[0]["matcher"], "^harness:engineer$")
+        self.assertFalse(gate[0]["hooks"][0].get("async"))
+
+    def test_tamper_scan_in_a_real_repo_with_allow_lists_and_clearing(self):
+        (self.repo / "tests" / "test_a.py").write_text("def test_a():\n    assert 1 == 2\n")
+        found = h.tamper_scan(self.cfg, self.run_, self.d)
+        self.assertEqual([f["kind"] for f in found], ["altered-assertion"])
+        self.assertTrue((self.d / "tamper.json").exists())
+        self.cfg["gates"] = {"tamper_allow": ["tests/*.py"]}
+        self.assertEqual(h.tamper_scan(self.cfg, self.run_, self.d), [])
+        del self.cfg["gates"]
+        (self.d / "tasks.json").write_text(json.dumps({"tasks": [{"repo": "app", "tests_may_change": ["tests/test_a.py"]}]}))
+        self.assertEqual(h.tamper_scan(self.cfg, self.run_, self.d), [])
+        (self.d / "tasks.json").unlink()
+        h.write_json(self.d / "tamper-cleared.json", {found[0]["id"]: {"by": "user", "reason": "intended"}})
+        self.assertEqual(h.tamper_scan(self.cfg, self.run_, self.d), [])
+
+    def test_scope_filter_does_not_shrink_tamper_json_and_duplicates_share_an_id(self):
+        (self.repo / "tests" / "test_a.py").write_text("def test_a():\n    pass\n")
+        found = h.tamper_scan(self.cfg, self.run_, self.d, only=["nope"])
+        self.assertEqual(found, [])
+        listed = json.loads((self.d / "tamper.json").read_text())["findings"]
+        self.assertEqual(len(listed), len({f["id"] for f in listed}))
+        self.assertTrue(listed)
+
+    def test_binary_changes_move_the_fingerprint(self):
+        blob = self.repo / "fx.bin"
+        blob.write_bytes(b"\x00\x01")
+        self.git("add", "fx.bin")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "bin")
+        self.run_["repos"]["app"]["base_commit"] = self.git("rev-parse", "HEAD")
+        blob.write_bytes(b"\x00\x02")
+        before = h.tree_fingerprint("app", h.repos(self.cfg)["app"], self.run_)
+        blob.write_bytes(b"\x00\x03")
+        self.assertNotEqual(before, h.tree_fingerprint("app", h.repos(self.cfg)["app"], self.run_))
+
+    def test_a_failing_scan_does_not_crash_verdict(self):
+        with mock.patch.object(h, "tamper_scan", mock.Mock(side_effect=RuntimeError("bad base"))):
+            code, out = self.verdict({})
+        self.assertIn("WARNING: test-tampering scan failed", out)
+        self.assertIn("DECISION: DONE", out)
+
+    def test_subagents_cannot_clear_flags_or_edit_enforcement_state(self):
+        def denied(tool_input, agent="harness:engineer", aid="a1"):
+            payload = {"tool_input": tool_input, "agent_type": agent}
+            if aid:
+                payload["agent_id"] = aid
+            return h.enforcement_state_denial(payload)
+        self.assertTrue(denied({"command": "python3 /x/harness.py tamper clear T-abc123 --reason ok"}))
+        self.assertTrue(denied({"command": "echo '{}' > .harness/runs/r/tamper-cleared.json"}))
+        self.assertTrue(denied({"file_path": "/p/.harness/runs/r/gate-state.json"}))
+        self.assertTrue(denied({"file_path": "/p/.harness/runs/r/tasks.json"}))
+        self.assertTrue(denied({"file_path": "/p/.claude/harness.toml"}))
+        self.assertFalse(denied({"file_path": "/p/.harness/runs/r/tasks.json"}, agent="harness:planner"))
+        self.assertFalse(denied({"file_path": "/p/.harness/runs/r/notes-T1.md"}))
+        self.assertFalse(denied({"command": "python3 /x/harness.py tamper clear T-abc123 --reason ok"}, aid=None))  # main session
+        self.assertFalse(denied({"command": "python3 /x/harness.py tamper scan"}))
+
+    def verdict(self, verified):
+        h.write_json(self.d / "review-1.json", {"round": 1, "findings": []})
+        h.write_json(self.d / "verified-1.json", {"round": 1, "findings": [], **verified})
+        out = io.StringIO()
+        with mock.patch.object(h, "load_run", lambda: (self.d, self.run_)), mock.patch.object(h, "log_event", lambda e: None), \
+                contextlib.redirect_stdout(out):
+            try:
+                h.cmd_verdict(mock.Mock(round=1), self.cfg)
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue()
+
+    def test_verdict_needs_the_verifier_to_judge_tampering(self):
+        (self.repo / "tests" / "test_a.py").write_text("def test_a():\n    assert 1 == 2\n")
+        tid = h.tamper_scan(self.cfg, self.run_, self.d)[0]["id"]
+        code, out = self.verdict({})
+        self.assertEqual(code, 2)
+        self.assertIn(tid, out)
+        code, out = self.verdict({"tamper": [{"id": tid, "verdict": "justified", "reason": "plan T1 changes the total"}]})
+        self.assertIn("DECISION: DONE", out)
+        code, out = self.verdict({"tamper": [{"id": tid, "verdict": "tampered", "reason": "weakened"}]})
+        self.assertIn("DECISION: FIX", out)
+        code, out = self.verdict({"tamper": [{"id": tid, "verdict": "justified"}]})  # no reason: not accepted
+        self.assertNotIn("DECISION: DONE", out)
+
+    def test_verdict_unchanged_without_tampering(self):
+        code, out = self.verdict({})
+        self.assertIn("DECISION: DONE", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -109,7 +109,9 @@ For round n = 1, 2, ...:
    where it mainly re-checks known findings.
 2. Spawn the `harness:verifier` subagent for round n. It writes `verified-<n>.json`.
 3. `H verdict --round n`. If it prints `INVALID`, resume the verifier once (SendMessage) with that message,
-   then rerun. Otherwise it prints `DECISION: DONE | FIX | ESCALATE`.
+   then rerun (the message may also ask for judgements on flagged test changes, listed in `tamper.json`). Otherwise
+   it prints `DECISION: DONE | FIX | ESCALATE`. A flagged test change the verifier calls `tampered` goes to the engineer
+   like any confirmed finding; if you, the user, accept a flagged change, record it with `H tamper clear <id> --reason "..."`.
    - DONE: go to step 8.
    - FIX: spawn a `harness:engineer` with `<run_dir>/fix-<n>.json`. Then `H gates`; continue with round n+1.
    - ESCALATE: tell the user how many confirmed and uncertain-blocking findings remain and where
