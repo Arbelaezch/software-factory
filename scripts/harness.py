@@ -3878,6 +3878,25 @@ CLEANUP_PROMPT = """Issue #{issue} is finished. Its out-of-scope concerns are in
 instructions and write the survivors to {out} (a JSON list, `[]` when none survive)."""
 
 
+def resume_parked_branch(cfg: dict, n: int) -> list[str]:
+    """Before an issue's session starts: in each repo sitting on its base branch, switch to the issue's own local
+    branch if park() left one there (named `<type>/<n>-<slug>`). The headless session can't run `git checkout`, so
+    the supervisor does it. Returns what it did; a repo with no or several matching branches is left alone."""
+    done = []
+    for rname, r in repos(cfg).items():
+        path = r["abs"]
+        if not is_git_repo(path) or git(path, "branch", "--show-current").strip() != base_branch_for(cfg, rname):
+            continue
+        found = [b for b in git(path, "branch", "--list", f"*/{n}-*", "--format=%(refname:short)").split() if b]
+        if len(found) != 1:
+            continue
+        sw = run_cmd(["git", "-C", str(path), "switch", found[0]])
+        if sw.returncode != 0:
+            raise RuntimeError(f"{rname}: could not switch to the parked branch {found[0]}: {sw.stderr.strip()}")
+        done.append(f"{rname}:{found[0]}")
+    return done
+
+
 def file_backlog(slug: str, n: int, items: list, pr_url: str | None) -> int:
     """Create a `backlog` issue for each {title, body} item, skipping titles that already exist. Returns how many."""
     items = [i for i in items if isinstance(i, dict) and str(i.get("title", "")).strip()][:10]
@@ -3967,6 +3986,13 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
                      "Bash(curl http://127.0.0.1*)", "Bash(curl -s http://127.0.0.1*)"]
 
     def run_issue(n):
+        try:
+            resumed = resume_parked_branch(cfg, n)
+        except RuntimeError as e:
+            factory_log({"kind": "resume_failed", "issue": n, "error": str(e)[:300]})
+            return 1  # the loop labels it blocked and raises the one blocker message
+        if resumed:
+            factory_log({"kind": "work_resumed", "issue": n, "branches": resumed})
         with open(sessions / f"issue-{n}-{int(time.time())}.log", "w", encoding="utf-8") as out:
             return run_factory(str(ROOT), "manager", {}, claude_command("-p", ISSUE_PROMPT.format(n=n), *claude_args, *ISSUE_ALLOWED), out)
 

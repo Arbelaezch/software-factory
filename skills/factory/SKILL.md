@@ -48,6 +48,9 @@ Event stream: `${CLAUDE_PROJECT_DIR}/.factory/events.log`
   on them on the next pass. If the supervisor has stopped and issues are now runnable, say so and offer to start it.
 
 If a command fails or prints something unexpected, show the user the message and stop; don't work around it.
+One exception: if the message says a headless issue session was refused a git step (checkout, switch, branch),
+don't widen its allowed tools. Run that git step yourself in the repo (you may create and switch branches), then
+`H factory queue N` to resume it.
 
 ## Watching
 
