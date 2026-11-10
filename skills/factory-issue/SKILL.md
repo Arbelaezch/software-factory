@@ -63,4 +63,7 @@ changes where humans were involved.
    5. `H run end --status done`, then `H factory done N --pr <PR url>`.
    Do not merge. Merging is the user's, or build step 6's.
 4. **If anything in step 3 fails** (push rejected, PR creation fails): `H factory block N` with what happened.
-5. **Rules that still apply:** subagents never commit or push; the guard enforces it. Keep your own output short.
+5. **Branches are the supervisor's.** If the issue was parked before, the supervisor has already put you on its
+   branch. Never run `git checkout` or `git switch`: they aren't pre-approved and would be refused. To change
+   branch use `H branch` (it switches to an existing branch); if that fails, `H factory block N`.
+6. **Rules that still apply:** subagents never commit or push; the guard enforces it. Keep your own output short.

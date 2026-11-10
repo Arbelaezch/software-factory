@@ -524,5 +524,38 @@ class IssuePlanTests(unittest.TestCase):
         self.assertEqual(len(log), 2)
 
 
+class ResumeParkedBranchTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.git = lambda *a: subprocess.run(["git", "-C", str(self.root), *a], check=True, capture_output=True, text=True).stdout.strip()
+        self.git("init", "-q", "-b", "main")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init")
+        self.cfg = {"git": {"base_branch": "main"}, "repos": {"app": {"path": "."}}}
+
+    def resume(self, n):
+        with mock.patch.object(h, "ROOT", self.root):
+            return h.resume_parked_branch(self.cfg, n)
+
+    def test_switches_to_the_issues_parked_branch(self):
+        self.git("branch", "fix/14-no-csrf")
+        self.git("branch", "feat/15-other")
+        self.assertEqual(self.resume(14), ["app:fix/14-no-csrf"])
+        self.assertEqual(self.git("branch", "--show-current"), "fix/14-no-csrf")
+
+    def test_no_or_several_matches_leave_the_tree_on_base(self):
+        self.assertEqual(self.resume(14), [])
+        self.git("branch", "fix/14-a")
+        self.git("branch", "feat/14-b")
+        self.assertEqual(self.resume(14), [])
+        self.assertEqual(self.git("branch", "--show-current"), "main")
+
+    def test_a_repo_not_on_base_is_left_alone(self):
+        self.git("switch", "-q", "-c", "chore/1-x")
+        self.git("branch", "fix/14-a")
+        self.assertEqual(self.resume(14), [])
+
+
 if __name__ == "__main__":
     unittest.main()
