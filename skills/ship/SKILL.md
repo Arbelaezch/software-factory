@@ -110,8 +110,8 @@ For round n = 1, 2, ...:
    spawn the `harness:claude-reviewer` subagent for round n; pass `model: sonnet` for rounds 2 and later,
    where it mainly re-checks known findings.
 2. Spawn the `harness:verifier` subagent for round n. It writes `verified-<n>.json`.
-3. `H verdict --round n`. If it prints `INVALID` about `review-<n>.json`, spawn the `harness:claude-reviewer`
-   for round n (it overwrites the file) and rerun. If it prints `INVALID` about `verified-<n>.json`, resume the verifier once (SendMessage) with that message,
+3. `H verdict --round n`. If it prints `INVALID` about `review-<n>.json`, do what it says (an outside
+   model's file: spawn the `harness:claude-reviewer` for round n; the fallback reviewer's own file: resume it once) and rerun. If it prints `INVALID` about `verified-<n>.json`, resume the verifier once (SendMessage) with that message,
    then rerun (the message may also ask for judgements on flagged test changes, listed in `tamper.json`). Otherwise
    it prints `DECISION: DONE | FIX | ESCALATE`. A flagged test change the verifier calls `tampered` goes to the engineer
    like any confirmed finding; if you, the user, accept a flagged change, record it with `H tamper clear <id> --reason "..."`.

@@ -2733,8 +2733,13 @@ def cmd_verdict(a, cfg):
         sys.exit(f"Missing {d}/review-{a.round}.json")
     problems = validate_review(review, a.round)
     if problems:
-        print(f"INVALID: review-{a.round}.json: {'; '.join(problems[:8])}. Spawn the harness:claude-reviewer "
-              f"subagent for round {a.round} (it overwrites the file), then rerun verdict.")
+        if review.get("provider") == "claude":
+            fix = (f"Resume the claude-reviewer subagent once (SendMessage) with this message so it rewrites "
+                   f"review-{a.round}.json, then rerun verdict.")
+        else:
+            fix = (f"Spawn the harness:claude-reviewer subagent for round {a.round} (it overwrites the file), "
+                   f"then rerun verdict.")
+        print(f"INVALID: review-{a.round}.json: {'; '.join(problems[:8])}. {fix}")
         sys.exit(2)
     if verified is None:
         sys.exit(f"Missing {d}/verified-{a.round}.json (the verifier writes it)")

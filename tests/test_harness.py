@@ -788,6 +788,68 @@ class ValidateTests(unittest.TestCase):
         self.assertIn("claude-reviewer", out.getvalue())
 
 
+class FallbackReviewerTests(ValidateTests):
+    """No outside-model key: the claude-reviewer subagent writes review-<n>.json and the loop still works."""
+
+    # Exactly the shape agents/claude-reviewer.md tells the subagent to write.
+    FALLBACK_REVIEW = {"round": 1, "provider": "claude", "model": "claude-reviewer", "summary": "s",
+                       "findings": [{"id": "R1-1", "severity": "blocking", "repo": "app", "file": "a.py", "line": 0,
+                                     "title": "t", "evidence": "x = 1", "detail": "d", "suggestion": "s", "status": "new"},
+                                    {"id": "R1-2", "severity": "nit", "repo": "app", "file": "a.py", "line": 7,
+                                     "title": "t", "evidence": "e", "detail": "d", "suggestion": "s", "status": "unresolved"}]}
+
+    def test_review_without_a_key_falls_back_and_writes_nothing(self):
+        cfg = {"reviewer": {"provider": "deepseek"},
+               "providers": {"deepseek": {"api_key_env": "HARNESS_TEST_NO_SUCH_KEY", "model": "m"}}}
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=False), \
+                mock.patch.object(h, "load_run", return_value=(self.d, {"id": "r1"})), contextlib.redirect_stdout(out):
+            os.environ.pop("HARNESS_TEST_NO_SUCH_KEY", None)
+            with self.assertRaises(SystemExit) as cm:
+                h.cmd_review(mock.Mock(round=1, provider=None), cfg)
+        self.assertEqual(cm.exception.code, 4)
+        self.assertIn("FALLBACK", out.getvalue())
+        self.assertFalse((self.d / "review-1.json").exists())
+
+    def test_fallback_review_file_is_valid(self):
+        self.assertEqual(h.validate_review(self.FALLBACK_REVIEW, 1), [])
+        h.write_json(self.d / "review-1.json", self.FALLBACK_REVIEW)
+        self.assertEqual(self.run_validate("review", 1), (0, "OK: review-1.json\n"))
+
+    def run_verdict(self, review, verified):
+        h.write_json(self.d / "review-1.json", review)
+        h.write_json(self.d / "verified-1.json", verified)
+        out = io.StringIO()
+        code = 0
+        with mock.patch.object(h, "load_run", return_value=(self.d, {"id": "r1", "mode": "full"})), \
+                mock.patch.object(h, "tamper_scan", return_value=[]), \
+                mock.patch.object(h, "log_event"), contextlib.redirect_stdout(out):
+            try:
+                h.cmd_verdict(mock.Mock(round=1), {})
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue()
+
+    def test_verdict_runs_end_to_end_on_a_fallback_review(self):
+        verified = {"findings": [{"id": "R1-1", "verdict": "confirmed"}, {"id": "R1-2", "verdict": "rejected"}]}
+        code, out = self.run_verdict(self.FALLBACK_REVIEW, verified)
+        self.assertEqual(code, 0)
+        self.assertIn("DECISION: FIX", out)
+
+    def test_invalid_fallback_review_is_resumed_not_respawned(self):
+        bad = {**self.FALLBACK_REVIEW, "findings": [{**self.FALLBACK_REVIEW["findings"][0], "line": "12"}]}
+        code, out = self.run_verdict(bad, {"findings": []})
+        self.assertEqual(code, 2)
+        self.assertIn("line must be an integer", out)
+        self.assertIn("Resume the claude-reviewer", out)
+
+    def test_invalid_outside_model_review_spawns_the_fallback(self):
+        bad = {"round": 1, "provider": "deepseek", "findings": [{"id": "R1-1", "severity": "should_fix", "file": "a.py"}]}
+        code, out = self.run_verdict(bad, {"findings": []})
+        self.assertEqual(code, 2)
+        self.assertIn("Spawn the harness:claude-reviewer", out)
+
+
 class GateEnforcementTests(unittest.TestCase):
     """The engineer SubagentStop hook, the tamper scan in a real repo, and the verdict that uses it."""
 
