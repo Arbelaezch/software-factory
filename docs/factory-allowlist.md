@@ -42,9 +42,14 @@ the rules below; a rejected rule is dropped and logged as `allow_rule_rejected`.
 
 ## What stays generic (do not repeat per repo)
 
-Read-only git and `gh issue`, `npm run`/`npm test`, the harness gates and the localhost browser
-checks are already allowed for every project. If several repos need the same new command, add it
+Read-only git and `gh issue`, `npm run`/`npm test`, `npm install`/`npm ci`, `npx tsc|vitest|vite|jest`, the harness
+gates and the localhost browser checks are already allowed for every project. If several repos need the same new command, add it
 to `ISSUE_ALLOWED` in the factory instead.
+
+## Other package managers
+
+`pnpm`, `yarn` and `bun` are not in the generic set. `factory start` looks for their lockfile and refuses to
+start, naming the rule to add (`"Bash(pnpm install*)"`), so the first issue does not stall on a denied install.
 
 ## When a blocker says a command was refused
 

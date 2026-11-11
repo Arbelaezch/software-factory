@@ -771,5 +771,36 @@ class ProjectAllowRulesTests(unittest.TestCase):
         self.assertEqual(h.project_allow_rules({}), ([], []))
 
 
+class InstallAllowTests(unittest.TestCase):
+    RULES = [r for r in h.ISSUE_ALLOWED_RULES if r.startswith("Bash(")]
+
+    def covered(self, cmd):
+        return any(h.rule_covers(r, cmd) for r in self.RULES)
+
+    def test_generic_rules_cover_the_node_scaffold_toolchain(self):
+        for cmd in ("npm install", "npm install -D vite three", "npm ci", "npm run build", "npm test",
+                    "npx tsc --noEmit", "npx vitest run", "npx vite build"):
+            self.assertTrue(self.covered(cmd), cmd)
+
+    def test_arbitrary_npx_is_not_covered(self):
+        self.assertFalse(self.covered("npx some-random-package"))
+        self.assertFalse(self.covered("npm publish"))
+
+    def test_preflight_flags_other_package_managers(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self.assertEqual(h.preflight_allow(root, self.RULES), [])
+            (root / "pnpm-lock.yaml").write_text("")
+            self.assertEqual(h.preflight_allow(root, self.RULES), ["pnpm install"])
+            self.assertEqual(h.preflight_allow(root, self.RULES + ["Bash(pnpm install*)"]), [])
+
+    def test_preflight_ignores_npm_projects(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "package-lock.json").write_text("")
+            self.assertEqual(h.preflight_allow(Path(d), self.RULES), [])
+
+
 if __name__ == "__main__":
     unittest.main()
