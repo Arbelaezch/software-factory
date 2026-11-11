@@ -44,7 +44,9 @@ Work folder: `${CLAUDE_PROJECT_DIR}/.factory/plans/<YYYYMMDD-HHMM>/` (create it)
    `issues.json` path and the harness command. Then run `H factory issues-create <issues.json>`: it checks the list,
    creates the factory labels if missing, creates the issues dependencies first with `Depends on #N` lines,
    and skips titles that already exist. If it reports problems, send them back to the planner once; if they
-   persist, stop and tell the user. Don't add the `todo` label and don't fix the draft yourself.
+   persist, stop and tell the user. Don't add the `todo` label and don't fix the draft yourself. Then record the
+   documents with `H factory docs <mvp path> [--vision <path>]`, so a later `--auto-queue` run knows what the
+   project is meant to contain.
 6. **Report.** The created issue numbers with titles and dependencies as a compact list, the planner's open notes,
    and the paths of `.factory/decisions.md` and `.factory/log.jsonl`. Nothing runs automatically: the user tells
-   the manager which issues to work on.
+   the manager which issues to work on, or asks it to run the whole plan on its own (`/factory` with auto-queue).

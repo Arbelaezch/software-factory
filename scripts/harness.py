@@ -3956,6 +3956,12 @@ def event_line(e: dict) -> str | None:
         "cleanup": lambda: f"#{n} cleanup filed {e.get('filed')} backlog issue(s)" if e.get("filed") else None,
         "conflict_found": lambda: f"#{n} has a merge conflict; trying to resolve it",
         "conflict_resolved": lambda: f"#{n} conflict resolved; waiting for CI again",
+        "auto_queue_on": lambda: "auto-queue on: the factory will queue its own work when the queue is empty",
+        "auto_queued": lambda: f"auto-queued {e.get('source')}: " + ", ".join(f"#{x}" for x in e.get("issues") or []),
+        "auto_queue_exhausted": lambda: f"auto-queue done: {e.get('why')}",
+        "auto_queue_failed": lambda: f"auto-queue failed: {e.get('error')}",
+        "discover_skipped": lambda: f"auto-queue could not discover work: {e.get('why')}",
+        "discover_failed": lambda: "auto-queue discovery gave an invalid issue list; nothing was filed",
         "supervisor_started": lambda: "supervisor started",
         "supervisor_stopped": lambda: f"supervisor stopped ({e.get('why')})",
     }.get(k, lambda: None)()
@@ -4047,12 +4053,18 @@ def cmd_factory_issues_create(a, cfg):
         for note in plan.get("notes") or []:
             print(f"note: {note}")
         return
-    slug = factory_repo(a, cfg)
-    labels_used = {lb for i in plan["issues"] for lb in (i.get("labels") or ["enhancement"])}
+    create_plan_issues(factory_repo(a, cfg), plan, order)
+
+
+def create_plan_issues(slug: str, plan: dict, order: list[str], extra_labels: tuple[str, ...] = ()) -> list[int]:
+    """Create the plan's issues, dependencies first, skipping titles that already exist. Returns the new numbers."""
+    by = {i["key"]: i for i in plan["issues"]}
+    labels_used = {lb for i in plan["issues"] for lb in (i.get("labels") or ["enhancement"])} | set(extra_labels)
     ensure_labels(slug, labels_used)
     existing = {x["title"].strip().lower(): x["number"] for x in
                 gh_json("issue", "list", "--repo", slug, "--state", "all", "--limit", "500", "--json", "title,number") or []}
     numbers: dict[str, int] = {}
+    made: list[int] = []
     for key in order:
         it = by[key]
         title = it["title"].strip()
@@ -4061,12 +4073,24 @@ def cmd_factory_issues_create(a, cfg):
             print(f"exists   #{numbers[key]}  {title}")
             continue
         args = ["issue", "create", "--repo", slug, "--title", title, "--body-file", "-"]
-        for lb in it.get("labels") or ["enhancement"]:
+        for lb in [*(it.get("labels") or ["enhancement"]), *extra_labels]:
             args += ["--label", lb]
         url = gh(*args, input_text=render_issue_body(it, numbers)).strip().splitlines()[-1]
         numbers[key] = int(url.rstrip("/").rsplit("/", 1)[-1])
+        made.append(numbers[key])
         factory_log({"kind": "issue_created", "key": key, "number": numbers[key], "repo": slug})
         print(f"created  #{numbers[key]}  {title}")
+    return made
+
+
+def trim_plan(plan: dict, limit: int) -> dict:
+    """The first `limit` issues in build order, minus any whose dependency was cut, so no issue points at nothing."""
+    by = {i["key"]: i for i in plan["issues"]}
+    keep: list[str] = []
+    for k in issue_order(plan):
+        if len(keep) < limit and all(d in keep for d in by[k].get("depends_on") or []):
+            keep.append(k)
+    return {**plan, "issues": [by[k] for k in keep]}
 
 
 # Factory run loop wiring (engine in scripts/factory_loop.py; design section 9).
@@ -4280,6 +4304,8 @@ def cmd_factory_start(a, cfg):
         cmd += ["--merge", a.merge]
     if a.until_limit:
         cmd += ["--until-limit"]
+    if a.auto_queue:
+        cmd += ["--auto-queue"]
     if shutil.which("caffeinate"):
         cmd = ["caffeinate", "-i", *cmd]
     with open(d / "supervisor.log", "a", encoding="utf-8") as out:
@@ -4414,6 +4440,46 @@ CI_FIX_PROMPT = """CI failed on {pr} (branch {branch}). You are the ci-fixer: fo
 attempt, push it, and write your diagnosis and what you changed to {note}. If you cannot fix it, write why to that file and do not push."""
 
 
+DISCOVER_AGENT = "harness:factory-discoverer"
+DISCOVER_ALLOWED = ["--allowedTools", "Bash(gh issue list *)", "Bash(gh issue view *)", "Bash(git log *)",
+                    "Bash(git ls-files *)", "Bash(git grep *)"]
+DISCOVER_PROMPT = """The factory's queue is empty and auto-queue is on. Follow your agent instructions: compare the project \
+documents ({docs}) with what exists, and write at most {limit} new issues to {out} (`{{"issues": []}}` when the documents \
+have nothing left to build)."""
+
+
+def docs_file() -> Path:
+    return ROOT / ".factory" / "docs.json"
+
+
+def cmd_factory_docs(a, cfg):
+    """Record which documents define the project, so auto-queue can tell what is still unbuilt (and nothing more)."""
+    paths = {"mvp": a.mvp, "vision": a.vision}
+    for k, v in paths.items():
+        if v and not (ROOT / v).is_file():
+            sys.exit(f"{k} document not found: {v}")
+    d = ROOT / ".factory"
+    d.mkdir(exist_ok=True)
+    docs_file().write_text(json.dumps({k: v for k, v in paths.items() if v}, indent=1) + "\n", encoding="utf-8")
+    print(f"recorded in {docs_file()}")
+
+
+def planned_issue_numbers() -> set[int]:
+    """Issues the factory created from a project plan (from the log): the ones auto-queue may pick up unlabelled."""
+    out: set[int] = set()
+    try:
+        for line in (ROOT / ".factory" / "log.jsonl").read_text(encoding="utf-8").splitlines():
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("kind") == "issue_created" and isinstance(e.get("number"), int):
+                out.add(e["number"])
+    except OSError:
+        pass
+    return out
+
+
 CLEANUP_AGENT = "harness:harness-cleanup"
 CLEANUP_ALLOWED = ["--allowedTools", "Bash(gh issue list *)", "Bash(gh issue view *)", "Bash(git log *)", "Bash(git diff *)"]
 CLEANUP_PROMPT = """Issue #{issue} is finished. Its out-of-scope concerns are in {run_dir}/concerns.jsonl. Follow your agent \
@@ -4475,6 +4541,8 @@ def cmd_factory_run(a, cfg):
     slug = factory_repo(a, cfg)
     fc = cfg.get("factory") or {}
     a.merge = a.merge or fc.get("merge", "auto")
+    if getattr(a, "auto_queue", False) and a.merge != "auto":
+        sys.exit("--auto-queue needs --merge auto: with manual merging the next issue would start on code that is not merged yet.")
 
     def fetch():
         return gh_json("issue", "list", "--repo", slug, "--state", "all", "--limit", "500",
@@ -4683,8 +4751,43 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
             return
         factory_log({"kind": "cleanup", "issue": n, "filed": filed})
 
+    def discover():
+        """One auto-queue discovery round: a read-only session compares the project documents with what exists and
+        drafts the missing issues; the supervisor validates, trims and files them as `todo`. Returns the new numbers."""
+        docs = read_json(docs_file(), {}) or {}
+        paths = [docs[k] for k in ("mvp", "vision") if docs.get(k)]
+        if not paths:
+            factory_log({"kind": "discover_skipped", "why": "no project documents recorded; run `factory docs <mvp>`"})
+            return []
+        limit = int(fc.get("auto_queue_per_round", 5))
+        out_file = ROOT / ".factory" / "discovered.json"
+        out_file.unlink(missing_ok=True)
+        prompt = DISCOVER_PROMPT.format(docs=", ".join(paths), limit=limit, out=out_file)
+        with open(sessions / f"discover-{int(time.time() * 1000)}.log", "w", encoding="utf-8") as out:
+            run_factory(str(ROOT), "manager", {}, claude_command("-p", prompt, "--agent", DISCOVER_AGENT, *claude_args, *DISCOVER_ALLOWED), out)
+        plan = read_json(out_file, None)
+        if not isinstance(plan, dict) or not plan.get("issues"):
+            return []
+        errors = validate_issue_plan(plan)
+        if errors:
+            factory_log({"kind": "discover_failed", "errors": errors[:5]})
+            return []
+        plan = trim_plan(plan, limit)
+        made = create_plan_issues(slug, plan, issue_order(plan), extra_labels=("todo",))
+        factory_log({"kind": "discovered", "issues": made, "notes": [str(x)[:200] for x in (plan.get("notes") or [])[:5]]})
+        return made
+
+    def promote(n):
+        set_issue_state(slug, n, "todo")
+
+    refill = None
+    if getattr(a, "auto_queue", False):
+        refill = fl.make_refill(fetch, planned_issue_numbers, promote, discover, factory_log,
+                                max_rounds=int(fc.get("auto_queue_rounds", 3)))
+        factory_log({"kind": "auto_queue_on"})
+
     summary = fl.run_loop(
-        after_issue=cleanup, park=park,
+        after_issue=cleanup, park=park, refill=refill,
         land_pr=make_lander() if a.merge == "auto" else None,
         gate=lambda: fl.usage_gate(lambda: usage.check(limits), log=factory_log,
                                    max_unknown=int(fc.get("unknown_limit", 3))),
@@ -5011,6 +5114,7 @@ def main(argv=None):
     f.add_argument("--merge", choices=["manual", "auto"], help="auto (default): wait for CI and squash-merge; manual: stop at awaiting-merge. Default is [factory] merge")
     f.add_argument("--dry-run", action="store_true", help="only show what could run")
     f.add_argument("--until-limit", action="store_true", help="ignore the [factory] usage caps and keep going until the plan limit itself is hit")
+    f.add_argument("--auto-queue", action="store_true", help="when the queue is empty, queue the factory's own planned and backlog issues, then discover new ones from the project documents. Off by default; this run only")
     f.add_argument("--repo")
     f.set_defaults(fn=cmd_factory_run)
     f = fsub.add_parser("start", help="start the factory loop detached and return (what /factory uses)")
@@ -5018,8 +5122,13 @@ def main(argv=None):
     f.add_argument("--max-issues", type=int, default=20)
     f.add_argument("--merge", choices=["manual", "auto"], help="auto (default): wait for CI and squash-merge each PR when green; manual: leave PRs for the user")
     f.add_argument("--until-limit", action="store_true", help="ignore the [factory] usage caps and keep going until the plan limit itself is hit")
+    f.add_argument("--auto-queue", action="store_true", help="when the queue is empty, queue the factory's own planned and backlog issues, then discover new ones from the project documents. Off by default; this run only")
     f.add_argument("--repo")
     f.set_defaults(fn=cmd_factory_start)
+    f = fsub.add_parser("docs", help="record the MVP (and vision) documents that auto-queue discovers work from")
+    f.add_argument("mvp")
+    f.add_argument("--vision")
+    f.set_defaults(fn=cmd_factory_docs)
     f = fsub.add_parser("watch", help="stream the events that need the user (one watcher per project; a second exits silently)")
     f.set_defaults(fn=cmd_factory_watch)
     f = fsub.add_parser("stop", help="stop the detached loop after the current issue (--now: immediately)")
