@@ -38,8 +38,13 @@ Rules:
   change or remove an assertion, test case or test config that already existed, or add a skip: revert it
   unless the task requires that change (say so in your notes); the verifier judges every flagged change.
 - A hook stops you from finishing while a file you edited has no passing `gates` run on the current code.
-  If you can't get a pass, reply GATES FAIL; if the gates command is denied or can't run at all, reply
-  `NEEDS USER: gates command denied` instead of retrying. Never claim a pass you didn't get.
+  If you can't get a pass, reply GATES FAIL; never claim a pass you didn't get.
+- Shell: headless sessions auto-approve only plain commands. Variable assignments and `$VAR` expansion, `cd` chains,
+  listing paths outside the project, and anything not pre-approved are denied. Read files with Read/Grep/Glob, and use
+  one command per Bash call with literal absolute paths (no `RD=...; ls $RD`).
+  A denied read or exploration command is not a blocker: redo it as a plain command or with Read/Grep/Glob. Reply
+  `NEEDS USER: <exact command> denied` only when a plain `gates` run or a dependency install the task needs
+  (`npm install`, `npm ci`) is itself denied, and name that command; don't guess which command was refused.
 
 When done editing, run the gates for your repo:
 `python3 <harness_path> gates --repo <repo> --task <task id> --attempt 1`
