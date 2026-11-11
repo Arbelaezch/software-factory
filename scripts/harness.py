@@ -4292,6 +4292,13 @@ def cmd_factory_start(a, cfg):
     """Start the loop detached (survives this session closing, keeps the Mac awake) and return at once."""
     if supervisor_info():
         sys.exit("already running; see `harness factory status`")
+    extra, _ = project_allow_rules(cfg.get("factory") or {})
+    missing = preflight_allow(ROOT, [r for r in ISSUE_ALLOWED_RULES if r.startswith("Bash(")] + extra)
+    if missing:
+        rules = ", ".join(f'"Bash({c}*)"' for c in missing)
+        sys.exit("Engineer sessions cannot prompt, so these commands would be denied and block the first issue: "
+                 + ", ".join(missing) + f".\nAdd to .claude/harness.toml under [factory]: allowed_tools = [{rules}]\n"
+                 "then run factory start again. See docs/factory-allowlist.md.")
     d = ROOT / ".factory"
     d.mkdir(exist_ok=True)
     cmd = [sys.executable, str(Path(__file__).resolve()), "--root", str(ROOT), "factory", "run",
@@ -4571,6 +4578,53 @@ ALLOW_FORBIDDEN = {"git", "gh", "sudo", "su", "rm", "rmdir", "mv", "dd", "chmod"
                    "docker", "kubectl", "terraform", "pip", "pip3", "brew", "npm", "npx", "python", "python3", "node"}
 
 
+# A skill's allowed-tools did not cover `git push` or `gh pr create` in print mode (bashMiss:no-rule-match);
+# CLI rules do.
+ISSUE_ALLOWED_RULES = [
+    "--allowedTools", "Bash(git push origin *)", "Bash(gh pr create *)", "Bash(git add *)",
+    "Bash(git commit -F *)", "Bash(git status)", "Bash(git status *)",
+    # Subagents (engineer, scout, ...) cannot prompt in print mode, so anything unlisted is denied.
+    "Bash(git diff *)", "Bash(git log *)", "Bash(git branch --show-current)",
+    "Bash(gh issue list *)", "Bash(gh issue view *)", "Bash(gh pr checks *)", "Bash(python3 *harness.py *)",
+    "Bash(npm run *)", "Bash(npm test *)",
+    # A fresh project has no node_modules: the scaffold issue installs, and later issues add dependencies.
+    # npx is limited to the toolchain the auto-detected gates use; an arbitrary `npx <pkg>` would fetch and run code.
+    "Bash(npm install)", "Bash(npm install *)", "Bash(npm ci)", "Bash(npm ci *)",
+    "Bash(npx tsc *)", "Bash(npx vitest *)", "Bash(npx vite *)", "Bash(npx jest *)",
+    # Read-only checks for running the app in a browser (stall and two-tab checks).
+    "Bash(docker ps)", "Bash(docker ps *)", "Bash(lsof -i *)", "Bash(lsof -nP -i *)",
+    "Bash(curl http://localhost*)", "Bash(curl -s http://localhost*)",
+    "Bash(curl http://127.0.0.1*)", "Bash(curl -s http://127.0.0.1*)"]
+
+# Install command per lockfile; npm is covered by ISSUE_ALLOWED_RULES, the others must come from the repo's harness.toml.
+INSTALL_BY_LOCKFILE = {"pnpm-lock.yaml": "pnpm install", "yarn.lock": "yarn install", "bun.lockb": "bun install",
+                       "bun.lock": "bun install"}
+
+
+def rule_covers(rule: str, command: str) -> bool:
+    """Whether a `Bash(...)` allow rule matches a command (`*` matches any run of characters)."""
+    m = re.fullmatch(r"Bash\((.*)\)", rule)
+    if not m:
+        return False
+    body = m.group(1)
+    if body.endswith(" *"):  # `npm test *` also matches a bare `npm test`
+        body = body[:-2]
+        pattern = ".*".join(re.escape(x) for x in body.split("*")) + r"(?: .*)?"
+    else:
+        pattern = ".*".join(re.escape(x) for x in body.split("*"))
+    return re.fullmatch(pattern, command) is not None
+
+
+def preflight_allow(root: Path, rules: list[str]) -> list[str]:
+    """Commands an engineer must run directly that no allow rule covers. Subagents cannot prompt, so each one
+    would stall the first issue that needs it; `factory start` reports them before anything is queued."""
+    missing = []
+    for lock, cmd in INSTALL_BY_LOCKFILE.items():
+        if (root / lock).exists() and not any(rule_covers(r, cmd) for r in rules) and cmd not in missing:
+            missing.append(cmd)
+    return missing
+
+
 def project_allow_rules(fc: dict) -> tuple[list[str], list[str]]:
     """Validate [factory].allowed_tools from a project's harness.toml. Returns (accepted, rejected-with-reason)."""
     ok, bad = [], []
@@ -4610,18 +4664,7 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
                                    "--agent", SELECTOR_AGENT, *claude_args), cwd=str(ROOT), timeout=300)
         return r.stdout
 
-    # A skill's allowed-tools did not cover `git push` or `gh pr create` in print mode (bashMiss:no-rule-match);
-    # CLI rules do.
-    ISSUE_ALLOWED = ["--allowedTools", "Bash(git push origin *)", "Bash(gh pr create *)", "Bash(git add *)",
-                     "Bash(git commit -F *)", "Bash(git status)", "Bash(git status *)",
-                     # Subagents (engineer, scout, ...) cannot prompt in print mode, so anything unlisted is denied.
-                     "Bash(git diff *)", "Bash(git log *)", "Bash(git branch --show-current)",
-                     "Bash(gh issue list *)", "Bash(gh issue view *)", "Bash(gh pr checks *)", "Bash(python3 *harness.py *)",
-                     "Bash(npm run *)", "Bash(npm test *)",
-                     # Read-only checks for running the app in a browser (stall and two-tab checks).
-                     "Bash(docker ps)", "Bash(docker ps *)", "Bash(lsof -i *)", "Bash(lsof -nP -i *)",
-                     "Bash(curl http://localhost*)", "Bash(curl -s http://localhost*)",
-                     "Bash(curl http://127.0.0.1*)", "Bash(curl -s http://127.0.0.1*)"]
+    ISSUE_ALLOWED = list(ISSUE_ALLOWED_RULES)
 
     extra_allow, rejected_allow = project_allow_rules(fc)
     for why in rejected_allow:
