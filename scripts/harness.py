@@ -4589,7 +4589,8 @@ ISSUE_ALLOWED_RULES = [
     "Bash(npm run *)", "Bash(npm test *)",
     # A fresh project has no node_modules: the scaffold issue installs, and later issues add dependencies.
     # npx is limited to the toolchain the auto-detected gates use; an arbitrary `npx <pkg>` would fetch and run code.
-    "Bash(npm install)", "Bash(npm install *)", "Bash(npm ci)", "Bash(npm ci *)",
+    "Bash(npm install)", "Bash(npm install *)", "Bash(npm ci)", "Bash(npm ci *)", "Bash(npm view *)",
+    "Bash(node --version)", "Bash(npm --version)",
     "Bash(npx tsc *)", "Bash(npx vitest *)", "Bash(npx vite *)", "Bash(npx jest *)",
     # Read-only checks for running the app in a browser (stall and two-tab checks).
     "Bash(docker ps)", "Bash(docker ps *)", "Bash(lsof -i *)", "Bash(lsof -nP -i *)",

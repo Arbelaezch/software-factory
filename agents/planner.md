@@ -17,6 +17,11 @@ The delegation message gives you the run directory. Read, in this order:
   these override your own assumptions)
 - every `<run_dir>/context-*.md` (scout reports)
 - the workspace CLAUDE.md, then any source files you need to confirm details. Read targeted excerpts.
+
+Shell: headless sessions auto-approve only plain commands. Variable assignments and `$VAR` expansion, `cd` chains,
+listing paths outside the project, and anything not pre-approved are denied. Read files with Read/Grep/Glob, and use
+one command per Bash call with literal absolute paths (no `RD=...; ls $RD`).
+
   Trust the scout reports; check only what they list under "Risks and unknowns" or "Not checked".
 
 Bash is read-only for you (`git log`, `git grep`, `ls`). Don't edit source files. Budget roughly 30 tool calls.
