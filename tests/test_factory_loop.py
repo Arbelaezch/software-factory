@@ -299,6 +299,182 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(calls["ran"], [1, 2])
 
 
+class AutoQueueTests(unittest.TestCase):
+    def test_planned_issues_come_first_and_only_the_factorys_own(self):
+        issues = [issue(1, labels=()), issue(2, labels=()), issue(3, labels=("backlog",)),
+                  issue(4, labels=("blocked",)), issue(5, labels=(), body="Depends on #4")]
+        src, found = fl.auto_queue_candidates(issues, {2, 4, 5})
+        self.assertEqual((src, [p["number"] for p in found]), ("planned", [2]))  # #1 was opened by a person
+
+    def test_backlog_when_nothing_is_planned(self):
+        issues = [issue(1, labels=("backlog",)), issue(2, labels=("backlog", "enhancement")),
+                  issue(3, labels=("backlog",), body="Depends on #9"), issue(4, labels=("backlog", "blocked"))]
+        src, found = fl.auto_queue_candidates(issues, set())
+        self.assertEqual((src, [p["number"] for p in found]), ("backlog", [1, 2]))
+
+    def refill(self, issues, discover, rounds=3):
+        promoted, log = [], []
+        r = fl.make_refill(lambda: issues, lambda: {i["number"] for i in issues}, promoted.append, discover, log.append, rounds)
+        return r, promoted, log
+
+    def test_refill_promotes_before_discovering(self):
+        discover = mock.Mock(return_value=[9])
+        r, promoted, log = self.refill([issue(1, labels=("backlog",))], discover)
+        self.assertTrue(r())
+        self.assertEqual(promoted, [1])
+        discover.assert_not_called()
+        self.assertEqual(log[0]["source"], "backlog")
+
+    def test_discovery_runs_a_limited_number_of_rounds(self):
+        discover = mock.Mock(return_value=[9])
+        r, promoted, log = self.refill([], discover, rounds=2)
+        self.assertEqual([r(), r(), r(), r()], [True, True, False, False])
+        self.assertEqual(discover.call_count, 2)
+        self.assertEqual(log[-1]["kind"], "auto_queue_exhausted")
+
+    def test_an_empty_discovery_round_ends_auto_queue(self):
+        discover = mock.Mock(return_value=[])
+        r, _, log = self.refill([], discover)
+        self.assertFalse(r())
+        self.assertFalse(r())
+        self.assertEqual(discover.call_count, 1)
+        self.assertIn("nothing left", log[-1]["why"])
+
+    def test_loop_keeps_working_as_the_queue_refills_and_never_without_refill(self):
+        labels = {1: {"todo"}}
+        issues = [{"number": n, "title": f"I{n}", "body": "", "state": "OPEN"} for n in (1, 2)]
+        order, made = [], []
+
+        def fetch():
+            return [{**i, "labels": [{"name": x} for x in labels.get(i["number"], ())]} for i in issues if i["number"] in labels]
+
+        def run_issue(n):
+            order.append(n)
+            labels[n] = {"closed"}
+            issues[n - 1]["state"] = "CLOSED"
+            return 0
+
+        def discover():
+            if made:
+                return []
+            made.append(2)
+            labels[2] = {"todo"}
+            return [2]
+
+        refill = fl.make_refill(fetch, set, lambda n: None, discover, lambda e: None)
+        base = dict(gate=lambda: "go", fetch_issues=fetch, select=lambda pool: (pool[0]["number"], "x"),
+                    set_state=lambda n, st: None, run_issue=run_issue, fetch_labels=lambda n: labels[n],
+                    raise_blocker=lambda *a: None, log=lambda e: None)
+        result = fl.run_loop(refill=refill, **base)
+        self.assertEqual(order, [1, 2])
+        self.assertEqual(len(result["results"]), 2)
+
+    def test_a_failing_refill_ends_the_run_cleanly(self):
+        log = []
+        result = fl.run_loop(gate=lambda: "go", fetch_issues=lambda: [], select=None, set_state=None, run_issue=None,
+                             fetch_labels=None, raise_blocker=None, log=log.append, refill=mock.Mock(side_effect=OSError("boom")))
+        self.assertEqual(result, {"results": [], "stopped": None})
+        self.assertEqual(log[-1]["kind"], "auto_queue_failed")
+
+
+class AutoQueueWiringTests(unittest.TestCase):
+    def test_trim_plan_keeps_build_order_and_drops_orphans(self):
+        plan = {"issues": [{"key": "c", "depends_on": ["a"]}, {"key": "a"}, {"key": "b", "depends_on": ["c"]}, {"key": "d"}]}
+        self.assertEqual([i["key"] for i in h.trim_plan(plan, 2)["issues"]], ["a", "d"])
+        self.assertEqual([i["key"] for i in h.trim_plan(plan, 3)["issues"]], ["a", "d", "c"])
+
+    def test_planned_numbers_come_from_the_log(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".factory").mkdir()
+            (root / ".factory" / "log.jsonl").write_text(
+                '{"kind": "issue_created", "number": 4}\nnot json\n{"kind": "queued", "issue": 5}\n{"kind": "issue_created", "number": 7}\n')
+            with mock.patch.object(h, "ROOT", root):
+                self.assertEqual(h.planned_issue_numbers(), {4, 7})
+
+    def test_auto_queue_refuses_manual_merging(self):
+        a = mock.Mock(merge="manual", issues=None, dry_run=False, max_issues=5, repo=None, auto_queue=True)
+        with mock.patch.object(h, "factory_repo", lambda a, c: "o/r"), mock.patch.object(h, "factory_modules", lambda: (fl, None)), \
+                self.assertRaises(SystemExit) as cm:
+            h.cmd_factory_run(a, {})
+        self.assertIn("--merge auto", str(cm.exception))
+
+    def test_empty_queue_runs_discovery_files_todo_issues_and_runs_them(self):
+        import os
+        import tempfile
+        import types
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "proj"
+            (root / ".factory").mkdir(parents=True)
+            (root / ".factory" / "docs.json").write_text('{"mvp": "mvp.md"}')
+            fake = Path(tmp) / "fake-claude.sh"
+            plan = '{"notes": ["n1"], "issues": [{"key": "a", "title": "Add the court", "body": "From the MVP.", "acceptance": ["It renders"]}]}'
+            fake.write_text(f"""#!/bin/sh
+case "$*" in
+  *factory-discoverer*)
+    if [ -f "$SOFTWARE_FACTORY_HOME/round1" ]; then echo '{{"issues": []}}' > .factory/discovered.json
+    else touch "$SOFTWARE_FACTORY_HOME/round1"; echo '{plan}' > .factory/discovered.json; fi;;
+esac
+echo "args: $@"
+""")
+            fake.chmod(0o755)
+            issues, created = {}, []
+
+            def fake_json(*args):
+                if args[:2] == ("issue", "list"):
+                    return [issue(n, labels=tuple(v)) for n, v in issues.items()]
+                if args[:2] == ("issue", "view"):
+                    return {"labels": [{"name": x} for x in issues[int(args[2])]]}
+                return [{"name": x} for x in (*fl.STATE_LABELS, "enhancement")]
+
+            def fake_gh(*args, **kw):
+                if args[:2] == ("issue", "create"):
+                    labels = {args[i + 1] for i, x in enumerate(args) if x == "--label"}
+                    issues[7] = labels
+                    created.append(labels)
+                    return "https://github.com/o/r/issues/7\n"
+                return ""
+
+            def set_state(slug, n, st):
+                issues[n] = (issues[n] - set(fl.STATE_LABELS)) | {st}
+
+            usage = types.SimpleNamespace(check=lambda limits: {"decision": "go"})
+            a = mock.Mock(merge="auto", issues=None, dry_run=False, max_issues=5, repo=None, auto_queue=True, until_limit=False)
+            env = {"HARNESS_CLAUDE": str(fake), "SOFTWARE_FACTORY_HOME": tmp}
+            with mock.patch.dict("os.environ", env), mock.patch.object(h, "ROOT", root), \
+                    mock.patch.object(h, "factory_repo", lambda a, c: "o/r"), \
+                    mock.patch.object(h, "factory_modules", lambda: (fl, usage)), \
+                    mock.patch.object(h, "gh_json", fake_json), mock.patch.object(h, "gh", fake_gh), \
+                    mock.patch.object(h, "set_issue_state", set_state), mock.patch.object(h, "ensure_labels"), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                h.cmd_factory_run(a, {"factory": {"claude_args": []}})
+            events = [json.loads(x) for x in (root / ".factory" / "log.jsonl").read_text().splitlines()]
+            discovers = [f.read_text() for f in (root / ".factory" / "sessions").glob("discover-*.log")]
+            issue_runs = list((root / ".factory" / "sessions").glob("issue-7-*.log"))
+        kinds = [e["kind"] for e in events]
+        self.assertEqual(created, [{"enhancement", "todo"}])  # filed ready to run
+        self.assertEqual(len(discovers), 2)  # one round that found an issue, one that found nothing
+        self.assertTrue(all("--agent harness:factory-discoverer" in d for d in discovers))
+        self.assertEqual(len(issue_runs), 1)  # the discovered issue was worked
+        self.assertIn({"kind": "auto_queue_on"}, [{"kind": e["kind"]} for e in events])
+        self.assertEqual([e for e in events if e["kind"] == "discovered"][0]["notes"], ["n1"])
+        self.assertEqual([e["source"] for e in events if e["kind"] == "auto_queued"], ["discovered"])
+        self.assertIn("auto_queue_exhausted", kinds)
+        self.assertEqual(kinds.count("harness_started"), 1)
+
+    def test_docs_are_recorded_for_discovery(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "mvp.md").write_text("x")
+            with mock.patch.object(h, "ROOT", root), contextlib.redirect_stdout(io.StringIO()):
+                h.cmd_factory_docs(mock.Mock(mvp="mvp.md", vision=None), {})
+                self.assertEqual(json.loads((root / ".factory" / "docs.json").read_text()), {"mvp": "mvp.md"})
+                with self.assertRaises(SystemExit):
+                    h.cmd_factory_docs(mock.Mock(mvp="missing.md", vision=None), {})
+
+
 class HarnessWiringTests(unittest.TestCase):
     def test_set_issue_state_swaps_the_state_label(self):
         calls = []
@@ -395,7 +571,7 @@ class HarnessWiringTests(unittest.TestCase):
                 labels[n] = (labels[n] - set(fl.STATE_LABELS)) | {st}
 
             usage = types.SimpleNamespace(check=lambda limits: {"decision": "go"})
-            a = mock.Mock(merge="manual", issues=None, dry_run=False, max_issues=5, repo=None)
+            a = mock.Mock(merge="manual", issues=None, dry_run=False, max_issues=5, repo=None, auto_queue=False, until_limit=False)
             env = {"HARNESS_CLAUDE": str(fake), "SOFTWARE_FACTORY_HOME": tmp}
             with mock.patch.dict("os.environ", env), mock.patch.object(h, "ROOT", root), \
                     mock.patch.object(h, "factory_repo", lambda a, c: "o/r"), \

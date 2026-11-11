@@ -76,6 +76,7 @@ The factory takes a project path as an argument. One factory run handles one pro
 | `human-liaison` | Sits between the factory and me for every question and blocker (section 7) | exists |
 | `ci-fixer` | Diagnoses a failed CI run, comments on the PR, attempts one fix | new |
 | `conflict-resolver` | Resolves a merge conflict using both sides' context | new |
+| `factory-discoverer` | With auto-queue on and the queue empty, compares the MVP and vision docs with what is built and filed and drafts what is missing, or nothing (section 10a) | new |
 | `harness-cleanup` | End-of-run cleanup. First job: re-check out-of-scope concerns and file the survivors | new |
 
 Planning from the MVP document (step 4). The care goes into the documents, not into approving issues.
@@ -338,6 +339,31 @@ After an issue's PR is open or merged, and only when that file exists, the super
 gone, not worth doing or already covered, and writes at most 5 survivors to `backlog.json`. The supervisor creates
 the issues (label `backlog`, "Raised while working on #N" link, skipping existing titles), so no agent creates an
 issue. A failure here is logged and never stops the loop.
+
+## 10a. Auto-queue
+
+Off by default. `factory start --auto-queue` (or "let it loose" to `/factory`) lets one run queue its own work
+instead of stopping when the queue is empty. It is per run and never persisted, so the next `factory start` is
+back to working only what I named. It requires `--merge auto`: with manual merging the next issue would be built
+on code that is not merged yet.
+
+When the pool is empty the loop calls a refill step, in this order, and goes on as soon as one source yields work:
+1. **Planned** issues: open, no state label, created by `factory issues-create` (read from `issue_created` in
+   `.factory/log.jsonl`) and with every dependency closed. Issues a person opened are never taken.
+2. **Backlog** issues from `harness-cleanup`, with dependencies closed. This is the one place the "never worked
+   until I relabel it" rule of section 8 is waived, and only for a run I started with the flag.
+3. **Discovery**: one headless `factory-discoverer` session (read-only; Bash limited to `gh issue list|view` and
+   `git log|ls-files|grep`) reads the documents recorded by `factory docs` (written by `/factory-plan`), the
+   decisions, every existing issue and the code, and writes issues only for what the documents call for that is neither built nor filed. The
+   supervisor validates the list, cuts it to `auto_queue_per_round` (default 5, dropping issues whose dependency was
+   cut), files it with the `todo` label and logs `discovered`. No documents recorded means no discovery.
+
+Limits: `auto_queue_rounds` discovery rounds per run (default 3); a round that finds nothing ends auto-queue for the
+run, which is the normal way a run finishes; `--max-issues` still caps the total; the usage gate, blockers and the
+one-attempt-per-issue rule are unchanged. Every step is logged (`auto_queue_on`, `auto_queued` with its source,
+`discovered`, `auto_queue_exhausted`) and shown in `factory status` events, but none wake the manager. Anything the
+documents leave open goes in the discoverer's `notes`, not into an invented issue. A refill failure is logged and ends
+the run cleanly.
 
 ## 11. Personal and professional split
 

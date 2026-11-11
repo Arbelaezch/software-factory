@@ -26,22 +26,68 @@ def label_names(issue: dict) -> set[str]:
     return {(x["name"] if isinstance(x, dict) else x) for x in issue.get("labels") or []}
 
 
-def compute_pool(issues: list[dict]) -> list[dict]:
-    """Issues the factory may start: open, labelled `todo`, in no other state, with every dependency closed.
-    Each result carries `depends_on`. A dependency that isn't in the list counts as unmet."""
+def _runnable(issues: list[dict], accept: Callable[[dict, set[str]], bool]) -> list[dict]:
+    """Open issues that `accept` (given the issue and its labels), carry no other state label than the one they
+    were accepted by, and have every dependency closed. A dependency that isn't in the list counts as unmet."""
     closed = {i["number"] for i in issues if str(i.get("state", "")).upper() == "CLOSED"}
     pool = []
     for i in sorted(issues, key=lambda x: x["number"]):
         labels = label_names(i)
-        if str(i.get("state", "")).upper() != "OPEN" or "todo" not in labels:
-            continue
-        if labels & (set(STATE_LABELS) - {"todo"}):
+        if str(i.get("state", "")).upper() != "OPEN" or not accept(i, labels):
             continue
         deps = parse_depends(i.get("body"))
         if all(d in closed for d in deps):
             pool.append({"number": i["number"], "title": i.get("title", ""), "depends_on": deps,
                          "labels": sorted(labels - set(STATE_LABELS))})
     return pool
+
+
+def compute_pool(issues: list[dict]) -> list[dict]:
+    """Issues the factory may start: open, labelled `todo`, in no other state, with every dependency closed.
+    Each result carries `depends_on`."""
+    return _runnable(issues, lambda i, labels: "todo" in labels and not labels & (set(STATE_LABELS) - {"todo"}))
+
+
+def auto_queue_candidates(issues: list[dict], created: set[int] | frozenset[int] = frozenset()) -> tuple[str, list[dict]]:
+    """What auto-queue may move to `todo` when the pool is empty: ("planned", ...) first, the open issues the
+    factory itself created from the project plan that no one has labelled; else ("backlog", ...), the issues
+    cleanup filed. Issues a person opened are never taken. Same dependency rule as the pool."""
+    planned = _runnable(issues, lambda i, labels: i["number"] in created and not labels & set(STATE_LABELS))
+    if planned:
+        return "planned", planned
+    return "backlog", _runnable(issues, lambda i, labels: "backlog" in labels and not labels & (set(STATE_LABELS) - {"backlog"}))
+
+
+def make_refill(fetch_issues: Callable[[], list[dict]], created: Callable[[], set[int]],
+                promote: Callable[[int], None], discover: Callable[[], list[int]],
+                log: Callable[[dict], None], max_rounds: int = 3) -> Callable[[], bool]:
+    """The auto-queue step the loop calls when the pool is empty. Returns True when it made work runnable.
+    Order: planned issues, then cleanup backlog, then one discovery round (at most `max_rounds` per run; a round
+    that finds nothing ends auto-queue for the run, since the documents have nothing left to build)."""
+    state = {"rounds": 0, "done": False}
+
+    def refill() -> bool:
+        if state["done"]:
+            return False
+        source, found = auto_queue_candidates(fetch_issues(), created())
+        if found:
+            for p in found:
+                promote(p["number"])
+            log({"kind": "auto_queued", "source": source, "issues": [p["number"] for p in found]})
+            return True
+        if state["rounds"] >= max_rounds:
+            state["done"] = True
+            log({"kind": "auto_queue_exhausted", "why": f"{max_rounds} discovery rounds used"})
+            return False
+        state["rounds"] += 1
+        made = discover()
+        if not made:
+            state["done"] = True
+            log({"kind": "auto_queue_exhausted", "why": "discovery found nothing left to build"})
+            return False
+        log({"kind": "auto_queued", "source": "discovered", "issues": made, "round": state["rounds"]})
+        return True
+    return refill
 
 
 def parse_pick(text: str, allowed: set[int]) -> tuple[int, str] | None:
@@ -190,8 +236,9 @@ def run_loop(*, gate: Callable[[], str], fetch_issues: Callable[[], list[dict]],
              max_issues: int = 20, should_stop: Callable[[], bool] = lambda: False,
              land_pr: Callable[[int], str] | None = None,
              after_issue: Callable[[int], None] | None = None,
-             park: Callable[[int], None] | None = None) -> dict:
-    """Work the pool one issue at a time until it is empty. Returns {"results": [...], "stopped": reason|None}."""
+             park: Callable[[int], None] | None = None,
+             refill: Callable[[], bool] | None = None) -> dict:
+    """Work the pool one issue at a time until it is empty (or, with `refill`, until it cannot be refilled). Returns {"results": [...], "stopped": reason|None}."""
     results, attempted, stopped = [], set(), None
     for i in fetch_issues():  # a crashed earlier run leaves issues in-progress; never guess, hand them back
         if "in-progress" in label_names(i) and str(i.get("state", "")).upper() == "OPEN":
@@ -209,6 +256,12 @@ def run_loop(*, gate: Callable[[], str], fetch_issues: Callable[[], list[dict]],
             stopped = "usage unknown"
             break
         pool = [p for p in compute_pool(fetch_issues()) if p["number"] not in attempted]
+        if not pool and refill:
+            try:
+                if refill():
+                    pool = [p for p in compute_pool(fetch_issues()) if p["number"] not in attempted]
+            except Exception as e:  # auto-queue is a bonus; a failure ends the run cleanly instead of crashing it
+                log({"kind": "auto_queue_failed", "error": str(e)[:200]})
         if not pool:
             break
         n, reason = select(pool)

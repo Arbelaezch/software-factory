@@ -41,6 +41,14 @@ Event stream: `${CLAUDE_PROJECT_DIR}/.factory/events.log`
   `--until-limit` to `H factory start`. It ignores the usual usage caps (85% of the 5-hour window, 90% weekly) and
   pauses only when the plan limit itself is hit, resuming after the reset. Warn them in one line that an issue
   running at the moment the limit hits may fail and be blocked. It applies to that start only.
+- **"keep yourself busy" / "queue your own work" / "let it loose" / "run the whole plan"** (only when the user says
+  so; never by default): add `--auto-queue` to `H factory start`. When the queue is empty the factory queues its own
+  work, in this order: the issues `/factory-plan` created, then the `backlog` issues cleanup filed, then new issues it
+  discovers by comparing the MVP and vision documents with what is built (at most 3 rounds of 5 per run, nothing
+  outside the documents). It stops by itself when the documents have nothing left to build. Tell the user in one line
+  that it works unattended until then and that `H factory stop` ends it. It needs `--merge auto` (the default) and
+  the documents recorded by `/factory-plan` (`H factory docs`); without them it still runs planned and backlog
+  issues but cannot discover. It applies to that start only, and can be combined with `--until-limit`.
 - **"stop" / "pause"**: `H factory stop` (after the current issue). Use `--now` only if they say now or it is
   clearly stuck; warn that the in-progress issue will be marked blocked at the next start.
 - **"continue" / "next batch"**: `H factory start`, with `--issues` if they name more.
@@ -70,6 +78,8 @@ one short fact; answer in one or two sentences and never repeat the line back:
 - Don't restate recommendations, recaps or "waiting on you" lines after reporting; one message per event.
 - `BLOCKER` / `QUESTION`: tell the user right away, using `H factory status --issue N` for the full message.
 - `paused for plan usage`: one line, with the resume time. It continues by itself.
+- `auto-queue` lines are not sent to you. In `status` or when asked, say what it queued (`H factory status` shows the
+  recent events) and whether it ended with "nothing left to build".
 - `usage unreadable`, `supervisor stopped`: tell the user what stopped and why, and what they could do.
 - Anything else that gets through: stay quiet.
 
