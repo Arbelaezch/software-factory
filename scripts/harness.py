@@ -27,6 +27,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 if sys.version_info < (3, 8):
@@ -568,12 +569,12 @@ def cmd_run_start(a, cfg):
     print(json.dumps(out, indent=2))
 
 
-def manager_usage(run: dict, cfg: dict) -> dict | None:
-    """Usage of the main (manager) session between run start and now."""
+def manager_entries(run: dict) -> list[dict] | None:
+    """Transcript entries of the main (manager) session between run start and now (or the run's end)."""
     path = run.get("session_transcript")
     if not path or not Path(path).exists():
         return None
-    start, end = parse_ts(run.get("started_at")), now()
+    start, end = parse_ts(run.get("started_at")), parse_ts(run.get("ended_at")) or now()
     entries = []
     for e in iter_transcript(Path(path)):
         if e.get("isSidechain"):
@@ -581,7 +582,57 @@ def manager_usage(run: dict, cfg: dict) -> dict | None:
         t = parse_ts(e.get("timestamp"))
         if t and start and start <= t <= end:
             entries.append(e)
-    return summarize_entries(entries, cfg, seen=set())
+    return entries
+
+
+def session_start(entries: list[dict], run_start: dt.datetime | None = None) -> dict | None:
+    """What a main session carries before it has done anything, from its whole transcript (not just the run).
+    parts: characters per startup item (the prompt and each attachment: skill and agent listings, environment,
+    session context ...) and, where the transcript records them, the system prompt and tool definitions, up to the
+    first request. first_request_tokens is what that request actually held, so what the parts do not cover is
+    estimation error (characters are not tokens). requests_before_run and
+    context_at_run_start say how much the session had already done when the run began."""
+    parts: dict[str, int] = {}
+    first = at_run_start = None
+    ids: set[str] = set()
+    before = 0
+    for e in entries:
+        if e.get("isSidechain"):
+            continue
+        msg = e.get("message") or {}
+        usage = msg.get("usage")
+        if e.get("type") == "assistant" and usage and msg.get("id") and msg.get("model") != "<synthetic>":
+            ctx = sum(usage.get(k, 0) or 0 for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+            if first is None:
+                first = ctx
+            t = parse_ts(e.get("timestamp"))
+            if run_start and t and t < run_start and msg["id"] not in ids:
+                before += 1
+                at_run_start = ctx
+            ids.add(msg["id"])
+        elif first is None and e.get("type") == "attachment":
+            att = e.get("attachment") or {}
+            key = att.get("type") or "attachment"
+            if key == "prompt_snapshot":  # a copy of the system prompt, counted from the request shape
+                continue
+            parts[key] = parts.get(key, 0) + len(json.dumps(att, ensure_ascii=False))
+        elif first is None and e.get("type") == "api-request-shape":
+            shape = e.get("shape") or {}
+            for key, name in (("system", "system prompt"), ("tools", "tool definitions")):
+                if isinstance(shape.get(key), list):  # older versions record only the shape, not the text
+                    parts[name] = parts.get(name, 0) + len(json.dumps(shape[key], ensure_ascii=False))
+        elif first is None and e.get("type") == "user":
+            parts["prompt"] = parts.get("prompt", 0) + len(json.dumps(msg.get("content"), ensure_ascii=False))
+    if first is None:
+        return None
+    return {"first_request_tokens": first, "parts": parts, "requests_before_run": before,
+            "context_at_run_start": at_run_start}
+
+
+def manager_usage(run: dict, cfg: dict) -> dict | None:
+    """Usage of the main (manager) session between run start and now."""
+    entries = manager_entries(run)
+    return None if entries is None else summarize_entries(entries, cfg, seen=set())
 
 
 def cmd_run_concern(a, cfg):
@@ -596,6 +647,13 @@ def cmd_run_concern(a, cfg):
     print(f"concern recorded for run {run['id']}")
 
 
+def count_review_rounds(d: Path, run: dict) -> int:
+    """Review rounds so far: the highest of the recorded count and the review-<n>.json files, since only the
+    outside-provider reviewer updates run.json (the Claude reviewer agent just writes its file)."""
+    files = [int(m.group(1)) for f in d.iterdir() if (m := re.fullmatch(r"review-(\d+)\.json", f.name))]
+    return max([run.get("review_rounds", 0), *files])
+
+
 def cmd_run_end(a, cfg):
     d, run = load_run(a.run)
     if run.get("status") != "running" and not a.force:
@@ -603,14 +661,14 @@ def cmd_run_end(a, cfg):
     usage = manager_usage(run, cfg)
     if usage and usage["requests"]:
         log_event({"kind": "agent", "run_id": run["id"], "stage": "manager", **usage})
-    run.update(status=a.status, ended_at=iso())
+    run.update(status=a.status, ended_at=iso(), review_rounds=count_review_rounds(d, run))
     if a.note:
         run["note"] = a.note
     save_run(d, run)
     totals = run_totals(run["id"])
     log_event({"kind": "run_end", "run_id": run["id"], "status": a.status, "mode": run.get("mode"),
                "duration_s": round((now() - parse_ts(run["started_at"])).total_seconds()),
-               "review_rounds": run.get("review_rounds", 0), **totals})
+               "review_rounds": run["review_rounds"], **totals})
     if current_run_id() == run["id"]:
         CURRENT_FILE.unlink(missing_ok=True)
     print(f"Run {run['id']} ended: {a.status}")
@@ -692,6 +750,7 @@ def summarize_entries(entries: list[dict], cfg: dict, seen: set[str]) -> dict:
     requests = 0
     tool_ids: set[str] = set()
     first = last = None
+    first_request = peak_request = None  # context size (all input tokens) of the first and the largest request
     new_ids = []
     already = set(seen)
     # Only the part of the transcript not counted before (a resumed agent appends to its file).
@@ -729,6 +788,10 @@ def summarize_entries(entries: list[dict], cfg: dict, seen: set[str]) -> dict:
         tout += u.get("output_tokens", 0) or 0
         tcr += u.get("cache_read_input_tokens", 0) or 0
         tcc += u.get("cache_creation_input_tokens", 0) or 0
+        ctx = (u.get("input_tokens", 0) or 0) + (u.get("cache_read_input_tokens", 0) or 0) \
+            + (u.get("cache_creation_input_tokens", 0) or 0)
+        first_request = ctx if first_request is None else first_request
+        peak_request = max(peak_request or 0, ctx)
         c = claude_request_cost(u, model, cfg)
         if c is None:
             cost_known = False
@@ -748,9 +811,72 @@ def summarize_entries(entries: list[dict], cfg: dict, seen: set[str]) -> dict:
         "cost_complete": cost_known,
         "billing": (cfg.get("metrics") or {}).get("anthropic_billing", "seat"),
         "tool_uses": len(tool_ids),
+        "first_request_tokens": first_request,
+        "peak_request_tokens": peak_request,
         "duration_s": round((last - first).total_seconds()) if first and last else None,
         "_new_ids": new_ids,
     }
+
+
+CHARS_PER_TOKEN = 4  # rough: tool output is mixed code and prose
+
+
+def tool_calls(entries: list[dict]) -> list[dict]:
+    """One record per tool call: tool, target (file, command or pattern), size of its result in characters, and how
+    many later requests carried that result in their context. A result stays in the context for the rest of the
+    agent's run, so `chars * later_requests` is what it cost to keep (cache reads, mostly)."""
+    calls: dict[str, dict] = {}
+    request_ids: dict[str, int] = {}  # message id -> 1-based request number
+    for e in entries:
+        msg = e.get("message") or {}
+        content = msg.get("content")
+        if e.get("type") == "assistant" and msg.get("id"):
+            n = request_ids.setdefault(msg["id"], len(request_ids) + 1)
+            for b in content if isinstance(content, list) else []:
+                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id") not in calls:
+                    inp = b.get("input") or {}
+                    target = inp.get("file_path") or inp.get("path") or inp.get("pattern") or str(inp.get("command") or "")[:80]
+                    calls[b["id"]] = {"tool": b.get("name") or "?", "target": " ".join(str(target).split()),
+                                      "request": n, "chars": None}
+        elif e.get("type") == "user":
+            for b in content if isinstance(content, list) else []:
+                if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") in calls:
+                    body = b.get("content")
+                    if isinstance(body, list):
+                        body = "".join(x.get("text", "") for x in body if isinstance(x, dict))
+                    calls[b["tool_use_id"]]["chars"] = len(body or "")
+    total = len(request_ids)
+    out = []
+    for c in calls.values():
+        if c["chars"] is not None:
+            out.append({**c, "later_requests": total - c["request"]})
+    return out
+
+
+def locate_transcript(agent_id: str) -> Path | None:
+    """A subagent's or a supervisor session's transcript, found by id."""
+    config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    hits = list(config_dir.glob(f"projects/*/*/subagents/agent-{agent_id}.jsonl")) \
+        or list(config_dir.glob(f"projects/*/{agent_id}.jsonl"))
+    return hits[0] if hits else None
+
+
+def transcripts_for(events: list[dict]) -> list[tuple[str, str | None, list[dict]]]:
+    """(stage, run id, entries) for every agent event in `events` whose transcript can still be found.
+    The manager's entries come from its run's session transcript."""
+    out, done_managers = [], set()
+    for e in events:
+        if e.get("kind") != "agent" or e.get("error"):
+            continue
+        rid = e.get("run_id")
+        if e.get("stage") == "manager" and rid and rid not in done_managers:
+            done_managers.add(rid)
+            entries = manager_entries(read_json(RUNS_DIR / rid / "run.json", {}) or {})
+            if entries:
+                out.append(("manager", rid, entries))
+        elif e.get("agent_id") and (path := locate_transcript(e["agent_id"])):
+            out.append((e.get("stage", "?"), rid, list(iter_transcript(path))))
+    return out
 
 
 def find_agent_transcript(payload: dict) -> Path | None:
@@ -765,6 +891,8 @@ def find_agent_transcript(payload: dict) -> Path | None:
     if cand.exists():
         return cand
     hits = list(base.glob(f"**/agent-{aid}.jsonl"))
+    if not hits and base.parent.name == "projects":  # the agent may have logged under another project directory
+        hits = list(base.parent.glob(f"*/*/subagents/agent-{aid}.jsonl"))
     return hits[0] if hits else None
 
 
@@ -791,7 +919,9 @@ def hook_subagent_stop(cfg):
     stage = (payload.get("agent_type") or "unknown").split(":")[-1]
     if not path:
         log_event({"kind": "agent", "run_id": rid, "stage": stage, "agent_id": aid,
-                   "error": "transcript not found"})
+                   "error": "transcript not found",
+                   "payload": {k: payload.get(k) for k in ("agent_type", "session_id", "transcript_path",
+                                                           "agent_transcript_path", "cwd")}})
         return
     seen_file = SEEN_DIR / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', aid)}.json"
     seen = set(read_json(seen_file, []))
@@ -3352,12 +3482,120 @@ def unattributed_agent_events(events: list[dict]) -> list[dict]:
     return [e for e in events if e.get("kind") == "agent" and (e.get("error") or e.get("stage") == "unknown")]
 
 
+def issue_rollup(events: list[dict]) -> dict[int, dict]:
+    """Cost per factory issue across every run of it (retries and aborted runs included) and the supervisor
+    sessions logged against it. An event belongs to an issue by its `issue` field or by its run's issue number."""
+    run_issue_no: dict[str, int] = {}
+    for rid in {e.get("run_id") for e in events if e.get("run_id")}:
+        n = ((read_json(RUNS_DIR / rid / "run.json", {}) or {}).get("issue") or {}).get("number")
+        if n is not None:
+            run_issue_no[rid] = n
+    out: dict[int, dict] = {}
+    for e in events:
+        n = e.get("issue", run_issue_no.get(e.get("run_id")))
+        if n is None or e.get("kind") not in ("agent", "llm_call", "run_end"):
+            continue
+        r = out.setdefault(n, {"runs": {}, "cost": 0.0, "context": 0, "by_stage": {}})
+        if e["kind"] == "run_end":
+            r["runs"][e["run_id"]] = e.get("status")
+            continue
+        if e.get("error"):
+            continue
+        cost = e.get("cost_usd_est") or 0.0
+        r["cost"] += cost
+        r["context"] += sum(e.get(f"gen_ai.usage.{k}") or 0 for k in ("input_tokens", "cache_read_tokens", "cache_creation_tokens"))
+        r["by_stage"][e.get("stage", "?")] = r["by_stage"].get(e.get("stage", "?"), 0.0) + cost
+    return out
+
+
+def print_manager_start(events: list[dict], top: int) -> None:
+    """What each run's manager session carried from its first request, and what that was made of."""
+    seen: set[str] = set()
+    rows, parts, firsts = [], {}, []
+    for rid in dict.fromkeys(e["run_id"] for e in events if e.get("kind") == "agent" and e.get("run_id")):
+        run = read_json(RUNS_DIR / rid / "run.json", {}) or {}
+        path = run.get("session_transcript")
+        if not path or not Path(path).exists():
+            continue
+        st = session_start(list(iter_transcript(Path(path))), parse_ts(run.get("started_at")))
+        if not st:
+            continue
+        rows.append([rid[:15], f"{st['first_request_tokens'] / 1000:.0f}k", st["requests_before_run"],
+                     f"{(st['context_at_run_start'] or st['first_request_tokens']) / 1000:.0f}k"])
+        if path not in seen:  # a session that served several runs started only once
+            seen.add(path)
+            firsts.append(st["first_request_tokens"])
+            for k, chars in st["parts"].items():
+                parts[k] = parts.get(k, 0) + chars
+    if not rows:
+        return
+    print("\n== Manager session start ==")
+    print(fmt_table(rows, ["run", "1st request", "requests before run", "context at run start"]))
+    n = len(firsts)
+    listed = sum(parts.values()) / CHARS_PER_TOKEN / n
+    print(f"\nStartup items (approx. tokens, average of {n} session(s)); the 1st request held {sum(firsts) / n / 1000:.0f}k "
+          f"in all, {listed / 1000:.0f}k of it accounted for here (the rest is estimation error: characters are not tokens):")
+    print(fmt_table([[k, f"{chars / CHARS_PER_TOKEN / n / 1000:.1f}k"] for k, chars in sorted(parts.items(), key=lambda kv: -kv[1])[:top]],
+                    ["item", "tokens"]))
+
+
+def print_tool_report(events: list[dict], top: int) -> None:
+    """Where the context goes: per tool, the size of results and what carrying them cost; the single biggest
+    results; and files read by more than one agent of the same run."""
+    sessions = transcripts_for(events)
+    rows: dict[str, dict] = {}
+    big: list[dict] = []
+    reads: dict[tuple, set] = {}
+    for stage, rid, entries in sessions:
+        for c in tool_calls(entries):
+            r = rows.setdefault(c["tool"], {"calls": 0, "chars": 0, "max": 0, "carried": 0})
+            r["calls"] += 1
+            r["chars"] += c["chars"]
+            r["max"] = max(r["max"], c["chars"])
+            r["carried"] += c["chars"] * c["later_requests"]
+            big.append({**c, "stage": stage})
+            if c["tool"] == "Read" and c["target"]:
+                reads.setdefault((rid, c["target"]), set()).add((stage, id(entries)))
+    if not rows:
+        print("(no transcripts found for these events)")
+        return
+    tok = lambda chars: chars / CHARS_PER_TOKEN
+    print(f"== Tool results (approx. tokens: {CHARS_PER_TOKEN} characters each; {len(sessions)} transcripts) ==")
+    print(fmt_table([[t, r["calls"], f"{tok(r['chars']) / 1000:.0f}k", f"{tok(r['chars']) / r['calls']:.0f}",
+                      f"{tok(r['max']) / 1000:.1f}k", f"{tok(r['carried']) / 1e6:.1f}M"]
+                     for t, r in sorted(rows.items(), key=lambda kv: -kv[1]["carried"])],
+                    ["tool", "calls", "result total", "avg", "max", "carried*"]))
+    print("*carried = result tokens x the requests that came after it: the cost of keeping it in context")
+    total_ctx = sum(sum(e.get(f"gen_ai.usage.{k}") or 0 for k in ("input_tokens", "cache_read_tokens", "cache_creation_tokens"))
+                    for e in events if e.get("kind") == "agent" and not e.get("error"))
+    carried = sum(tok(r["carried"]) for r in rows.values())
+    if total_ctx:
+        print(f"Tool results are {100 * carried / total_ctx:.0f}% of all {total_ctx / 1e6:.1f}M context tokens sent; the rest is "
+              "the system prompt, tools, CLAUDE.md, prompts and the agents' own output, re-sent on every request.")
+    print(f"\n== Largest {top} results by carried cost ==")
+    big.sort(key=lambda c: -c["chars"] * c["later_requests"])
+    print(fmt_table([[c["stage"], c["tool"], c["target"][:60], f"{tok(c['chars']) / 1000:.1f}k", c["later_requests"],
+                      f"{tok(c['chars'] * c['later_requests']) / 1000:.0f}k"] for c in big[:top]],
+                    ["stage", "tool", "target", "size", "later reqs", "carried"]))
+    repeated = sorted(((k, len(v)) for k, v in reads.items() if len(v) > 1), key=lambda kv: -kv[1])
+    if repeated:
+        print(f"\n== Files read by more than one agent in the same run (top {top}) ==")
+        print(fmt_table([[n, (rid or "-")[:15], "/".join(Path(f).parts[-3:])] for (rid, f), n in repeated[:top]],
+                        ["agents", "run", "file"]))
+        print(f"{len(repeated)} file(s) in total, {sum(n - 1 for _, n in repeated)} repeat read(s). Some are needed "
+              "(each engineer reads its own task); the rest are what the plan could carry.")
+
+
 def cmd_report(a, cfg):
     events = read_events()
     cutoff = now() - dt.timedelta(days=a.days)
     events = [e for e in events if (parse_ts(e.get("ts")) or now()) >= cutoff]
     if a.run:
         events = [e for e in events if e.get("run_id") == a.run]
+    if a.tools:
+        print_tool_report(events, a.top)
+        print_manager_start(events, a.top)
+        return
     if a.csv:
         import csv
         keys = sorted({k for e in events for k in e if not isinstance(e[k], (dict, list))})
@@ -3380,16 +3618,28 @@ def cmd_report(a, cfg):
                   + (x.get("gen_ai.usage.cache_creation_tokens") or 0) for x in es)
         tout = sum(x.get("gen_ai.usage.output_tokens") or 0 for x in es)
         durs = [x["duration_s"] for x in es if x.get("duration_s") is not None]
+        firsts = [x["first_request_tokens"] for x in es if x.get("first_request_tokens")]
         billing = es[0].get("billing", "")
-        rows.append([stage, model, n, f"{tin / n / 1000:.0f}k", f"{tout / n / 1000:.1f}k",
+        rows.append([stage, model, n, f"{sum(firsts) / len(firsts) / 1000:.0f}k" if firsts else "",
+                     f"{tin / n / 1000:.0f}k", f"{tout / n / 1000:.1f}k",
                      f"${tot / n:.3f}", f"${tot:.2f}", billing, f"{sum(durs) / len(durs):.0f}s" if durs else ""])
     print(f"== Agents and models (last {a.days} days) ==")
-    print(fmt_table(rows, ["stage", "model", "calls", "avg in", "avg out", "avg $", "total $", "billing", "avg time"])
+    print(fmt_table(rows, ["stage", "model", "calls", "1st req", "avg in", "avg out", "avg $", "total $", "billing", "avg time"])
           if rows else "(no usage recorded yet)")
     lost = unattributed_agent_events(events)
     if lost:
         print(f"{len(lost)} agent event(s) have no usage data (transcript not found or no agent type); "
               "they are excluded above.")
+
+    issues = issue_rollup(events)
+    if issues:
+        print("\n== Issues (all runs and supervisor sessions) ==")
+        i_rows = []
+        for n, r in sorted(issues.items()):
+            top = max(r["by_stage"], key=r["by_stage"].get) if r["by_stage"] else ""
+            i_rows.append([f"#{n}", len(r["runs"]), "/".join(str(s) for s in r["runs"].values()),
+                           f"{r['context'] / 1e6:.1f}M", f"${r['cost']:.2f}", top])
+        print(fmt_table(i_rows, ["issue", "runs", "run status", "context", "total $", "top stage"]))
 
     gates = [e for e in events if e.get("kind") == "gate"]
     if gates:
@@ -4132,6 +4382,34 @@ def claude_command(*args: str) -> list[str]:
     return [os.environ.get("HARNESS_CLAUDE", "claude"), *args]
 
 
+def metered_command(*args: str) -> tuple[list[str], str]:
+    """claude_command with a session id we chose, so the session's transcript can be found afterwards."""
+    sid = str(uuid.uuid4())
+    return claude_command(*args, "--session-id", sid), sid
+
+
+def log_session_usage(stage: str, sid: str, cfg: dict, issue: int | None = None) -> None:
+    """Log the usage of a supervisor-launched `claude -p` session (selector, cleanup, discover, CI fixer, conflict
+    resolver). These are main sessions, so no SubagentStop hook sees them."""
+    config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    hits = list(config_dir.glob(f"projects/*/{sid}.jsonl"))
+    found = issue_run(issue) if issue is not None else None
+    event = {"kind": "agent", "run_id": found[1]["id"] if found else None, "stage": stage, "agent_id": sid}
+    if issue is not None:
+        event["issue"] = issue
+    if not hits:
+        log_event({**event, "error": "transcript not found"})
+        return
+    try:
+        summary = summarize_entries(list(iter_transcript(hits[0])), cfg, set())
+    except OSError:  # metering must never stop the factory
+        log_event({**event, "error": "transcript unreadable"})
+        return
+    summary.pop("_new_ids")
+    if summary["requests"]:
+        log_event({**event, **summary})
+
+
 def cmd_factory_pool(a, cfg):
     fl, _ = factory_modules()
     slug = factory_repo(a, cfg)
@@ -4661,8 +4939,10 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
         limits = {"five_hour": 100.0, "seven_day": 100.0}
 
     def ask_selector(pool):
-        r = run_cmd(claude_command("-p", "Pick the next issue. Candidates:\n" + json.dumps(pool, indent=1),
-                                   "--agent", SELECTOR_AGENT, *claude_args), cwd=str(ROOT), timeout=300)
+        command, sid = metered_command("-p", "Pick the next issue. Candidates:\n" + json.dumps(pool, indent=1),
+                                       "--agent", SELECTOR_AGENT, *claude_args)
+        r = run_cmd(command, cwd=str(ROOT), timeout=300)
+        log_session_usage(SELECTOR_AGENT.split(":")[-1], sid, cfg)
         return r.stdout
 
     ISSUE_ALLOWED = list(ISSUE_ALLOWED_RULES)
@@ -4720,7 +5000,9 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
                 prompt = prompt_tpl.format(pr=url, branch=branch, base=base, note=note)
                 fields = {"pr_branch": branch, **({"base_branch": base} if role == "conflict-resolver" else {})}
                 with open(sessions / f"{kind}-{n}-{int(time.time())}.log", "w", encoding="utf-8") as out:
-                    run_factory(str(ROOT), role, fields, claude_command("-p", prompt, "--agent", agent, *claude_args, *allowed), out)
+                    command, sid = metered_command("-p", prompt, "--agent", agent, *claude_args, *allowed)
+                    run_factory(str(ROOT), role, fields, command, out)
+                log_session_usage(role, sid, cfg, n)
                 if note.is_file():  # the worker can't comment (guard); the supervisor posts its note
                     try:
                         gh("pr", "comment", url, "--body-file", str(note))
@@ -4787,7 +5069,9 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
         out_file.unlink(missing_ok=True)
         prompt = CLEANUP_PROMPT.format(run_dir=d, issue=n, out=out_file)
         with open(sessions / f"cleanup-{n}-{int(time.time())}.log", "w", encoding="utf-8") as out:
-            run_factory(str(ROOT), "manager", {}, claude_command("-p", prompt, "--agent", CLEANUP_AGENT, *claude_args, *CLEANUP_ALLOWED), out)
+            command, sid = metered_command("-p", prompt, "--agent", CLEANUP_AGENT, *claude_args, *CLEANUP_ALLOWED)
+            run_factory(str(ROOT), "manager", {}, command, out)
+        log_session_usage(CLEANUP_AGENT.split(":")[-1], sid, cfg, n)
         try:
             filed = file_backlog(slug, n, read_json(out_file, []) or [], (read_json(ROOT / ".factory" / "prs.json", {}) or {}).get(str(n)))
         except (RuntimeError, OSError) as e:
@@ -4808,7 +5092,9 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
         out_file.unlink(missing_ok=True)
         prompt = DISCOVER_PROMPT.format(docs=", ".join(paths), limit=limit, out=out_file)
         with open(sessions / f"discover-{int(time.time() * 1000)}.log", "w", encoding="utf-8") as out:
-            run_factory(str(ROOT), "manager", {}, claude_command("-p", prompt, "--agent", DISCOVER_AGENT, *claude_args, *DISCOVER_ALLOWED), out)
+            command, sid = metered_command("-p", prompt, "--agent", DISCOVER_AGENT, *claude_args, *DISCOVER_ALLOWED)
+            run_factory(str(ROOT), "manager", {}, command, out)
+        log_session_usage(DISCOVER_AGENT.split(":")[-1], sid, cfg)
         plan = read_json(out_file, None)
         if not isinstance(plan, dict) or not plan.get("issues"):
             return []
@@ -5087,6 +5373,8 @@ def main(argv=None):
     s.add_argument("--run")
     s.add_argument("--limit", type=int, default=15)
     s.add_argument("--csv", help="export raw events to a CSV file")
+    s.add_argument("--tools", action="store_true", help="per-tool breakdown of result sizes, from the transcripts")
+    s.add_argument("--top", type=int, default=10, help="rows in the --tools lists")
     s.set_defaults(fn=cmd_report)
 
     s = sub.add_parser("models", help="list or change agent models")
