@@ -637,6 +637,22 @@ class SubagentStopTests(unittest.TestCase):
         events, _ = self.run_hook({"agent_id": "a1", "agent_type": "harness:scout"})
         self.assertEqual([(e["stage"], e["error"]) for e in events], [("scout", "transcript not found")])
 
+    def test_missing_transcript_error_records_the_payload(self):
+        events, _ = self.run_hook({"agent_id": "a1", "agent_type": "harness:scout", "cwd": "/x", "extra": 1})
+        self.assertEqual(events[0]["payload"]["cwd"], "/x")
+        self.assertNotIn("extra", events[0]["payload"])
+
+    def test_transcript_is_found_under_another_project_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            projects = Path(tmp) / "projects"
+            mine = projects / "-mine"
+            mine.mkdir(parents=True)
+            other = projects / "-other" / "sess" / "subagents"
+            other.mkdir(parents=True)
+            (other / "agent-a9.jsonl").write_text("{}\n")
+            found = h.find_agent_transcript({"agent_id": "a9", "session_id": "s", "transcript_path": str(mine / "s.jsonl")})
+        self.assertEqual(found.name, "agent-a9.jsonl")
+
     def test_agent_inside_a_run_with_missing_transcript_logs_an_error(self):
         with mock.patch.object(h, "RUNS_DIR", Path(tempfile.gettempdir())):
             events, _ = self.run_hook({"agent_id": "a1", "agent_type": "Explore"}, rid="r1")
@@ -658,6 +674,203 @@ class SubagentStopTests(unittest.TestCase):
                {"kind": "agent", "stage": "scout", "error": "transcript not found"},
                {"kind": "agent", "stage": "scout"}, {"kind": "gate"}]
         self.assertEqual(len(h.unattributed_agent_events(evs)), 2)
+
+
+def assistant_line(mid, inp, out=1, cache_read=0, cache_write=0):
+    return json.dumps({"type": "assistant", "message": {"id": mid, "model": "claude-sonnet-5-5", "content": [], "usage": {
+        "input_tokens": inp, "output_tokens": out, "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_write}}}) + "\n"
+
+
+class RequestSizeTests(unittest.TestCase):
+    def test_first_and_peak_request_count_all_input_tokens(self):
+        entries = [json.loads(assistant_line("m1", 10, cache_write=5000)),
+                   json.loads(assistant_line("m2", 20, cache_read=5000, cache_write=3000)),
+                   json.loads(assistant_line("m3", 5, cache_read=8000))]
+        r = h.summarize_entries(entries, {}, set())
+        self.assertEqual((r["first_request_tokens"], r["peak_request_tokens"]), (5010, 8020))
+
+    def test_no_requests(self):
+        r = h.summarize_entries([], {}, set())
+        self.assertEqual((r["first_request_tokens"], r["peak_request_tokens"]), (None, None))
+
+
+def tool_entries(*calls):
+    """Transcript entries: one assistant request per call (tool, target, result text), as Claude Code writes them."""
+    out = []
+    for i, (tool, target, result) in enumerate(calls, 1):
+        key = {"Read": "file_path", "Bash": "command", "Grep": "pattern"}[tool]
+        out.append({"type": "assistant", "message": {"id": f"m{i}", "content": [
+            {"type": "tool_use", "id": f"t{i}", "name": tool, "input": {key: target}}]}})
+        out.append({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": f"t{i}", "content": result}]}})
+        out.append({"type": "api-request-blob", "message": {"content": [{"type": "tool_result", "tool_use_id": f"t{i}", "content": "dup"}]}})
+    return out
+
+
+class ToolCallTests(unittest.TestCase):
+    def test_result_size_and_requests_that_carried_it(self):
+        calls = h.tool_calls(tool_entries(("Read", "/a.py", "x" * 400), ("Bash", "ls", "y" * 40), ("Grep", "foo", "")))
+        self.assertEqual([(c["tool"], c["target"], c["chars"], c["later_requests"]) for c in calls],
+                         [("Read", "/a.py", 400, 2), ("Bash", "ls", 40, 1), ("Grep", "foo", 0, 0)])
+
+    def test_streamed_blocks_of_one_request_count_once(self):
+        e = tool_entries(("Read", "/a.py", "x" * 8))
+        calls = h.tool_calls([e[0], e[0], e[1]])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["later_requests"], 0)
+
+    def test_list_content_and_missing_result(self):
+        e = tool_entries(("Read", "/a.py", ""), ("Bash", "ls", ""))
+        e[1]["message"]["content"][0]["content"] = [{"type": "text", "text": "abc"}, {"type": "text", "text": "de"}]
+        del e[4]  # the second call never got a result
+        calls = h.tool_calls(e)
+        self.assertEqual([(c["tool"], c["chars"]) for c in calls], [("Read", 5)])
+
+    def test_report_totals_and_repeated_reads(self):
+        sessions = [("engineer", "r1", tool_entries(("Read", "/p/plan.md", "x" * 400))),
+                    ("scout", "r1", tool_entries(("Read", "/p/plan.md", "x" * 400), ("Bash", "ls", "y"))),
+                    ("scout", "r2", tool_entries(("Read", "/p/plan.md", "x" * 400)))]
+        buf = io.StringIO()
+        with mock.patch.object(h, "transcripts_for", return_value=sessions), mock.patch.object(h.sys, "stdout", buf):
+            h.print_tool_report([], 5)
+        out = buf.getvalue()
+        self.assertRegex(out, r"Read\s+3\s")
+        self.assertIn("1 file(s) in total, 1 repeat read(s)", out)  # r1 read plan.md twice; r2 once
+
+    def test_no_transcripts(self):
+        buf = io.StringIO()
+        with mock.patch.object(h, "transcripts_for", return_value=[]), mock.patch.object(h.sys, "stdout", buf):
+            h.print_tool_report([], 5)
+        self.assertIn("no transcripts found", buf.getvalue())
+
+    def test_locate_transcript_finds_subagent_and_session_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sub = Path(tmp) / "projects" / "-p" / "s1" / "subagents"
+            sub.mkdir(parents=True)
+            (sub / "agent-a1.jsonl").write_text("{}")
+            (Path(tmp) / "projects" / "-p" / "sid9.jsonl").write_text("{}")
+            with mock.patch.dict(h.os.environ, {"CLAUDE_CONFIG_DIR": tmp}):
+                self.assertEqual(h.locate_transcript("a1").name, "agent-a1.jsonl")
+                self.assertEqual(h.locate_transcript("sid9").name, "sid9.jsonl")
+                self.assertIsNone(h.locate_transcript("nope"))
+
+
+class SessionStartTests(unittest.TestCase):
+    def entries(self):
+        usage = lambda ctx: {"input_tokens": ctx, "output_tokens": 1}
+        asst = lambda mid, ts, ctx: {"type": "assistant", "timestamp": ts, "message": {
+            "id": mid, "model": "claude-sonnet-5-5", "content": [], "usage": usage(ctx)}}
+        return [
+            {"type": "queue-operation"},
+            {"type": "attachment", "attachment": {"type": "skill_listing", "content": "s" * 400}},
+            {"type": "attachment", "attachment": {"type": "skill_listing", "content": "s" * 400}},
+            {"type": "attachment", "attachment": {"type": "prompt_snapshot", "systemPrompt": ["x" * 400]}},
+            {"type": "user", "message": {"content": "p" * 100}},
+            {"type": "api-request-shape", "shape": {"system": [{"text": "x" * 40}], "tools": [{"name": "t" * 80}]}},
+            asst("m1", "2026-11-11T10:00:00Z", 26000),
+            {"type": "attachment", "attachment": {"type": "date"}},  # after the first request: not startup
+            asst("m1", "2026-11-11T10:00:01Z", 26000),  # a second block of the same request
+            asst("m2", "2026-11-11T10:05:00Z", 30000),
+            asst("m3", "2026-11-11T10:20:00Z", 40000),
+            {"type": "assistant", "isSidechain": True, "timestamp": "2026-11-11T10:06:00Z", "message": {
+                "id": "s1", "model": "claude-sonnet-5-5", "content": [], "usage": usage(9)}},
+        ]
+
+    def test_startup_parts_and_context_at_run_start(self):
+        st = h.session_start(self.entries(), h.parse_ts("2026-11-11T10:10:00Z"))
+        self.assertEqual(st["first_request_tokens"], 26000)
+        self.assertEqual(st["requests_before_run"], 2)
+        self.assertEqual(st["context_at_run_start"], 30000)
+        self.assertEqual(sorted(st["parts"]), ["prompt", "skill_listing", "system prompt", "tool definitions"])
+        self.assertGreater(st["parts"]["skill_listing"], 800)  # both attachments summed
+        self.assertNotIn("date", st["parts"])
+        self.assertNotIn("prompt_snapshot", st["parts"])
+
+    def test_run_that_started_with_the_session(self):
+        st = h.session_start(self.entries(), h.parse_ts("2026-11-11T09:00:00Z"))
+        self.assertEqual((st["requests_before_run"], st["context_at_run_start"]), (0, None))
+
+    def test_shape_without_text_adds_no_parts(self):
+        e = self.entries()
+        i = next(i for i, x in enumerate(e) if x["type"] == "api-request-shape")
+        e[i] = {"type": "api-request-shape", "shape": {"system": "list[3] of dict", "tools": "list[12] of dict"}}
+        self.assertNotIn("system prompt", h.session_start(e)["parts"])
+
+    def test_no_requests(self):
+        self.assertIsNone(h.session_start([{"type": "attachment", "attachment": {"type": "date"}}]))
+
+
+class SessionUsageTests(unittest.TestCase):
+    """log_session_usage: supervisor-launched `claude -p` sessions are metered from their transcript."""
+
+    def log(self, transcript=None, issue=None, found=None):
+        events = []
+        with tempfile.TemporaryDirectory() as tmp:
+            if transcript:
+                d = Path(tmp) / "projects" / "-proj"
+                d.mkdir(parents=True)
+                (d / "sid1.jsonl").write_text(transcript)
+            with mock.patch.dict(h.os.environ, {"CLAUDE_CONFIG_DIR": tmp}), \
+                    mock.patch.object(h, "issue_run", return_value=found), \
+                    mock.patch.object(h, "log_event", events.append):
+                h.log_session_usage("harness-cleanup", "sid1", {}, issue)
+        return events
+
+    def test_logs_usage_against_the_issue_and_its_run(self):
+        events = self.log(assistant_line("m1", 5, 2), issue=7, found=(Path("x"), {"id": "run-7"}))
+        self.assertEqual((events[0]["stage"], events[0]["issue"], events[0]["run_id"]), ("harness-cleanup", 7, "run-7"))
+        self.assertEqual(events[0]["gen_ai.usage.input_tokens"], 5)
+
+    def test_session_without_an_issue(self):
+        events = self.log(assistant_line("m1", 5))
+        self.assertNotIn("issue", events[0])
+        self.assertIsNone(events[0]["run_id"])
+
+    def test_missing_transcript_is_logged_as_an_error(self):
+        events = self.log(None)
+        self.assertEqual(events[0]["error"], "transcript not found")
+
+    def test_metered_command_names_the_session(self):
+        command, sid = h.metered_command("-p", "go")
+        self.assertEqual(command[-2:], ["--session-id", sid])
+        self.assertEqual(str(h.uuid.UUID(sid)), sid)
+
+
+class IssueRollupTests(unittest.TestCase):
+    def test_sums_every_run_and_supervisor_session_of_an_issue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for rid, n in (("r1", 1), ("r2", 1), ("r3", 2)):
+                h.write_json(Path(tmp) / rid / "run.json", {"issue": {"number": n}})
+            ev = lambda **k: {"kind": "agent", "gen_ai.usage.input_tokens": 1000, **k}
+            events = [ev(run_id="r1", stage="planner", cost_usd_est=1.0), ev(run_id="r2", stage="engineer", cost_usd_est=0.5),
+                      ev(run_id=None, issue=1, stage="harness-cleanup", cost_usd_est=0.25),
+                      ev(run_id="r3", stage="planner", cost_usd_est=2.0), ev(run_id="r3", stage="x", error="no"),
+                      ev(run_id="nope", stage="scout", cost_usd_est=9.0),
+                      {"kind": "run_end", "run_id": "r1", "status": "aborted"}, {"kind": "run_end", "run_id": "r2", "status": "done"}]
+            with mock.patch.object(h, "RUNS_DIR", Path(tmp)):
+                out = h.issue_rollup(events)
+        self.assertEqual(sorted(out), [1, 2])
+        self.assertEqual(round(out[1]["cost"], 2), 1.75)
+        self.assertEqual(out[1]["runs"], {"r1": "aborted", "r2": "done"})
+        self.assertEqual(out[1]["context"], 3000)
+        self.assertEqual(out[2]["cost"], 2.0)
+
+
+class ReviewRoundsTests(unittest.TestCase):
+    def count(self, files, recorded=0):
+        with tempfile.TemporaryDirectory() as tmp:
+            for f in files:
+                (Path(tmp) / f).write_text("{}")
+            return h.count_review_rounds(Path(tmp), {"review_rounds": recorded})
+
+    def test_counts_review_files_the_claude_reviewer_wrote(self):
+        self.assertEqual(self.count(["review-1.json", "review-2.json", "verified-2.json", "plan.md"]), 2)
+
+    def test_keeps_a_higher_recorded_count(self):
+        self.assertEqual(self.count(["review-1.json"], recorded=3), 3)
+
+    def test_no_reviews(self):
+        self.assertEqual(self.count(["plan.md"]), 0)
 
 
 class ValidateTests(unittest.TestCase):
