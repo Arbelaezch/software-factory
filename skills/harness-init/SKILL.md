@@ -34,8 +34,9 @@ allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/harness.py *)
    briefly (README, package.json/pyproject, top-level folders, existing CLAUDE.md files; read
    excerpts, not everything) and:
    - fill in the TODO sections of `CLAUDE.md`: what the project is, how to run/test each part, the
-     conventions and rules that matter. Keep it under ~60 lines. If a CLAUDE.md already existed, only
-     add what's missing, plus a short "Harness" section if absent.
+     conventions and rules that matter. Every agent pays for this file on every request, so keep it
+     under ~60 lines: only what the code doesn't show, links to docs instead of copied text, and no
+     style a linter already enforces. If a CLAUDE.md already existed, only add what's missing.
    - **Required:** edit `.claude/harness.toml` with your Edit tool: replace the generated
      `description = "..."` under `[project]` with one or two sentences on what the project is and its
      stack, and replace `review_focus = []` with 2–6 short, specific checks a reviewer should make in

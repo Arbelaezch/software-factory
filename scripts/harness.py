@@ -3879,9 +3879,6 @@ def merge_project_settings(root: Path, git_mode: str = "uncommitted") -> Path:
 
 CLAUDE_MD_TEMPLATE = """# {name}
 
-<!-- Written by /harness-init. Agents read this file before planning, coding or reviewing:
-     keep it short, factual and current. -->
-
 ## What this is
 {description}
 
@@ -3892,11 +3889,8 @@ CLAUDE_MD_TEMPLATE = """# {name}
 <!-- How to run, test and lint each part. -->
 
 ## Conventions and rules
-<!-- Architecture notes, patterns to follow, things that must never happen. -->
-
-## Harness
-- `/ship <issue or task>`, `/review-pr <PR>`, `/harness-report`. Config: `.claude/harness.toml`.
-- Run files live in `.harness/` (kept out of git).
+<!-- Only what the code doesn't show: rules that must hold, non-obvious patterns. Link to docs instead of
+     copying them; leave out style a linter already enforces. -->
 """
 
 

@@ -755,6 +755,29 @@ class ToolCallTests(unittest.TestCase):
                 self.assertIsNone(h.locate_transcript("nope"))
 
 
+class ClaudeMdTemplateTests(unittest.TestCase):
+    """Every agent pays for the generated CLAUDE.md on every request: it stays short and holds only project facts."""
+
+    def render(self):
+        return h.CLAUDE_MD_TEMPLATE.format(name="demo", description="A demo.", repo_lines="- `app` (app): node")
+
+    def test_keeps_the_sections_agents_need(self):
+        md = self.render()
+        for heading in ("## What this is", "## Repos", "## Commands", "## Conventions and rules"):
+            self.assertIn(heading, md)
+        self.assertIn("A demo.", md)
+
+    def test_stays_short_and_has_no_harness_boilerplate(self):
+        md = self.render()
+        self.assertLess(len(md), 800)  # about 200 tokens before the project fills it in
+        self.assertNotIn("/ship", md)
+        self.assertNotIn(".harness/", md)
+
+    def test_init_skill_does_not_ask_for_a_harness_section(self):
+        skill = (h.PLUGIN_DIR / "skills" / "harness-init" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertNotIn('"Harness" section', skill)
+
+
 class SessionStartTests(unittest.TestCase):
     def entries(self):
         usage = lambda ctx: {"input_tokens": ctx, "output_tokens": 1}
