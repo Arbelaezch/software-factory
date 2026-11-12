@@ -191,7 +191,7 @@ terminal is logged in to. Run `python3 scripts/usage.py` (exit code 0 go, 10 pau
 - Any section from [`scripts/defaults.toml`](scripts/defaults.toml) can be overridden, such as
   `[reviewer]`, `[models]`, `[loop]` or `[providers.*]`.
 
-Run state and metrics live in `.harness/` in the project, which is excluded from git automatically.
+Run state and metrics live in `.harness/` in the project, which is excluded from git automatically. `harness report --tools` shows where context goes; see `docs/context-cost.md`.
 </details>
 
 ## Repository layout
