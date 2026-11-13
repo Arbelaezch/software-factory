@@ -105,7 +105,7 @@ which keeps its context small over long runs.
 | Command | |
 |---|---|
 | `/ship <issue or task>` | Full pipeline: optional grill, scouts, plan, approval, implementation, review loop, PR description drafts |
-| `/ship --quick <task>` | No grill, one review round (scouts still run) |
+| `/ship --tier tiny\|standard\|large <task>` | Force a size tier; tiny skips grill and scouts, plans on Sonnet, one review round. `--quick` is an alias for tiny |
 | `/review-pr <PR URL or repo#n>` | Reviews a PR plus the PRs it links to, then posts a **pending** GitHub review once I agree |
 | `/harness-report` | Cost, quality and speed per stage and model |
 | `/harness-init` | Set up or reconfigure the current project |
