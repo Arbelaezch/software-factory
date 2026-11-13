@@ -67,7 +67,22 @@ max_review_rounds = 3          # after this many rounds with open issues -> esca
 max_gate_retries = 2           # engineer retries when gates fail before escalating
 max_gate_blocks = 3            # times the stop hook sends an engineer back for a missing/stale gates run, then it lets it finish and flags the run
 fix_severities = ["blocking", "should_fix"]   # confirmed findings sent back to the engineer
-quick_max_review_rounds = 1    # used by `/ship --quick`
+quick_max_review_rounds = 1    # review-round cap for the tiny tier (`/ship --quick`)
+
+# ---------------------------------------------------------------------------
+# Size tiers (skills/ship/SKILL.md). The /ship manager picks one from the task, or you force it with a flag:
+#   tiny     one repo, about 2 files or fewer, well specified: no scouts, planner on Sonnet, one task, one review round
+#   standard the full flow (default)
+#   large    the full flow; phase splitting already applies above 6 tasks
+# The plan approval checkpoint and the git guard are identical in every tier.
+# ---------------------------------------------------------------------------
+[tiers]
+tiny_planner_model = "sonnet"     # a [models] planner override for the project wins
+# Round-1 model of the claude-reviewer subagent (outside-model reviews are unaffected). Rounds 2+ are always Sonnet.
+tiny_reviewer_model = "sonnet"    # tiny tier and no risk marker below in the changed paths or added lines
+standard_reviewer_model = "opus"  # every other case, and any tiny run with a risk marker or a task flagged opus
+risk_markers = ["auth", "permission", "password", "token", "secret", "migration", "migrate",
+                "transaction", "concurren", "thread", "mutex", "race", "lock"]
 
 # ---------------------------------------------------------------------------
 # Cross-lab reviewer (Reviewer 1). Swap providers by changing `provider`, or per

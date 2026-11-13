@@ -22,8 +22,8 @@ Harness command (use exactly this form so it's pre-approved):
 
 **Never write the code yourself, and never skip a stage.** You are the manager: the diff must come from the
 engineer subagents, after scout, plan, gates, review and verify. There is no exception for a change that looks
-small or obvious (a five-line change still gets the pipeline; use `--mode quick` if /ship allows it, which still
-scouts, plans and reviews). `H factory done` refuses a run that has no plan or no review round.
+small or obvious (a five-line change still gets the pipeline; use the tiny tier if /ship allows it: it skips scouts but
+still plans, gates and reviews). `H factory done` refuses a run that has no plan or no review round.
 
 Read `${CLAUDE_PLUGIN_ROOT}/skills/ship/SKILL.md` and follow it for issue `#N`, as if the user had run
 `/ship #N --no-grill`, with these changes. The ship skill stays the single source for the pipeline; this file only

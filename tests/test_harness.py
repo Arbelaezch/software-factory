@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -1323,3 +1324,112 @@ class GateEnforcementTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TierTests(unittest.TestCase):
+    """Size tiers (#57): run start, run tier, reviewer model choice, and the per-tier report."""
+
+    def test_quick_is_an_alias_for_tiny(self):
+        self.assertEqual(h.resolve_tier(None, "quick"), ("tiny", "quick"))
+        self.assertEqual(h.resolve_tier(None, "full"), ("standard", "full"))
+        self.assertEqual(h.resolve_tier("large", "full"), ("large", "full"))
+        self.assertEqual(h.resolve_tier("tiny", "full"), ("tiny", "quick"))
+
+    def start(self, cfg, **kw):
+        args = mock.Mock(task="fix typo", issue=None, repo=None, mode="full", tier=None, force=False)
+        for k, v in kw.items():
+            setattr(args, k, v)
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(h, "new_run", return_value=(Path(tmp), {"id": "r1"})) as nr, \
+                contextlib.redirect_stdout(out):
+            h.cmd_run_start(args, cfg)
+        return json.loads(out.getvalue()), nr
+
+    def test_run_start_records_the_tier_and_sets_the_tiny_planner_model(self):
+        out, nr = self.start({}, tier="tiny")
+        self.assertEqual(out["tier"], "tiny")
+        self.assertEqual(out["model_overrides"], {"planner": "sonnet"})
+        self.assertEqual(nr.call_args.args[2], "quick")
+        self.assertEqual(nr.call_args.args[4]["tier"], "tiny")
+
+    def test_project_planner_override_wins_and_standard_has_none(self):
+        out, _ = self.start({"models": {"planner": "opus"}}, mode="quick")
+        self.assertEqual(out["model_overrides"], {"planner": "opus"})
+        out, nr = self.start({})
+        self.assertEqual((out["tier"], "model_overrides" in out), ("standard", False))
+        self.assertEqual(nr.call_args.args[2], "full")
+
+    def test_run_tier_back_to_standard_restores_the_review_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            h.write_json(d / "run.json", {"id": "r1", "mode": "quick", "tier": "tiny"})
+            with mock.patch.object(h, "load_run", side_effect=lambda r=None: (d, h.read_json(d / "run.json"))), \
+                    mock.patch.object(h, "log_event"), contextlib.redirect_stdout(io.StringIO()):
+                h.cmd_run_tier(mock.Mock(tier="standard", reason="two repos", run=None), {})
+            run = h.read_json(d / "run.json")
+        self.assertEqual((run["tier"], run["mode"]), ("standard", "full"))
+        self.assertEqual(run["tier_changes"][0]["reason"], "two repos")
+
+    def test_reviewer_model_rules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            tiny, std = {"tier": "tiny", "id": "r1"}, {"tier": "standard", "id": "r1"}
+            self.assertEqual(h.choose_reviewer_model(d, std, {}, 2)[0], "sonnet")
+            self.assertEqual(h.choose_reviewer_model(d, std, {}, 1)[0], "opus")
+            self.assertEqual(h.choose_reviewer_model(d, tiny, {}, 2)[0], "sonnet")
+            # tiny with no repos configured: nothing risky in the diff
+            self.assertEqual(h.choose_reviewer_model(d, tiny, {}, 1)[0], "sonnet")
+            h.write_json(d / "tasks.json", {"tasks": [{"id": "T1", "model": "opus"}]})
+            self.assertEqual(h.choose_reviewer_model(d, tiny, {}, 1)[0], "opus")
+
+    def test_risk_marker_in_the_diff_keeps_opus(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            git = lambda *a: subprocess.run(["git", "-C", str(root), *a], check=True, capture_output=True, text=True).stdout.strip()
+            git("init", "-q", "-b", "main")
+            (root / "a.py").write_text("x = 1\n")
+            git("add", ".")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init")
+            base = git("rev-parse", "HEAD")
+            cfg = {"repos": {"app": {"path": "."}}}
+            run = {"tier": "tiny", "id": "r1", "repos": {"app": {"base_commit": base}}}
+            with mock.patch.object(h, "ROOT", root), mock.patch.object(h, "run_untracked", return_value=[]):
+                (root / "a.py").write_text("x = 2\n")
+                self.assertEqual(h.choose_reviewer_model(root / "run", run, cfg, 1)[0], "sonnet")
+                (root / "a.py").write_text("x = 2\ndef check_password(p): pass\n")
+                model, why = h.choose_reviewer_model(root / "run", run, cfg, 1)
+            self.assertEqual(model, "opus")
+            self.assertIn("password", why)
+
+    def test_fallback_records_the_reviewer_model_and_verdict_labels_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            run = {"id": "r1", "tier": "standard"}
+            line = h.fallback_model_line(d, run, {}, 1)
+            self.assertIn("model: opus", line)
+            self.assertEqual(h.read_json(d / "run.json")["reviewer_models"], {"1": "opus"})
+        self.assertEqual(h.reviewer_label({"provider": "claude", "model": "claude-reviewer"}, run, 1), "claude-reviewer:opus")
+        self.assertEqual(h.reviewer_label({"provider": "deepseek", "model": "m"}, run, 1), "m")
+
+    def test_tiny_run_is_capped_at_one_review_round(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d)
+        h.write_json(d / "review-1.json", FallbackReviewerTests.FALLBACK_REVIEW)
+        h.write_json(d / "verified-1.json", {"findings": [{"id": "R1-1", "verdict": "confirmed"}, {"id": "R1-2", "verdict": "rejected"}]})
+        out = io.StringIO()
+        with mock.patch.object(h, "load_run", return_value=(d, {"id": "r1", "mode": "full", "tier": "tiny"})), \
+                mock.patch.object(h, "tamper_scan", return_value=[]), mock.patch.object(h, "log_event"), \
+                contextlib.redirect_stdout(out):
+            h.cmd_verdict(mock.Mock(round=1), {})
+        self.assertIn("DECISION: ESCALATE", out.getvalue())
+
+    def test_report_groups_runs_by_tier(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            h.print_tier_rollup([{"tier": "tiny", "status": "done", "review_rounds": 1, "claude_cost_usd_est": 0.2, "duration_s": 600},
+                                 {"mode": "quick", "status": "done", "review_rounds": 1, "claude_cost_usd_est": 0.4, "duration_s": 600},
+                                 {"status": "escalated", "review_rounds": 3, "claude_cost_usd_est": 3.0, "duration_s": 1800}])
+        text = out.getvalue()
+        self.assertRegex(text, r"tiny\s+2\s+100%\s+1\.0\s+\$0\.30")
+        self.assertRegex(text, r"standard\s+1\s+0%\s+3\.0\s+\$3\.00")

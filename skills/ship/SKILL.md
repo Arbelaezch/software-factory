@@ -1,7 +1,7 @@
 ---
 name: ship
 description: Run the harness delivery pipeline for a GitHub issue or task (optional grill, scout, plan, approve, implement, cross-lab review loop, PR description drafts).
-argument-hint: "[--quick] [--grill|--no-grill] <issue URL | repo#number | task description>"
+argument-hint: "[--tier tiny|standard|large | --quick] [--grill|--no-grill] <issue URL | repo#number | task description>"
 disable-model-invocation: true
 allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/harness.py *) Bash(git status *) Bash(git diff *) Bash(git log *)
 ---
@@ -14,30 +14,42 @@ logs into this conversation, and don't read source files. Read only the short ou
 commands and subagent replies.
 
 Arguments: `$ARGUMENTS`
-- `--quick`: no grill, one review round (scouts still run). For small, well-understood changes.
+- `--tier tiny|standard|large`: force the size tier (see below). Without it, you pick one from the task.
+- `--quick`: alias for `--tier tiny`.
 - `--grill` / `--no-grill`: force the grill on or off. Otherwise ask.
 - Everything else is the task: a GitHub issue (URL, or `<repo>#<n>` where repo is the harness name, the
   folder name or the GitHub name) optionally followed by extra instructions, or a plain task
   description. If it's empty, ask the user for the task and stop. In a single-repo project a bare
   `#<n>` works (pass `--repo <name>`); with several repos, ask which one.
 
+## Size tiers
+Choose the tier from the task before `run start`, and say which one in a single line:
+- **tiny**: one repo, about 2 files or fewer, well specified (a typo, a config value, a small bug with a clear
+  repro). No grill, no scouts (the planner reads the files itself), planner on Sonnet, a single task, one
+  review round. If the task is vague, spans repos or touches auth, data, migrations or concurrency, it isn't tiny.
+- **standard**: the full flow below. The default when unsure.
+- **large**: the full flow; the phase splitting in step 3 applies above 6 tasks.
+Every tier keeps the plan approval checkpoint (step 4) and the same guard rules. If a tiny run's planner says
+the task is bigger than tiny (more than one task, more than 2 files, another repo), run
+`H run tier standard --reason "<why>"`, scout the repos now, and resume the planner with the scout context.
+
 Harness command (use exactly this form so it's pre-approved):
 `H = python3 ${CLAUDE_PLUGIN_ROOT}/scripts/harness.py --root ${CLAUDE_PROJECT_DIR}`
 
 Give every subagent, in its delegation message: the run directory, the harness command (the `harness`
 value printed by `run start`), the `git_mode` printed by `run start`, and the specific job. If
-`run start` prints `model_overrides`, pass that model when spawning the matching agent.
+`run start` prints `model_overrides` (a tiny run adds `planner: sonnet`), pass that model when spawning the matching agent.
 
 ## 0. Start the run
-- Issue: `H run start --issue <ref> [--task "<extra instructions>"] [--mode quick]`. It reads the issue
+- Issue: `H run start --issue <ref> [--task "<extra instructions>"] [--tier <tier>]`. It reads the issue
   (title, body, labels, comments) into `task.md` via `gh`.
-- Plain task: `H run start --task "<task>" [--mode quick]`.
+- Plain task: `H run start --task "<task>" [--tier <tier>]`.
 Note `run_dir`, `git_mode` and, for issues, `suggested_branch_type` from the output. If another run is
 active, ask the user whether to end it (`H run end --status aborted`) or stop. If `gh` fails, tell the
 user to run `gh auth login`.
 
 ## 1. Grill (optional, interactive)
-Skip when `--quick` or `--no-grill`. Otherwise, unless `--grill` was given, ask with AskUserQuestion:
+Skip when the tier is tiny or `--no-grill`. Otherwise, unless `--grill` was given, ask with AskUserQuestion:
 "Grill this task before planning?" options: "Yes, grill me (Recommended for vague or risky tasks)",
 "No, go straight to planning".
 
@@ -54,7 +66,8 @@ without a grill, if the user gave details beyond the one-line task, record them 
 Using the workspace CLAUDE.md and the repos in `.claude/harness.toml`, decide which repos the task likely
 touches (in a single-repo project, just that one). Spawn one
 `harness:scout` subagent per relevant repo **in parallel**, each told to write `<run_dir>/context-<repo>.md`.
-When unsure whether a repo is involved, include it; scouts are cheap. Quick mode still scouts.
+When unsure whether a repo is involved, include it; scouts are cheap. **Tiny tier: skip this step** (the
+planner reads the files itself).
 
 ## 3. Plan
 Spawn the `harness:planner` subagent with the run directory. It writes `plan.md` and `tasks.json`.
@@ -107,8 +120,9 @@ path to an engineer to fix, then rerun. After two such fix attempts, ask the use
 ## 7. Review loop
 For round n = 1, 2, ...:
 1. `H review --round n`. If it prints `FALLBACK` (also when the outside model's output was unparseable),
-   spawn the `harness:claude-reviewer` subagent for round n; pass `model: sonnet` for rounds 2 and later,
-   where it mainly re-checks known findings.
+   spawn the `harness:claude-reviewer` subagent for round n with the `model` that the FALLBACK output names
+   ("Spawn it with model: ..."). The harness picks it: Sonnet for rounds 2+ and for a tiny run whose diff shows
+   no risk marker, Opus otherwise, and records it in `run.json` for `harness report`.
 2. Spawn the `harness:verifier` subagent for round n. It writes `verified-<n>.json`.
 3. `H verdict --round n`. If it prints `INVALID` about `review-<n>.json`, do what it says (an outside
    model's file: spawn the `harness:claude-reviewer` for round n; the fallback reviewer's own file: resume it once) and rerun. If it prints `INVALID` about `verified-<n>.json`, resume the verifier once (SendMessage) with that message,

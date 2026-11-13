@@ -15,7 +15,10 @@ Read the workspace `CLAUDE.md` (and any in the repo or app folder you touch) and
 The delegation message gives you the run directory. Read, in this order:
 - `<run_dir>/task.md`, and `<run_dir>/brief.md` if it exists (clarified requirements from the user;
   these override your own assumptions)
-- every `<run_dir>/context-*.md` (scout reports)
+- every `<run_dir>/context-*.md` (scout reports). A tiny-tier run (`tier` is "tiny" in run.json) has none: find
+  the files yourself with Grep/Glob, read the few you need, take test commands from the repo's config, and
+  write a single task. If the job turns out bigger (several tasks, more than 2 files, another repo), say
+  so at the top of your reply instead of stretching the plan, so the manager can re-tier the run and scout.
 - the workspace CLAUDE.md, then any source files you need to confirm details. Read targeted excerpts.
 
 Shell: headless sessions auto-approve only plain commands. Variable assignments and `$VAR` expansion, `cd` chains,

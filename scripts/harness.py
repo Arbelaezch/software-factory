@@ -526,13 +526,23 @@ def new_run(cfg: dict, task: str, mode: str, force: bool = False, extra: dict | 
     save_run(d, run)
     CURRENT_FILE.parent.mkdir(parents=True, exist_ok=True)
     CURRENT_FILE.write_text(rid)
-    log_event({"kind": "run_start", "run_id": rid, "mode": mode})
+    log_event({"kind": "run_start", "run_id": rid, "mode": mode, "tier": run.get("tier")})
     return d, run
+
+
+TIERS = ("tiny", "standard", "large")
+
+
+def resolve_tier(tier: str | None, mode: str) -> tuple[str, str]:
+    """(tier, mode) for a run. `--mode quick` is the old name for the tiny tier; tiny always runs in quick mode."""
+    tier = tier or ("tiny" if mode == "quick" else "standard")
+    return tier, ("quick" if tier == "tiny" else "full")
 
 
 def cmd_run_start(a, cfg):
     if not a.task and not a.issue:
         sys.exit("Give --task and/or --issue.")
+    tier, a.mode = resolve_tier(a.tier, a.mode)
     issue, task_md = None, None
     if a.issue:
         rname, num = parse_gh_ref(a.issue, cfg, a.repo)
@@ -557,16 +567,65 @@ def cmd_run_start(a, cfg):
         if a.task:
             task_md += f"\n## Extra instructions from the user\n\n{a.task}\n"
     task = f"{issue['slug']}#{issue['number']}: {issue['title']}" if issue else a.task
-    d, run = new_run(cfg, task, a.mode, a.force, {"issue": issue} if issue else None)
+    d, run = new_run(cfg, task, a.mode, a.force, {"tier": tier, **({"issue": issue} if issue else {})})
     (d / "task.md").write_text(task_md or f"# Task\n\n{a.task}\n", encoding="utf-8")
     out = {"run_id": run["id"], "run_dir": str(d), "harness": f"python3 {HARNESS_SCRIPT} --root {ROOT}",
-           "git_mode": (cfg.get("git") or {}).get("mode", "uncommitted")}
-    if cfg.get("models"):
-        out["model_overrides"] = cfg["models"]
+           "git_mode": (cfg.get("git") or {}).get("mode", "uncommitted"), "tier": tier}
+    models = dict(cfg.get("models") or {})
+    if tier == "tiny":
+        models.setdefault("planner", (cfg.get("tiers") or {}).get("tiny_planner_model", "sonnet"))
+    if models:
+        out["model_overrides"] = models
     if issue:
         out.update({"issue": f"{issue['slug']}#{issue['number']}", "issue_title": issue["title"],
                     "issue_repo": issue["repo"], "suggested_branch_type": issue["branch_type"]})
     print(json.dumps(out, indent=2))
+
+
+def cmd_run_tier(a, cfg):
+    """Change the run's tier, e.g. back to standard when the planner says the task is bigger than tiny."""
+    d, run = load_run(a.run)
+    old = run.get("tier") or ("tiny" if run.get("mode") == "quick" else "standard")
+    tier, mode = resolve_tier(a.tier, "full")
+    run.update(tier=tier, mode=mode)
+    if tier != old:
+        run.setdefault("tier_changes", []).append({"ts": iso(), "from": old, "to": tier, "reason": a.reason or ""})
+    save_run(d, run)
+    log_event({"kind": "run_tier", "run_id": run["id"], "tier": tier, "from": old})
+    print(f"Run {run['id']}: tier {old} -> {tier} (mode {mode})"
+          + ("; the planner and scouts stay as they were, only the review-round cap and reporting change." if tier != old else ""))
+
+
+# Words in a changed path or an added line that make a diff too risky for the cheaper reviewer model.
+DEFAULT_RISK_MARKERS = ["auth", "permission", "password", "token", "secret", "migration", "migrate",
+                        "transaction", "concurren", "thread", "mutex", "race", "lock"]
+
+
+def choose_reviewer_model(d: Path, run: dict, cfg: dict, rnd: int) -> tuple[str, str]:
+    """(model, reason) for the claude-reviewer subagent. Rounds 2+ re-check known findings, so Sonnet.
+    Round 1 uses Sonnet only for a tiny-tier run whose diff shows no risk marker and has no hard task."""
+    if rnd >= 2:
+        return "sonnet", "rounds 2 and later re-check known findings"
+    tcfg = cfg.get("tiers") or {}
+    if (run.get("tier") or ("tiny" if run.get("mode") == "quick" else "standard")) != "tiny":
+        return tcfg.get("standard_reviewer_model", "opus"), "tier is not tiny"
+    tasks = (read_json(d / "tasks.json", {}) or {}).get("tasks") or []
+    if any(t.get("model") == "opus" for t in tasks if isinstance(t, dict)):
+        return "opus", "a task is flagged hard (model: opus)"
+    markers = [m.lower() for m in tcfg.get("risk_markers", DEFAULT_RISK_MARKERS)]
+    for rname, rcfg in repos(cfg).items():
+        try:
+            files = changed_files(rname, rcfg, run)
+            base = (run.get("repos", {}).get(rname) or {}).get("base_commit") or "HEAD"
+            added = "\n".join(ln for ln in git(rcfg["abs"], "diff", "-U0", base).splitlines()
+                              if ln.startswith("+") and not ln.startswith("+++"))
+        except Exception:
+            return "opus", "could not read the diff to check for risk markers"
+        text = ("\n".join(files) + "\n" + added).lower()
+        hit = next((m for m in markers if m in text), None)
+        if hit:
+            return "opus", f"the diff touches '{hit}'"
+    return tcfg.get("tiny_reviewer_model", "sonnet"), "tiny tier and no risk markers in the diff"
 
 
 def manager_entries(run: dict) -> list[dict] | None:
@@ -667,7 +726,7 @@ def cmd_run_end(a, cfg):
     save_run(d, run)
     totals = run_totals(run["id"])
     log_event({"kind": "run_end", "run_id": run["id"], "status": a.status, "mode": run.get("mode"),
-               "duration_s": round((now() - parse_ts(run["started_at"])).total_seconds()),
+               "tier": run.get("tier"), "duration_s": round((now() - parse_ts(run["started_at"])).total_seconds()),
                "review_rounds": run["review_rounds"], **totals})
     if current_run_id() == run["id"]:
         CURRENT_FILE.unlink(missing_ok=True)
@@ -2614,6 +2673,15 @@ def parse_json_content(text: str) -> dict:
         raise
 
 
+def fallback_model_line(d: Path, run: dict, cfg: dict, rnd: int) -> str:
+    """Pick the claude-reviewer model for this round and record it in run.json for `harness report`."""
+    model, why = choose_reviewer_model(d, run, cfg, rnd)
+    if run.get("id"):
+        run.setdefault("reviewer_models", {})[str(rnd)] = model
+        save_run(d, run)
+    return f"Spawn it with model: {model} ({why})."
+
+
 def cmd_review(a, cfg):
     d, run = load_run()
     rcfg = cfg.get("reviewer") or {}
@@ -2622,10 +2690,12 @@ def cmd_review(a, cfg):
     if provider == "claude" or not p:
         print(f"FALLBACK: provider '{provider}' is not an outside model. Spawn the claude-reviewer subagent "
               f"for round {a.round} instead; it writes {d}/review-{a.round}.json.")
+        print(fallback_model_line(d, run, cfg, a.round))
         sys.exit(4)
     if not os.environ.get(p.get("api_key_env", "")):
         print(f"FALLBACK: ${p.get('api_key_env')} is not set, so {provider} can't be called. Spawn the "
               f"claude-reviewer subagent for round {a.round} instead.")
+        print(fallback_model_line(d, run, cfg, a.round))
         sys.exit(4)
     prompt, truncated = build_review_prompt(run, d, cfg, a.round)
     (d / f"review-{a.round}.prompt.md").write_text(prompt, encoding="utf-8")
@@ -2854,6 +2924,13 @@ def cmd_validate(a, cfg):
     print(f"OK: {fname}")
 
 
+def reviewer_label(review: dict, run: dict, rnd: int) -> str | None:
+    """Model name for the reviewer-quality rows; the Claude reviewer carries the model it was spawned with."""
+    model = review.get("model")
+    spawned = (run.get("reviewer_models") or {}).get(str(rnd))
+    return f"{model}:{spawned}" if review.get("provider") == "claude" and spawned else model
+
+
 def cmd_verdict(a, cfg):
     d, run = load_run()
     lcfg = cfg.get("loop") or {}
@@ -2929,13 +3006,13 @@ def cmd_verdict(a, cfg):
     to_fix = [f for f in final if f["verdict"] == "confirmed" and f["severity"] in fix_sev]
     # An uncertain blocking finding can't be sent to the engineer (unproven), so a human has to judge it.
     uncertain_blocking = [f for f in final if f["verdict"] == "uncertain" and f["severity"] == "blocking"]
-    max_rounds = lcfg.get("quick_max_review_rounds", 1) if run.get("mode") == "quick" else lcfg.get("max_review_rounds", 3)
+    max_rounds = lcfg.get("quick_max_review_rounds", 1) if run.get("mode") == "quick" or run.get("tier") == "tiny" else lcfg.get("max_review_rounds", 3)
     write_json(d / f"final-{a.round}.json", {"round": a.round, "findings": final})
     judged_n = stats["confirmed"] + stats["rejected"] + stats["uncertain"]
     precision = round(stats["confirmed"] / judged_n, 3) if judged_n else None
     log_event({"kind": "review_quality", "run_id": run["id"], "stage": "reviewer", "round": a.round,
-               "provider": review.get("provider"), "gen_ai.request.model": review.get("model"),
-               "precision": precision, "to_fix": len(to_fix), **stats,
+               "provider": review.get("provider"), "gen_ai.request.model": reviewer_label(review, run, a.round),
+               "tier": run.get("tier"), "precision": precision, "to_fix": len(to_fix), **stats,
                "confirmed_by_severity": {s: sum(1 for f in final if f["verdict"] == "confirmed" and f["severity"] == s) for s in SEVERITIES}})
     if run.get("mode") == "review":
         decision = "DRAFT"
@@ -3593,6 +3670,26 @@ def print_tool_report(events: list[dict], top: int) -> None:
               "(each engineer reads its own task); the rest are what the plan could carry.")
 
 
+def print_tier_rollup(run_ends: list[dict]) -> None:
+    """Cost, rounds and time per size tier (run_end events), to compare quality and cost across tiers."""
+    by_tier: dict[str, list] = {}
+    for e in run_ends:
+        by_tier.setdefault(e.get("tier") or ("tiny" if e.get("mode") == "quick" else "standard"), []).append(e)
+    rows = []
+    for tier in TIERS:
+        es = by_tier.get(tier)
+        if not es:
+            continue
+        n = len(es)
+        rows.append([tier, n, f"{100 * sum(1 for x in es if x.get('status') == 'done') / n:.0f}%",
+                     f"{sum(x.get('review_rounds') or 0 for x in es) / n:.1f}",
+                     f"${sum(x.get('claude_cost_usd_est') or 0 for x in es) / n:.2f}",
+                     f"{sum((x.get('duration_s') or 0) for x in es) / n / 60:.0f}m"])
+    if rows:
+        print("\n== Runs by tier ==")
+        print(fmt_table(rows, ["tier", "runs", "done", "avg rounds", "avg claude $*", "avg time"]))
+
+
 def cmd_report(a, cfg):
     events = read_events()
     cutoff = now() - dt.timedelta(days=a.days)
@@ -3702,11 +3799,13 @@ def cmd_report(a, cfg):
         r_rows = []
         for rid, e in sorted(runs.items())[-a.limit:]:
             run = read_json(RUNS_DIR / rid / "run.json", {})
-            r_rows.append([rid[:15], (run.get("task") or "")[:40], run.get("mode", ""), e.get("status"), e.get("review_rounds"),
+            r_rows.append([rid[:15], (run.get("task") or "")[:40], run.get("tier") or run.get("mode", ""), e.get("status"), e.get("review_rounds"),
                            f"${e.get('claude_cost_usd_est', 0):.2f}", f"${e.get('external_cost_usd', 0):.3f}",
                            f"{(e.get('duration_s') or 0) / 60:.0f}m"])
-        print(fmt_table(r_rows, ["run", "task", "mode", "status", "rounds", "claude $*", "outside $", "time"]))
+        print(fmt_table(r_rows, ["run", "task", "tier", "status", "rounds", "claude $*", "outside $", "time"]))
         print("*Claude cost is an API-equivalent estimate; on a Team seat it isn't billed per token.")
+    if runs:
+        print_tier_rollup(list(runs.values()))
     ext = sum(e.get("cost_usd_est") or 0 for e in usage if e.get("billing") == "api")
     print(f"\nActual outside-model spend in window: ${ext:.3f}")
 
@@ -5285,9 +5384,15 @@ def main(argv=None):
     s.add_argument("--task", help="task description (or extra instructions when --issue is given)")
     s.add_argument("--issue", help="GitHub issue: URL, <repo>#<n>, or #<n> with --repo")
     s.add_argument("--repo", help="default repo for a bare #<n> issue reference")
-    s.add_argument("--mode", choices=["full", "quick"], default="full")
+    s.add_argument("--mode", choices=["full", "quick"], default="full", help="quick is an alias for --tier tiny")
+    s.add_argument("--tier", choices=TIERS, help="size tier (default standard; see skills/ship/SKILL.md)")
     s.add_argument("--force", action="store_true")
     s.set_defaults(fn=cmd_run_start)
+    s = rsub.add_parser("tier", help="change the active run's size tier (e.g. back to standard)")
+    s.add_argument("tier", choices=TIERS)
+    s.add_argument("--reason")
+    s.add_argument("--run")
+    s.set_defaults(fn=cmd_run_tier)
     s = rsub.add_parser("end")
     s.add_argument("--status", choices=["done", "escalated", "aborted"], required=True)
     s.add_argument("--note")
