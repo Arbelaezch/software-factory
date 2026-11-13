@@ -675,6 +675,11 @@ class SubagentStopTests(unittest.TestCase):
                {"kind": "agent", "stage": "scout"}, {"kind": "gate"}]
         self.assertEqual(len(h.unattributed_agent_events(evs)), 2)
 
+    def test_legacy_lost_events_are_split_out(self):
+        old = {"kind": "agent", "stage": "unknown", "error": "transcript not found"}
+        new = {**old, "payload": {"agent_type": None}}
+        self.assertEqual(h.legacy_lost_agent_events([old, new]), [old])
+
 
 def assistant_line(mid, inp, out=1, cache_read=0, cache_write=0):
     return json.dumps({"type": "assistant", "message": {"id": mid, "model": "claude-sonnet-5-5", "content": [], "usage": {

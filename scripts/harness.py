@@ -3482,6 +3482,13 @@ def unattributed_agent_events(events: list[dict]) -> list[dict]:
     return [e for e in events if e.get("kind") == "agent" and (e.get("error") or e.get("stage") == "unknown")]
 
 
+def legacy_lost_agent_events(lost: list[dict]) -> list[dict]:
+    """Lost events written before the SubagentStop hook recorded its payload (#68). Their transcripts are gone, so
+    they cannot be recovered, unlike a recent loss which still points at a path to check."""
+    return [e for e in lost if e.get("error") == "transcript not found" and e.get("stage") == "unknown"
+            and "payload" not in e]
+
+
 def issue_rollup(events: list[dict]) -> dict[int, dict]:
     """Cost per factory issue across every run of it (retries and aborted runs included) and the supervisor
     sessions logged against it. An event belongs to an issue by its `issue` field or by its run's issue number."""
@@ -3627,9 +3634,14 @@ def cmd_report(a, cfg):
     print(fmt_table(rows, ["stage", "model", "calls", "1st req", "avg in", "avg out", "avg $", "total $", "billing", "avg time"])
           if rows else "(no usage recorded yet)")
     lost = unattributed_agent_events(events)
-    if lost:
-        print(f"{len(lost)} agent event(s) have no usage data (transcript not found or no agent type); "
+    legacy = legacy_lost_agent_events(lost)
+    recent = [e for e in lost if e not in legacy]
+    if recent:
+        print(f"{len(recent)} agent event(s) have no usage data (transcript not found or no agent type); "
               "they are excluded above.")
+    if legacy:
+        print(f"{len(legacy)} older agent event(s) predate payload logging (#68) and cannot be recovered; "
+              "they are excluded above and not counted as a problem.")
 
     issues = issue_rollup(events)
     if issues:
@@ -5229,7 +5241,9 @@ def cmd_doctor(a, cfg):
             print(f"         gate {g['name']}: {g['cmd']}" + (f"  (cwd {g['cwd']})" if g.get("cwd", ".") != "." else "")
                   + ("  [auto-detected]" if auto else ""))
     print("\nMetrics:")
-    lost = unattributed_agent_events(read_events())
+    all_lost = unattributed_agent_events(read_events())
+    legacy = legacy_lost_agent_events(all_lost)
+    lost = [e for e in all_lost if e not in legacy]
     line(not lost, "all agent events have usage data" if not lost else
          f"{len(lost)} agent event(s) in {EVENTS_FILE.name} have no usage data (transcript not found or no agent type)")
     print("\nReviewer:")
