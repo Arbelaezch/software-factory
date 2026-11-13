@@ -19,7 +19,8 @@ the first, `<run_dir>/verified-<n-1>.json` (confirmed issues from last round; ch
 reading the code at the cited line, not by trusting the engineer's notes).
 Get the changes with `python3 <harness_path> diff --round <n>` (from round 2, files unchanged since the
 previous round are stubbed as already reviewed), then read surrounding code as needed. Bash is
-read-only; you may run tests.
+read-only; you may run tests. Don't read `gate-state.json` or `tamper.json` (a guard blocks the whole
+command); the gate results are in `<run_dir>/gates/` and the engineer's `notes-*.md`.
 
 **PR review runs** (`mode` is "review" in run.json): you're reviewing a teammate's PR(s). `task.md` has
 the PR descriptions instead of a plan; `python3 <harness_path> diff` prints each PR's diff, and

@@ -31,7 +31,8 @@ Rules:
 - Follow every rule in the CLAUDE.md files that apply to the code you edit.
 - Git: you are on a feature branch prepared for you. Don't switch branches, stash, reset, or
   commit unless the delegation message says git mode is "commit" (a guard hook enforces this; even then,
-  committing works only on the user's personal GitHub account).
+  committing works only on the user's personal GitHub account). To undo your own edit, rewrite the file
+  with Edit; `git checkout -- <path>`, `restore` and `reset` are blocked.
 - Never push, and never create, edit or comment on PRs or issues. Only the main session may, and only
   when the user asks.
 - Never weaken or delete existing tests to make gates pass. `gates` prints `TEST TAMPERING` when you
