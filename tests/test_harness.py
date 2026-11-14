@@ -1333,7 +1333,7 @@ class FallbackReviewerTests(ValidateTests):
                 mock.patch.object(h, "load_run", return_value=(self.d, {"id": "r1"})), contextlib.redirect_stdout(out):
             os.environ.pop("HARNESS_TEST_NO_SUCH_KEY", None)
             with self.assertRaises(SystemExit) as cm:
-                h.cmd_review(mock.Mock(round=1, provider=None), cfg)
+                h.cmd_review(mock.Mock(round=1, provider=None, merge=False), cfg)
         self.assertEqual(cm.exception.code, 4)
         self.assertIn("FALLBACK", out.getvalue())
         self.assertFalse((self.d / "review-1.json").exists())
@@ -2240,6 +2240,7 @@ message = "Live equivalent: web/{1}/api/."
         pr = {"repo": "backend", "number": 7, "path": str(repo), "merge_base": base, "ref": "refs/harness/pr/7",
               "title": "t", "head_branch": "feat/x", "base": "dev", "author": "a", "reason": "requested"}
         run = {"mode": "review", "profile": "legacy", "prs": [pr]}
+        self.assertEqual(h.pr_changed_lines(run), 5)
         lines = h.pr_classified_paths(run).splitlines()
         self.assertEqual(lines, ["- backend#7 `shop/views.py`: legacy (legacy-views). Live equivalent: web/shop/api/.",
                                  "- backend#7 `surveys2/models.py`: dead (dead-apps). Not in INSTALLED_APPS."])
@@ -2334,6 +2335,91 @@ class PrReviewReportTests(unittest.TestCase):
         self.assertIn("### Closes #9: Drafts are hidden", text)
         self.assertIn("- drafts never listed", text)
         self.assertEqual(calls[0][:5], ("issue", "view", "9", "--repo", "o/backend"))
+
+
+class PrReviewLensTests(unittest.TestCase):
+    """/review-pr: the Claude reviewer for legacy projects, lenses for large PR sets, and merging the lens reviews."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.d = Path(tmp.name)
+        self.run = {"id": "r", "mode": "review", "profile": "legacy", "prs": []}
+        for p in (mock.patch.object(h, "load_run", lambda: (self.d, self.run)),
+                  mock.patch.object(h, "fallback_model_line", lambda *a: "Spawn it with model: opus (x).")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def review(self, cfg, changed=10, provider=None, merge=False):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(h, "pr_changed_lines", lambda run: changed):
+            try:
+                h.cmd_review(mock.Mock(round=1, provider=provider, merge=merge), cfg)
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue()
+
+    def test_reviewer_choice(self):
+        self.assertEqual(h.pr_review_reviewer(self.run, {}), "claude")
+        self.assertEqual(h.pr_review_reviewer({"mode": "review"}, {}), "provider")
+        self.assertEqual(h.pr_review_reviewer({"mode": "review"}, {"review_pr": {"reviewer": "claude"}}), "claude")
+        self.assertEqual(h.pr_review_reviewer(self.run, {"review_pr": {"reviewer": "provider"}}), "provider")
+
+    def test_legacy_pr_review_uses_the_claude_reviewer_with_lenses_for_big_diffs(self):
+        cfg = {"reviewer": {"provider": "deepseek"}, "providers": {"deepseek": {"api_key_env": "X"}}}
+        code, out = self.review(cfg, changed=50)
+        self.assertEqual(code, 4)
+        self.assertIn("Spawn the claude-reviewer subagent for round 1", out)
+        self.assertIn("model: opus", out)
+        code, out = self.review(cfg, changed=900)
+        self.assertEqual(code, 4)
+        self.assertIn("once per lens", out)
+        self.assertIn("correctness, contracts, data, access", out)
+        code, out = self.review({**cfg, "review_pr": {"lens_min_changed_lines": 0}}, changed=900)
+        self.assertNotIn("once per lens", out)
+
+    def test_standard_pr_review_fallback_also_uses_lenses(self):
+        self.run["profile"] = None
+        code, out = self.review({"reviewer": {"provider": "claude"}}, changed=900)
+        self.assertEqual(code, 4)
+        self.assertIn("provider 'claude' is not an outside model", out)
+        self.assertIn("once per lens", out)
+
+    def lens(self, name, findings, **extra):
+        h.write_json(self.d / f"review-1-{name}.json", {"round": 1, "summary": f"{name} ok", "findings": [
+            {"id": f"R1-{i}", "severity": sev, "repo": "app", "file": f, "line": line, "title": t, "evidence": "e",
+             "detail": "d", "suggestion": "s", "status": "new"} for i, (sev, f, line, t) in enumerate(findings, 1)],
+            **extra})
+
+    def test_merge_combines_lenses_and_dedupes_the_same_spot(self):
+        self.lens("correctness", [("should_fix", "api/views.py", 10, "None not handled")])
+        self.lens("contracts", [("nit", "app/x.js", 3, "field renamed")], questions=[{"question": "why?"}])
+        self.lens("data", [("blocking", "./api/views.py", 12, "replica read after write")])
+        self.lens("access", [])
+        code, out = self.review({}, merge=True)
+        self.assertEqual(code, 0, out)
+        review = h.read_json(self.d / "review-1.json")
+        self.assertEqual([(f["id"], f["title"], f["lenses"]) for f in review["findings"]],
+                         [("R1-1", "replica read after write", ["correctness", "data"]),
+                          ("R1-2", "field renamed", ["contracts"])])
+        self.assertEqual(review["questions"], [{"question": "why?"}])
+        self.assertIn("data: data ok", review["summary"])
+        self.assertEqual(h.validate_review(review, 1), [])
+
+    def test_merge_refuses_missing_or_invalid_lens_files(self):
+        self.lens("correctness", [])
+        self.lens("contracts", [])
+        self.lens("data", [("urgent", "a.py", 1, "x")])
+        code, out = self.review({}, merge=True)
+        self.assertEqual(code, 2)
+        self.assertIn("review-1-data.json", out)
+        self.assertIn("review-1-access.json is missing", out)
+        self.assertFalse((self.d / "review-1.json").exists())
+
+    def test_defaults_define_the_reviewer_settings(self):
+        defaults = h._read_toml(Path(h.__file__).with_name("defaults.toml"))["review_pr"]
+        self.assertEqual((defaults["reviewer"], defaults["lens_min_changed_lines"]), ("auto", 400))
 
 
 class PrReviewVerifierTests(unittest.TestCase):

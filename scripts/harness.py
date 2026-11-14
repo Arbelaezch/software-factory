@@ -3629,17 +3629,118 @@ def fallback_model_line(d: Path, run: dict, cfg: dict, rnd: int) -> str:
     return f"Spawn it with model: {model} ({why})."
 
 
+# /review-pr in a legacy codebase: the Claude reviewer, which can read models, contracts and consumers, reviews instead
+# of the diff-only outside model, and a large PR set is split into focused passes (lenses) run in parallel, each
+# writing review-<n>-<lens>.json, which `review --merge` combines into review-<n>.json.
+REVIEW_LENSES = ("correctness", "contracts", "data", "access")
+
+
+def pr_review_reviewer(run: dict, cfg: dict) -> str:
+    """"claude" or "provider" for a PR review run, from [review_pr] reviewer (auto: claude for the legacy profile)."""
+    choice = (cfg.get("review_pr") or {}).get("reviewer", "auto")
+    if choice == "auto":
+        return "claude" if is_legacy(run) else "provider"
+    return choice if choice in ("claude", "provider") else "provider"
+
+
+def pr_changed_lines(run: dict) -> int:
+    total = 0
+    for pr in run.get("prs", []):
+        if not pr.get("merge_base"):
+            continue
+        for ln in git(Path(pr["path"]), "diff", "--numstat", pr["merge_base"], pr["ref"]).splitlines():
+            added, deleted = (ln.split("\t") + ["", ""])[:2]
+            total += (int(added) if added.isdigit() else 0) + (int(deleted) if deleted.isdigit() else 0)
+    return total
+
+
+def claude_pr_review_lines(d: Path, run: dict, cfg: dict, rnd: int, why: str) -> list[str]:
+    """What the manager spawns when a PR review uses the Claude reviewer: one pass, or one per lens for a big diff."""
+    minimum = (cfg.get("review_pr") or {}).get("lens_min_changed_lines", 400)
+    changed = pr_changed_lines(run)
+    model = fallback_model_line(d, run, cfg, rnd)
+    if minimum and changed >= minimum:
+        return [f"FALLBACK: {why}. The PRs change {changed} lines (lenses from {minimum}), so spawn the claude-reviewer "
+                f"subagent once per lens, in parallel, for round {rnd}: {', '.join(REVIEW_LENSES)}. Tell each one its "
+                f"lens; each writes {d}/review-{rnd}-<lens>.json. Then run `review --round {rnd} --merge`.", model]
+    return [f"FALLBACK: {why}. Spawn the claude-reviewer subagent for round {rnd}; it writes {d}/review-{rnd}.json.",
+            model]
+
+
+def _same_spot(a: dict, b: dict) -> bool:
+    try:
+        close = abs(int(a.get("line")) - int(b.get("line"))) <= 3
+    except (TypeError, ValueError):
+        close = a.get("line") == b.get("line")
+    return (a.get("repo"), str(a.get("file") or "").lstrip("./")) == \
+        (b.get("repo"), str(b.get("file") or "").lstrip("./")) and close
+
+
+def merge_lens_reviews(d: Path, rnd: int) -> tuple[dict, list[str]]:
+    """review-<n>.json from the lens files: findings on the same file within 3 lines are one finding (the most
+    severe kept, the other lenses noted), most severe first, renumbered R<n>-1..."""
+    order = {s: i for i, s in enumerate(SEVERITIES)}
+    findings, summaries, questions, problems = [], [], [], []
+    for lens in REVIEW_LENSES:
+        path = d / f"review-{rnd}-{lens}.json"
+        data = read_json(path)
+        if data is None:
+            problems.append(f"{path.name} is missing")
+            continue
+        errors = _validate_findings_file(data, rnd, path.name)
+        if errors:
+            problems.append(f"{path.name}: {'; '.join(errors[:4])}")
+            continue
+        if data.get("summary"):
+            summaries.append(f"{lens}: {data['summary'].strip()}")
+        questions += data.get("questions") or []
+        for f in data["findings"]:
+            f = {**f, "lenses": [lens]}
+            dup = next((g for g in findings if _same_spot(f, g)), None)
+            if dup is None:
+                findings.append(f)
+            else:
+                keep = f if order.get(f.get("severity"), 9) < order.get(dup.get("severity"), 9) else dup
+                keep["lenses"] = dup["lenses"] + [lens]
+                findings[findings.index(dup)] = keep
+    findings.sort(key=lambda f: order.get(f.get("severity"), 9))
+    for i, f in enumerate(findings, 1):
+        f["id"] = f"R{rnd}-{i}"
+    return {"round": rnd, "provider": "claude", "model": "claude-reviewer", "summary": " ".join(summaries),
+            "findings": findings, "questions": questions}, problems
+
+
 def cmd_review(a, cfg):
     d, run = load_run()
+    if a.merge:
+        review, problems = merge_lens_reviews(d, a.round)
+        if problems:
+            print(f"INVALID: {'; '.join(problems)}. Resume the lens's claude-reviewer (SendMessage) to fix its file, "
+                  f"then rerun `review --round {a.round} --merge`.")
+            sys.exit(2)
+        write_json(d / f"review-{a.round}.json", review)
+        print(f"Merged {len(REVIEW_LENSES)} lenses into {d}/review-{a.round}.json: {len(review['findings'])} findings.")
+        return
+    if run.get("mode") == "review" and not a.provider and pr_review_reviewer(run, cfg) == "claude":
+        print("\n".join(claude_pr_review_lines(d, run, cfg, a.round, "PR reviews in this project use the Claude "
+                                                                      "reviewer ([review_pr] reviewer)")))
+        sys.exit(4)
     rcfg = cfg.get("reviewer") or {}
     provider = a.provider or rcfg.get("provider", "deepseek")
     p = (cfg.get("providers") or {}).get(provider)
     if provider == "claude" or not p:
+        if run.get("mode") == "review":
+            print("\n".join(claude_pr_review_lines(d, run, cfg, a.round, f"provider '{provider}' is not an outside model")))
+            sys.exit(4)
         print(f"FALLBACK: provider '{provider}' is not an outside model. Spawn the claude-reviewer subagent "
               f"for round {a.round} instead; it writes {d}/review-{a.round}.json.")
         print(fallback_model_line(d, run, cfg, a.round))
         sys.exit(4)
     if not os.environ.get(p.get("api_key_env", "")):
+        if run.get("mode") == "review":
+            print("\n".join(claude_pr_review_lines(d, run, cfg, a.round,
+                                                    f"${p.get('api_key_env')} is not set, so {provider} can't be called")))
+            sys.exit(4)
         print(f"FALLBACK: ${p.get('api_key_env')} is not set, so {provider} can't be called. Spawn the "
               f"claude-reviewer subagent for round {a.round} instead.")
         print(fallback_model_line(d, run, cfg, a.round))
@@ -6856,6 +6957,7 @@ def main(argv=None):
     s = sub.add_parser("review", help="run the cross-lab reviewer for a round")
     s.add_argument("--round", type=int, required=True)
     s.add_argument("--provider")
+    s.add_argument("--merge", action="store_true", help="combine the lens reviews (review-<n>-<lens>.json) of a PR review")
     s.set_defaults(fn=cmd_review)
 
     s = sub.add_parser("validate", help="check a handoff file (plan | review | verified | fix) before the next stage uses it")
