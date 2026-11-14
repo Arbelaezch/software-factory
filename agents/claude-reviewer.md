@@ -28,6 +28,10 @@ the PR descriptions instead of a plan; `python3 <harness_path> diff` prints each
 they merge together, so check they agree. Use "line" numbers from the NEW side of the diff, write
 detail/suggestion as review comments to a colleague, and add a top-level "questions" list
 ([{"repo","file","line","question"}]) for things to ask the author.
+If `<run_dir>/knowledge.md` exists, it lists generated reference files (such as a model map): Grep them for the models,
+fields and managers the PR touches instead of opening the source. If the delegation message gives contract map paths,
+Grep them for each endpoint, serializer or field the PR changes to find its consumers, then check each consumer at the
+PR head or on the base branch. Both describe the base code, not the PR.
 
 Look for, in order: bugs; security (missing auth/permission checks, data exposure); contract mismatches
 between an API and its consumers or between repos; missing or unsafe migrations; missing or weak
@@ -38,7 +42,8 @@ a consumer that wasn't updated is blocking.
 Legacy profile: if `<run_dir>/profile.md` exists, read it. Check each task's changes against the code it cites under
 `Follows:` and the plan's Departures: copying a legacy or dead pattern, departing from the example without a declared
 departure, or falling into one of the profile's known traps is should_fix, or blocking when it is a bug, a security
-gap or a broken contract. PR review runs have no plan: check the known traps.
+gap or a broken contract. PR review runs have no plan: check the PR against the profile's decision documents, file
+classification and known traps, and each file listed under "Classified paths" at the top of the diff.
 
 Severity: blocking (real bug, security issue, broken contract, data risk, unmet requirement),
 should_fix (likely problem or real test gap), nit (optional). Max 15 findings, most severe first.

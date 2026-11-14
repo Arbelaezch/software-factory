@@ -3322,6 +3322,9 @@ def cmd_diff(a, cfg):
     d, run = load_run()
     rs = repos(cfg)
     if run.get("mode") == "review":
+        classified = pr_classified_paths(run) if is_legacy(run) and not a.stat else ""
+        if classified:
+            print(f"=== Classified paths ===\n{CLASSIFIED_PATHS_NOTE}\n{classified}\n")
         for pr in run.get("prs", []):
             print(f"=== {pr['repo']}#{pr['number']} {pr['title']} ({pr['head_branch']} -> {pr['base']}; "
                   f"read files with: git -C {pr['path']} show {pr['ref']}:<path>) ===")
@@ -3340,6 +3343,11 @@ def cmd_diff(a, cfg):
         else:
             diff, stat = repo_diff(rname, rs[rname], run)
             print(stat if a.stat else diff)
+
+
+CLASSIFIED_PATHS_NOTE = ("These changed files are dead, dangerous or legacy code according to the project's path "
+                         "classification. Check that each change belongs there: new work in dead code or new feature "
+                         "work in legacy code is a finding.")
 
 
 # --------------------------------------------------------------------------- review
@@ -3381,10 +3389,35 @@ REVIEW_SCHEMA_PR = """Respond with a single JSON object, no prose outside it:
 "status" is "unresolved" only when the finding repeats an issue from the previous round's list that still is not fixed."""
 
 
+def pr_classified_paths(run: dict) -> str:
+    """Files the run's PRs change that .claude/classification.toml marks dead, dangerous or legacy, one line each."""
+    try:
+        rules = load_classification()
+    except ValueError as exc:
+        return f"(not checked: {exc})"
+    if not rules:
+        return ""
+    lines = []
+    for pr in run.get("prs", []):
+        if not pr.get("merge_base"):
+            continue
+        prefix = root_relative(pr["path"])
+        files = git(Path(pr["path"]), "diff", "--name-only", pr["merge_base"], pr["ref"]).splitlines()
+        for f in filter(None, files):
+            hit = classify_path(f"{prefix}/{f}" if prefix and prefix != "." else f, rules)
+            if hit and hit[0]["class"] != "live":
+                rule, msg = hit
+                lines.append(f"- {pr['repo']}#{pr['number']} `{f}`: {rule['class']} ({rule['name']}). {msg}".strip())
+    return "\n".join(lines)
+
+
 def build_pr_review_prompt(run: dict, d: Path, cfg: dict) -> tuple[str, bool]:
     rcfg = cfg.get("reviewer") or {}
     rs = repos(cfg)
     parts = [(d / "task.md").read_text(encoding="utf-8"), ""]
+    classified = pr_classified_paths(run) if is_legacy(run) else ""
+    if classified:
+        parts.append(f"# Classified paths\n{CLASSIFIED_PATHS_NOTE}\n{classified}\n")
     diffs = []
     for pr in run.get("prs", []):
         desc = rs[pr["repo"]].get("description", "")
@@ -3432,12 +3465,19 @@ its example without a declared departure, or falls into a known trap is should_f
 a security gap or a broken contract."""
 
 
+PR_LEGACY_REVIEW_NOTE = """This is a legacy codebase: nearby code is often a pattern to avoid, and there is no plan to check against.
+Check the PR against the project's file classification and known traps: new imports from or edits to dead code, new
+feature work in legacy code, copying a legacy pattern when live code does the same thing, or falling into a known trap
+is should_fix, or blocking when it is a bug, a security gap or a broken contract. Files the PR changes that the
+classification marks dead, dangerous or legacy are listed under "Classified paths"."""
+
+
 def legacy_review_context(run: dict, cfg: dict) -> str:
     """Known traps for every review of a legacy-profile run; the Follows/Departures check only when there is a plan."""
     if not is_legacy(run):
         return ""
     traps = (cfg.get("ship") or {}).get("traps") or []
-    text = "" if run.get("mode") == "review" else LEGACY_REVIEW_NOTE
+    text = PR_LEGACY_REVIEW_NOTE if run.get("mode") == "review" else LEGACY_REVIEW_NOTE
     if traps:
         text += ("\n\n" if text else "") + "Known traps in this codebase:\n" + "\n".join(f"- {t}" for t in traps)
     return text
@@ -4190,6 +4230,7 @@ def write_pr_task(d: Path, run: dict, metas: dict) -> None:
 
 def print_pr_set(d: Path, run: dict) -> None:
     print(f"run_dir: {d}")
+    print(f"profile: {run.get('profile') or 'standard'}")
     print(f"Reviewing {len(run['prs'])} PR(s) together:")
     for pr in run["prs"]:
         print(f"  - {pr['repo']}#{pr['number']} {pr['title']}  (@{pr['author']}, {pr['head_branch']} -> {pr['base']})"
