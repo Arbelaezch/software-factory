@@ -1,6 +1,6 @@
 ---
 name: review-pr
-description: Review a PR together with the PRs it depends on in the project's other repos (cross-lab reviewer + verifier), then create pending GitHub reviews you edit and submit yourself.
+description: Review a PR together with the PRs it depends on in the project's other repos (reviewer + verifier), then create pending GitHub reviews you edit and submit yourself.
 argument-hint: "<PR URL or repo#number> [--only]"
 disable-model-invocation: true
 allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/harness.py *)
@@ -41,9 +41,14 @@ path; `knowledge` rebuilds stale generated files (such as a model map; this can 
 reason in one line and continue without it.
 
 ## 2. Review
-1. `H review --round 1`. If it prints `FALLBACK`, spawn the `harness:claude-reviewer` subagent for round 1 and
-   tell it this is a **PR review run** (the run directory, the harness path, round 1, and the contract map paths if
-   any).
+1. `H review --round 1`. If it prints `FALLBACK` (in a legacy-profile project it always does: the Claude reviewer can
+   read the models, contracts and consumers an outside model can't), spawn the `harness:claude-reviewer` subagent as
+   it says, with the model it names. Tell it this is a **PR review run** (the run directory, the harness path, round 1,
+   and the contract map paths if any).
+   - One reviewer: it writes `review-1.json`.
+   - Lenses (a large PR set): spawn one per lens it lists, **in parallel**, each told its lens. When all are done, run
+     `H review --round 1 --merge`. If it prints `INVALID`, resume that lens's reviewer once (SendMessage) with the
+     message, then rerun the merge.
 2. Spawn the `harness:verifier` subagent for round 1. Tell it this is a **PR review run**: the code is not
    checked out, so it reads files with `git show <ref>:<path>` (`H pr show` prints the exact
    commands) and checks consumers in the other repos with `git grep ... origin/<base>`. Give it the contract map

@@ -48,6 +48,18 @@ departure, or falling into one of the profile's known traps is should_fix, or bl
 gap or a broken contract. PR review runs have no plan: check the PR against the profile's decision documents, file
 classification and known traps, and each file listed under "Classified paths" at the top of the diff.
 
+**Lenses** (PR review runs only): when the delegation message names a lens, review the whole PR set for that lens
+only, deeper than a general pass, and write `<run_dir>/review-<n>-<lens>.json` (same format; other reviewers cover
+the rest, and findings at the same spot are merged). At most 8 findings, budget roughly 30 tool calls.
+- `correctness`: logic and edge cases: null/None and empty sets, boundaries and off-by-one, timezones and dates,
+  error and exception paths, ordering and races, state the PR leaves inconsistent on failure.
+- `contracts`: every endpoint, serializer field, status code, error code, prop or export the PR changes, checked
+  against each consumer in every repo (contract map, `git grep`), including backwards compatibility.
+- `data`: models and migrations (missing, unsafe, irreversible), transactions and locks, read-after-write and replica
+  routing, N+1 queries, missing indexes, unbounded queries or loops on large tables.
+- `access`: authentication and permission checks, querysets scoped to the caller, data exposed in responses, and the
+  project's own scoping rules from `review_focus` and the profile's traps.
+
 Severity: blocking (real bug, security issue, broken contract, data risk, unmet requirement),
 should_fix (likely problem or real test gap), nit (optional). Max 15 findings, most severe first.
 Every finding cites a file, a line, and quotes the code.
