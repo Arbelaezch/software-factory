@@ -1,0 +1,30 @@
+# Harness config for software-factory. Plugin defaults (providers, pricing, loop limits) live in
+# /Users/christianarbelaez/code/software-factory/scripts/defaults.toml; anything set here overrides them for this project only.
+
+[project]
+name = "software-factory"
+description = "Harness: a Claude Code plugin for a multi-agent delivery pipeline (/ship, /factory, /review-pr). Stdlib-only Python CLI (scripts/harness.py) plus agent, skill and hook files."
+# Extra things the reviewers should check in this codebase:
+review_focus = [
+  "scripts/ uses only the Python standard library",
+  "git guard changes keep subagents from pushing or writing to GitHub, with tests for both allow and block",
+  "tests never read or write real user state (~/.claude*, phone setup, gh auth)",
+  "new config keys have a default in scripts/defaults.toml",
+  "agent and skill prose stays in step with the harness.py subcommands and flags it calls",
+]
+
+[accounts]
+claude = "personal"
+github = "Arbelaezch"
+# git_email = "you@example.com"  # doctor warns if a repo commits as someone else
+
+[git]
+mode = "commit"
+base_branch = "main"
+
+[repos.app]
+path = "."
+description = "Python 3.11+ CLI (stdlib only) and Claude Code plugin files"
+gates = [
+  { name = "tests", kind = "pytest", cmd = "python3 -m pytest -q" },
+]

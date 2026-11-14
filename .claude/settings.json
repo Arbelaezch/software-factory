@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 */scripts/harness.py *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git branch --show-current)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
+    ],
+    "deny": []
+  },
+  "enabledPlugins": {
+    "harness@personal-harness": true
+  },
+  "extraKnownMarketplaces": {
+    "personal-harness": {
+      "source": {
+        "source": "directory",
+        "path": "/Users/christianarbelaez/code/software-factory"
+      }
+    }
+  }
+}
