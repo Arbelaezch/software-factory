@@ -32,7 +32,8 @@ Event stream: `${CLAUDE_PROJECT_DIR}/.factory/events.log`
   aren't watching yet, start watching.
 - **A blocked issue** (the user asks about it, or an event says so): `H factory status --issue N` prints the
   message the factory sent. Put it to the user as it is, short, with its options. Never answer a product question
-  for them.
+  for them. Blockers also reach the user's phone (Telegram, `H phone status`); if the issue is no longer `blocked`,
+  it was answered there, so don't ask again.
 - **The user answers** (picks an option or says what to do): record it with
   `H factory decide --question "<the question>" --answer "<their answer>" --by user --kind <product|implementation>
   --why "<their reasoning if given>"`, then re-queue the issue: `H factory queue N`. If the supervisor has stopped

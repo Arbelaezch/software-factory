@@ -199,9 +199,8 @@ Not blockers: merge conflicts (go to `conflict-resolver`), a single CI failure (
 usage limit (pause and resume).
 
 Delivery goes through one function, `notify(message)`, with channels behind it.
-- `terminal`: default.
-- `push`: off by default, switchable per run and mid-session. Not built in v1, scaffolding only. See
-  "Phone access" below for why.
+- `terminal`: default, always gets every message.
+- `push`: the phone, through a Telegram bot (below).
 - Adding a channel means adding one class. Nothing else changes.
 - Built: `harness notify --kind question|blocker|done --issue N --situation ... [--need ...] [--option ...
   --recommend N] [--detail ...] [--channel terminal|push]`. It rejects a message that breaks the format (more than
@@ -209,20 +208,29 @@ Delivery goes through one function, `notify(message)`, with channels behind it.
   channel never loses the message: the terminal always gets it. The `human-liaison` agent (haiku) builds the
   message from the raw material and calls this. Batching of questions belongs to the run loop (step 5).
 
-Phone access (status 2026/11/06)
-- The manager is meant to run as a long-lived interactive session started with `claude --remote-control`.
-  Workers stay headless children. `human-liaison` asks through `AskUserQuestion` in the manager session.
-- Tested and working: Remote Control connects, the session shows in the Claude app's Code tab, and a question
-  posted by the session can be answered from the app. So replying from the phone works.
-- Tested and not working: phone push notifications. `PushNotification` returned "Mobile push requested" and
-  `AskUserQuestion` was posted while I was away from the terminal, but neither produced a push or a Mac
-  notification. Only the push sent when Remote Control connects arrived. The terminal and app were on the
-  same account (Pro plan), both push toggles in `/config` were on, and no "No mobile registered" warning
-  showed. A feedback report was drafted. Tracked in a GitHub issue.
-- A mismatch between the terminal's login and the phone app's account causes the "No mobile registered"
-  warning, so both must use the same claude.ai account. The factory's usage limits are that account's too.
-- Until this is fixed, the terminal is the notification channel, and I check the Code tab in the app by hand.
-  No interim push service is planned.
+Phone access (decided 2026/11/14, issue #9)
+- Claude's own push (Remote Control, `PushNotification`) was dropped: pushes never arrived (tested 2026/11/06), and
+  since step 5 each issue runs in a headless session that exits when it blocks, so there is no live session to
+  attach to. Keeping one open per blocker would spend plan usage while waiting.
+- QUESTION and BLOCKER messages go to a Telegram bot (`scripts/phone.py`), on top of the terminal and the issue
+  comment. DONE stays on the terminal. Each option is a button, the recommended one starred.
+- One bot and one bridge serve every factory on the machine, whatever Claude or GitHub account each project uses.
+  Setup is once per machine: create a bot with @BotFather, turn on topics for it there, message it, then run
+  `harness phone setup --token <token>`. State lives in `~/.config/software-factory/phone`, outside the projects.
+- Each project gets its own topic in the chat. Without topics, every message still names the project and a reply is
+  matched by the message it replies to.
+- The bridge is a small long-polling process (outgoing HTTPS only, so it works from any network). `factory run`
+  and every blocker start it if it isn't running; it exits after 30 minutes with no supervisor running and nothing
+  waiting on me. `harness phone serve --forever` keeps it up (for a launchd agent).
+- A tap or a reply goes to a short Sonnet session in that project, under the project's Claude account, allowed only
+  `harness factory decide|queue|start|status` and file reads. It records the answer and re-queues the issue the way
+  `/factory` does (starting the supervisor if it has stopped), or answers a follow-up question from the run's files.
+  A fresh session is used because the issue session has exited and the `/factory` manager holds no context about
+  the blocker. At most 4 replies per blocker; past that I finish at the computer.
+- `status` (or `/status`) in a project's topic returns that project's `harness factory status`; outside the topics
+  it covers every project. No model is used.
+- A blocker answered at the computer (the issue is queued or started again) is closed out on the phone.
+- Only my Telegram user, in the chat found at setup, is listened to. `[factory] phone = false` turns it off for a project.
 
 A blocker stops only the blocked issue and anything that depends on it. The factory keeps working other
 independent issues in my directed group. Questions are batched so I am not pinged repeatedly.
@@ -283,8 +291,8 @@ How it is built (step 5, decided 2026/11/06)
   on the issue, message through `notify`) and stops. When the review verdict is DONE it commits the diff, pushes
   the branch, opens the PR from the draft and runs `harness factory done N --pr URL` (label `awaiting-merge`).
   A session that ends in neither state is marked `blocked` by the supervisor.
-- Questions are asynchronous: they arrive on the terminal, I answer with `harness factory decide` and relabel the
-  issue `todo`. Replying live from the phone needs the interactive manager and the push fix, and is not part of v1.
+- Questions are asynchronous: they arrive on the terminal and the phone, and I answer from either (section 7). At the
+  computer that is `harness factory decide` and a relabel to `todo`, through `/factory`.
 - The front door is `/factory` (skill), a thin conversation with the manager: "work on 12 and 13", "status",
   an answer to a blocked issue, "stop". It calls `harness factory start | status | stop | queue | decide` and
   never does the work. `start` launches `factory run` detached (own session, under `caffeinate`, lock in
@@ -430,7 +438,7 @@ marker with the wrong directory, and a subagent without push rights.
 5. Run loop with `issue-selector`, the ship recipe, manual merge, and the usage gate with pause and resume. (done; run on callback #17)
 6. Auto-merge, CI wait, `ci-fix` recipe. (done; not yet run on a real project)
 7. `question-resolver`, `conflict-resolve`, `harness-cleanup`. (done; not yet run on a real project)
-8. Push notification channel (blocked by #9).
+8. Phone channel: blockers to a Telegram bot, answered from the phone (#9). (done; not yet run on a real blocker)
 9. First real project: callback. (in progress: issue #17 reached an open PR through the whole pipeline; see section 16)
 
 ## 13. Not in v1
@@ -439,7 +447,6 @@ marker with the wrong directory, and a subagent without push rights.
 - Stacked branches (an issue building on an unmerged PR).
 - Several projects in one factory process.
 - A dashboard or web UI.
-- Push notifications (scaffolding only).
 - Smart blocker summarising beyond the standard format.
 - Retrying failed harness runs.
 
@@ -456,7 +463,6 @@ in `~/.claude-personal`, the README and `scripts/claude-accounts.sh`.
 
 ## 15. Open items
 
-- Phone push notifications do not arrive (section 7, "Phone access"). Revisit when fixed.
 - `ci-fixer` can't comment on the PR itself (`gh pr comment` is blocked for worker sessions), so it writes its diagnosis to `.factory/ci-fix-N.md` and the supervisor posts it. Issue #21 (letting the worker comment) is no longer needed for v1.
 - Confirm what the usage probe reports when I am near or over a limit (the `status` field values are unseen).
 
@@ -480,5 +486,5 @@ Next, in order:
 1. Run a small second issue on callback with `/factory work on N`: checks done, CI wait and auto-merge, and the quiet event watch.
 2. Force the other paths once: a throwaway PR with a failing test (ci-fixer) and one that conflicts with the base (conflict-resolver).
 3. Run `/factory-plan` on a real MVP document, then let the factory build a short chain of dependent issues.
-4. Step 8 once #9 is solved: the push channel so blockers reach the phone.
+4. Set up the Telegram bot (`harness phone setup`) and answer a real blocker from the phone.
 5. Optional: set `DEEPSEEK_API_KEY` so review uses the external reviewer instead of the Claude fallback; #7 (BM25 for the scout) stays open.

@@ -394,12 +394,13 @@ class NotifyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             h.notify("x", ("pager",))
 
-    def test_push_is_scaffolding_and_never_loses_the_message(self):
+    def test_a_failing_push_never_loses_the_message(self):
         out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        with mock.patch.object(h.PushChannel, "send", side_effect=RuntimeError("the phone is not set up")), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             h.notify("hello", ("push",))
         self.assertIn("hello", out.getvalue())
-        self.assertIn("not built", err.getvalue())
+        self.assertIn("not set up", err.getvalue())
 
     def test_a_new_channel_is_one_class(self):
         got = []
@@ -413,6 +414,34 @@ class NotifyTests(unittest.TestCase):
         with mock.patch.dict(h.CHANNELS, {"memory": Memory}), contextlib.redirect_stdout(io.StringIO()):
             h.notify("hi", ("memory",))
         self.assertEqual(got, ["hi"])
+
+    def test_blockers_go_to_the_phone_and_done_does_not(self):
+        ph = mock.Mock()
+        ph.configured.return_value = True
+        cfg = {"project": {"name": "alpha"}, "accounts": {"claude": "personal", "dirs": {"personal": "/acc/p"}}}
+        with mock.patch.object(h, "phone_module", return_value=ph), mock.patch.object(h, "factory_comment"), \
+                mock.patch.object(h, "factory_log"), contextlib.redirect_stdout(io.StringIO()):
+            h.factory_raise_blocker(cfg, "o/r", "QUESTION", 5, "Which one.", "Pick one", ["A", "B"], 2)
+            h.factory_raise_blocker(cfg, "o/r", "DONE", 5, "The PR is open.", "")
+            h.factory_raise_blocker({**cfg, "factory": {"phone": False}}, "o/r", "BLOCKER", 6, "Stuck.", "Help")
+        ph.send_blocker.assert_called_once()
+        args = ph.send_blocker.call_args.args
+        self.assertEqual((args[1], args[2], args[3], args[5], args[6], args[7], args[8]),
+                         ("alpha", 5, "QUESTION", "Pick one", ["A", "B"], 2, "/acc/p"))
+        self.assertTrue(args[4].startswith("[QUESTION]  alpha #5"))
+        ph.ensure_bridge.assert_called_once()
+
+    def test_a_phone_failure_never_stops_the_factory(self):
+        ph = mock.Mock()
+        ph.configured.return_value = True
+        ph.send_blocker.side_effect = RuntimeError("network down")
+        logged, err = [], io.StringIO()
+        with mock.patch.object(h, "phone_module", return_value=ph), mock.patch.object(h, "factory_comment"), \
+                mock.patch.object(h, "factory_log", side_effect=logged.append), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            h.factory_raise_blocker({}, "o/r", "BLOCKER", 6, "Stuck.", "Help")
+        self.assertIn("network down", err.getvalue())
+        self.assertEqual(logged[0]["kind"], "phone_failed")
 
 
 def issue(key, deps=(), **kw):

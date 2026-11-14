@@ -157,6 +157,24 @@ whatever account they're signed into, and the session-start hook warns if that d
 </details>
 
 <details>
+<summary><b>Optional: factory blockers on your phone (Telegram)</b></summary>
+
+The factory's questions and blockers can reach your phone, and you answer them there. Set it up once per machine;
+every project and every Claude or GitHub account shares the one bot.
+
+1. In Telegram, message [@BotFather](https://t.me/BotFather): `/newbot`, then copy the token. In its bot settings,
+   turn on topics (threaded mode), so each project gets its own thread.
+2. Send your new bot any message.
+3. Run `python3 ~/code/software-factory/scripts/harness.py phone setup --token <token>`, then `phone test` in a project.
+
+Each option arrives as a button. Tap one, or reply to the message ("2, but keep the old endpoint", or a question
+like "why did CI fail?"). A short Sonnet session in that project records the answer and resumes the issue, or answers
+the question. Send `status` in a project's topic for that project, or outside the topics for all of them.
+`harness phone status` shows the bridge and what is waiting; `[factory] phone = false` turns it off for a project.
+See section 7 of [`docs/factory-design.md`](docs/factory-design.md).
+</details>
+
+<details>
 <summary><b>Optional: plan-usage check (statusline)</b></summary>
 
 `scripts/usage.py` reports how much of the 5-hour and weekly plan windows is used and returns go, pause
@@ -228,7 +246,7 @@ Run state and metrics live in `.harness/` in the project, which is excluded from
 agents/           subagent definitions: scout, planner, engineer, claude-reviewer, verifier
 skills/           slash commands: /ship, /review-pr, /harness-init, /harness-report
 hooks/hooks.json  git guard, per-agent metrics, account check
-scripts/          harness.py (CLI), defaults.toml, claude-accounts.sh, usage.py, statusline_capture.py
+scripts/          harness.py (CLI), defaults.toml, claude-accounts.sh, usage.py, statusline_capture.py, phone.py
 docs/             factory-design.md (planned factory layer), factory-allowlist.md (per-repo command allow list)
 ```
 
