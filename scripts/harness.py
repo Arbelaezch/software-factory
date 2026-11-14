@@ -519,16 +519,69 @@ def new_run(cfg: dict, task: str, mode: str, force: bool = False, extra: dict | 
     if current_run_id() and not force:
         rid = current_run_id()
         sys.exit(f"Run {rid} is still active. End it first (harness run end --status aborted) or pass --force.")
+    profile = ship_profile(cfg)
     rid = f"{now():%Y%m%d-%H%M%S}-{slugify(task, 32)}"
     d = RUNS_DIR / rid
     d.mkdir(parents=True)
     run = {"id": rid, "task": task, "mode": mode, "status": "running",
            "started_at": iso(), "repos": {}, "review_rounds": 0, **(extra or {})}
+    if profile == "legacy":
+        run["profile"] = profile
+        (d / PROFILE_FILE).write_text(profile_markdown(cfg), encoding="utf-8")
     save_run(d, run)
     CURRENT_FILE.parent.mkdir(parents=True, exist_ok=True)
     CURRENT_FILE.write_text(rid)
     log_event({"kind": "run_start", "run_id": rid, "mode": mode, "tier": run.get("tier")})
     return d, run
+
+
+# ---------------------------------------------------------------------------
+# Legacy-codebase profile. `[ship] profile = "legacy"` writes <run_dir>/profile.md at run start with the project's
+# decision documents, file classification and known traps. The agents' legacy sections apply only when that file
+# exists, and the plan and review checks only when run.json has "profile": "legacy", so a project on the standard
+# profile runs exactly as before.
+# ---------------------------------------------------------------------------
+PROFILES = ("standard", "legacy")
+PROFILE_FILE = "profile.md"
+
+
+def ship_profile(cfg: dict) -> str:
+    profile = (cfg.get("ship") or {}).get("profile") or "standard"
+    if profile not in PROFILES:
+        sys.exit(f"[ship] profile in .claude/harness.toml must be one of {', '.join(PROFILES)}, not {profile!r}.")
+    return profile
+
+
+def is_legacy(run: dict) -> bool:
+    return run.get("profile") == "legacy"
+
+
+def profile_markdown(cfg: dict) -> str:
+    """profile.md: the project's own inputs to the legacy profile. The per-stage rules live in the agent prompts."""
+    s = cfg.get("ship") or {}
+    docs = [f"- `{p}`" + ("" if (ROOT / p).exists() else " (not found; tell the user)") for p in s.get("decision_docs") or []]
+    traps = [f"- {t}" for t in s.get("traps") or []]
+    classes = s.get("classification") or ""
+    classes = "\n".join(f"- {c}" for c in classes) if isinstance(classes, list) else classes.strip()
+    return "\n".join([
+        "# Legacy-codebase profile",
+        "",
+        "Copying the nearest existing code is often wrong in this codebase. Every example must come from live code,",
+        "and every departure from the local convention is declared in the plan.",
+        "",
+        "## Decision documents",
+        "Product and design decisions already made (paths from the project root). Grill questions and plans must not",
+        "contradict them; ask only what they leave open.",
+        *(docs or ["None configured."]),
+        "",
+        "## File classification",
+        classes or "None configured: classify files as live, legacy or dead from the repo's CLAUDE.md files and git "
+        "history.",
+        "",
+        "## Known traps",
+        *(traps or ["None configured."]),
+        "",
+    ])
 
 
 TIERS = ("tiny", "standard", "large")
@@ -577,6 +630,8 @@ def cmd_run_start(a, cfg):
         models.setdefault("planner", (cfg.get("tiers") or {}).get("tiny_planner_model", "sonnet"))
     if models:
         out["model_overrides"] = models
+    if is_legacy(run):
+        out.update({"profile": "legacy", "profile_file": str(d / PROFILE_FILE)})
     if issue:
         out.update({"issue": f"{issue['slug']}#{issue['number']}", "issue_title": issue["title"],
                     "issue_repo": issue["repo"], "suggested_branch_type": issue["branch_type"]})
@@ -2812,18 +2867,43 @@ def project_context(cfg: dict) -> str:
     return "\n\n".join(lines) or "(No project description configured.)"
 
 
+LEGACY_REVIEW_NOTE = """This is a legacy codebase: nearby code is often a pattern to avoid. Each plan task names the live code it
+follows ("Follows:") and the plan lists deliberate "Departures" from the local convention. Check each task's changes
+against its cited example and the declared departures: a change that copies a legacy or dead pattern, departs from
+its example without a declared departure, or falls into a known trap is should_fix, or blocking when it is a bug,
+a security gap or a broken contract."""
+
+
+def legacy_review_context(run: dict, cfg: dict) -> str:
+    """Known traps for every review of a legacy-profile run; the Follows/Departures check only when there is a plan."""
+    if not is_legacy(run):
+        return ""
+    traps = (cfg.get("ship") or {}).get("traps") or []
+    text = "" if run.get("mode") == "review" else LEGACY_REVIEW_NOTE
+    if traps:
+        text += ("\n\n" if text else "") + "Known traps in this codebase:\n" + "\n".join(f"- {t}" for t in traps)
+    return text
+
+
 def review_system_prompt(run: dict, cfg: dict | None = None) -> str:
     pr_mode = run.get("mode") == "review"
     intro = PR_REVIEW_PREAMBLE if pr_mode else REVIEW_INTRO
     schema_tail = REVIEW_SCHEMA_PR if pr_mode else REVIEW_SCHEMA
-    return f"{intro}\n\n{project_context(cfg or load_config())}\n\n{REVIEW_CRITERIA}\n\n{schema_tail}"
+    cfg = cfg or load_config()
+    parts = [intro, project_context(cfg), legacy_review_context(run, cfg), REVIEW_CRITERIA, schema_tail]
+    return "\n\n".join(p for p in parts if p)
 
 
 def plan_digest(plan: str) -> str:
-    """Task headings, acceptance criteria and contract changes: what a re-review needs from plan.md."""
-    keep = [ln for ln in plan.splitlines() if ln.startswith(("# ", "### ")) or ln.lstrip("- ").startswith("Done when")]
-    contract = _plan_section(plan, "Contract changes")
-    return "\n".join(keep) + (f"\n\nContract changes:\n{contract}" if contract else "")
+    """Task headings, acceptance criteria, cited examples, contract changes and departures: what a re-review needs."""
+    keep = [ln for ln in plan.splitlines()
+            if ln.startswith(("# ", "### ")) or ln.lstrip("- ").startswith(("Done when", "Follows"))]
+    out = "\n".join(keep)
+    for heading in ("Contract changes", "Departures"):
+        section = _plan_section(plan, heading)
+        if section:
+            out += f"\n\n{heading}:\n{section}"
+    return out
 
 
 def build_review_prompt(run: dict, d: Path, cfg: dict, round_n: int) -> tuple[str, bool]:
@@ -3163,8 +3243,27 @@ def validate_verified(verified, rnd: int, review) -> list[str]:
     return errors
 
 
+def validate_legacy_plan(plan_md: str | None, tasks: dict, cfg: dict) -> list[str]:
+    """Legacy profile: every task names the existing code it follows, and plan.md lists departures from convention."""
+    rs = repos(cfg)
+    errors = []
+    for t in tasks.get("tasks") or []:
+        follows = t.get("follows")
+        if not _nonempty_str(follows):
+            errors.append(f"task {t.get('id')!r}: \"follows\" must name the live code it copies (\"path:lines\")")
+            continue
+        path = re.sub(r":[\d,-]+$", "", follows.split()[0])
+        base = rs[t["repo"]]["abs"] if t.get("repo") in rs else ROOT
+        if not ((base / path).exists() or (ROOT / path).exists()):
+            errors.append(f"task {t.get('id')!r}: follows {path!r}, which does not exist")
+    if plan_md is not None and not re.search(r"^## Departures\s*$", plan_md, re.M):
+        errors.append("plan.md needs a \"## Departures\" section (each place a task deliberately does not copy the "
+                      "local convention, and what it does instead; \"None\" if none)")
+    return errors
+
+
 def cmd_validate(a, cfg):
-    d, _ = load_run()
+    d, run = load_run()
     rnd = a.round
     if a.what != "plan" and rnd is None:
         sys.exit(f"validate {a.what} needs --round")
@@ -3182,6 +3281,8 @@ def cmd_validate(a, cfg):
     if a.what == "plan" and not errors:
         plan_md = (d / "plan.md").read_text(encoding="utf-8") if (d / "plan.md").exists() else None
         contract_errors = validate_contract_plan(plan_md, data, cfg)
+        if is_legacy(run):
+            contract_errors += validate_legacy_plan(plan_md, data, cfg)
         if contract_errors:
             print(f"INVALID: plan.md: {'; '.join(contract_errors)}. Ask the planner (SendMessage) to fix plan.md, "
                   f"then rerun `validate plan`.")
@@ -3801,6 +3902,9 @@ def write_pr_descriptions(d: Path, run: dict, cfg: dict, changed: list, gate_eve
         contract = _plan_section(plan, "Contract changes")
         if contract and contract.lower().strip(". ") != "none":
             body += ["## Contract changes", contract, ""]
+        departures = _plan_section(plan, "Departures")
+        if departures and departures.lower().strip(". ") != "none":
+            body += ["## Departures from local convention", departures, ""]
         _, stat = repo_diff(rname, rs[rname], run)
         body += ["## Changes", "```", stat.strip("\n"), "```", ""]
         repo_gates = {}
@@ -5647,6 +5751,20 @@ def cmd_doctor(a, cfg):
             unknown = [s.partition(":")[0] for s in c.get("covers") or [] if ":" in s and s.partition(":")[0] not in repos(cfg)]
             if unknown:
                 print(f"  info {name}: contracts covers {', '.join(unknown)} as pathspecs, not repo names")
+    ship = cfg.get("ship") or {}
+    profile = ship.get("profile") or "standard"
+    print("\n/ship profile:")
+    if profile not in PROFILES:
+        line(False, f"[ship] profile {profile!r} is not one of {', '.join(PROFILES)}")
+    elif profile == "standard":
+        print("  info standard (set [ship] profile = \"legacy\" for a legacy codebase)")
+    else:
+        missing = [p for p in ship.get("decision_docs") or [] if not (ROOT / p).exists()]
+        line(not missing, "legacy: decision documents found" if not missing else
+             f"legacy: decision documents not found: {', '.join(missing)} (paths are from the project root)")
+        for key in ("decision_docs", "classification", "traps"):
+            if not ship.get(key):
+                print(f"  info legacy: no [ship] {key} configured")
     print("\nMetrics:")
     all_lost = unattributed_agent_events(read_events())
     legacy = legacy_lost_agent_events(all_lost)

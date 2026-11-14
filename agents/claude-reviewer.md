@@ -35,6 +35,10 @@ tests; plan requirements not met; the project-specific checks; platform pitfalls
 When the diff output starts with "API contract snapshot changes", check each changed endpoint, field or status code
 against its consumers in every repo (`git grep` the URL or field name) and against "Contract changes" in plan.md;
 a consumer that wasn't updated is blocking.
+Legacy profile: if `<run_dir>/profile.md` exists, read it. Check each task's changes against the code it cites under
+`Follows:` and the plan's Departures: copying a legacy or dead pattern, departing from the example without a declared
+departure, or falling into one of the profile's known traps is should_fix, or blocking when it is a bug, a security
+gap or a broken contract. PR review runs have no plan: check the known traps.
 
 Severity: blocking (real bug, security issue, broken contract, data risk, unmet requirement),
 should_fix (likely problem or real test gap), nit (optional). Max 15 findings, most severe first.

@@ -44,7 +44,9 @@ value printed by `run start`), the `git_mode` printed by `run start`, and the sp
 - Issue: `H run start --issue <ref> [--task "<extra instructions>"] [--tier <tier>]`. It reads the issue
   (title, body, labels, comments) into `task.md` via `gh`.
 - Plain task: `H run start --task "<task>" [--tier <tier>]`.
-Note `run_dir`, `git_mode` and, for issues, `suggested_branch_type` from the output. If another run is
+Note `run_dir`, `git_mode` and, for issues, `suggested_branch_type` from the output. If it prints
+`"profile": "legacy"`, the project is a legacy codebase: the legacy notes in steps 1, 2 and 4 apply, and the scouts,
+planner, engineers and reviewers pick up `<run_dir>/profile.md` on their own. If another run is
 active, ask the user whether to end it (`H run end --status aborted`) or stop. If `gh` fails, tell the
 user to run `gh auth login`.
 
@@ -59,6 +61,17 @@ recommended answer, covering scope, users/roles affected, edge cases, error stat
 shape, data/migrations, and what "done" looks like. Stop when the decisions are clear or the user
 says enough.
 
+**Legacy profile:** the grill always runs (skip it only for the tiny tier or `--no-grill`); don't ask whether to
+grill, and interview the user yourself rather than with a grill skill. First read `profile_file`, then the decision
+documents it lists, only the parts that bear on the task (look at headings, read the sections that apply). Ask only
+what those documents and the task don't already answer, one question at a time, each with your recommended answer:
+- product behaviour: who sees what, roles, edge cases, error states;
+- important implementation trade-offs: data model shape, a migration vs. reusing an existing field, where logic lives
+  (shared module vs. one view), contract changes and their consumers, backwards compatibility, performance vs.
+  correctness, security and scoping choices.
+Never ask about routine choices (naming, file layout, helpers, test structure): those follow the project's
+conventions and a fixed bar of correct, secure (permissions and scoping explicit), tested and readable.
+
 Then write `<run_dir>/brief.md`: decisions made, explicit non-goals, acceptance criteria. Even
 without a grill, if the user gave details beyond the one-line task, record them in brief.md.
 
@@ -66,7 +79,8 @@ without a grill, if the user gave details beyond the one-line task, record them 
 Using the workspace CLAUDE.md and the repos in `.claude/harness.toml`, decide which repos the task likely
 touches (in a single-repo project, just that one). Spawn one
 `harness:scout` subagent per relevant repo **in parallel**, each told to write `<run_dir>/context-<repo>.md`.
-When unsure whether a repo is involved, include it; scouts are cheap. **Tiny tier: skip the scouts** (the
+When unsure whether a repo is involved, include it; scouts are cheap. Legacy profile: tell each scout to read
+`<run_dir>/profile.md`. **Tiny tier: skip the scouts** (the
 planner reads the files itself).
 
 API contracts (every tier): first run `H contracts map`. If it prints "No repo has [contracts]", skip this. Otherwise it
@@ -81,7 +95,9 @@ If its reply says the job exceeds 6 tasks, show the user the proposed phases and
 whether to plan phase 1 only (Recommended) or keep everything in one run.
 
 ## 4. Checkpoint (always)
-Show the user the planner's short task list and any open questions (from its reply, not the file).
+Show the user the planner's short task list and any open questions (from its reply, not the file). Legacy profile:
+also show each departure from local convention the planner listed (or say there are none), so the user approves them
+with the plan.
 Ask with AskUserQuestion: "Approve the plan?" options: "Approve", "Change something", "Abort".
 - Change: collect the feedback, resume the planner (SendMessage) with it, then ask again. After two
   rounds of changes, spawn a fresh planner told to read the existing plan.md plus the accumulated

@@ -18,6 +18,12 @@ The delegation message gives you: the run directory, the harness command path, a
 Before editing, read: the task (or findings), the relevant `<run_dir>/context-<repo>.md`, the repo's
 CLAUDE.md if present, and the files you'll change. Match the surrounding code style and patterns.
 
+Legacy profile: if `<run_dir>/profile.md` exists, read it. Copy the code your task cites under `Follows:` and apply
+the plan's Departures; don't copy other nearby code, which may be legacy. If you meet a trap the plan didn't expect
+(an import from legacy or dead code, a migration the plan lacks, a scoping or permission rule it doesn't mention, a
+contract change not under Contract changes, or one of the profile's known traps), stop and report that the plan is
+wrong (what, where, why it matters) instead of working around it.
+
 Rules:
 - If you exceed roughly 60 tool calls without converging, stop and report what blocks you.
 - Stay inside the task's scope. If the plan is wrong or impossible, stop and say why instead of

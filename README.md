@@ -195,6 +195,12 @@ terminal is logged in to. Run `python3 scripts/usage.py` (exit code 0 go, 10 pau
   snapshot before any edits and the `contracts` gate takes another and diffs them, so nothing is committed to the repo.
   `cwd` is where the commands run. The plan must declare every contract change with a consumer task, reviewers get
   the contract diff, and an undeclared change fails the gate and is a blocking finding.
+- `[ship]` (optional): `profile = "legacy"` for a large codebase where the nearest code is often a pattern to avoid
+  (retiring or dead code next to live code). The grill always runs (except tiny) and asks only about product
+  behaviour and important trade-offs the project's `decision_docs` don't settle; scouts report each file's class
+  (from `classification`), the live code to copy and the `traps` that apply; every plan task cites the code it
+  follows and the plan lists its departures from local convention for approval; engineers stop at traps the plan
+  didn't expect; reviewers check against the cited examples and the traps. With the default `"standard"`, nothing changes.
 - Any section from [`scripts/defaults.toml`](scripts/defaults.toml) can be overridden, such as
   `[reviewer]`, `[models]`, `[loop]` or `[providers.*]`.
 
