@@ -1817,3 +1817,125 @@ class KnowledgeTests(unittest.TestCase):
         with mock.patch.object(h, "transcripts_for", return_value=sessions), mock.patch.object(h.sys, "stdout", buf):
             h.print_tool_report([], 5, self.cfg)
         self.assertRegex(buf.getvalue(), r"r1\s+2\s+scout 1, planner 1")
+
+
+class PathClassificationTests(unittest.TestCase):
+    """.claude/classification.toml: the edit hook blocks dead/dangerous paths, warns on legacy, ignores live code."""
+
+    RULES = """# first match wins
+[onsite-pages]
+class = "live"
+paths = ["web/events/templates/events/checkin.html"]
+
+[dead-apps]
+class = "dead"
+paths = ["web/{surveys2,teams}/**"]
+message = "Not in INSTALLED_APPS."
+
+[bypass]
+class = "dangerous"
+paths = ["web/transition_utilities"]
+message = "Login-bypass URLs."
+
+[legacy-views]
+class = "legacy"
+paths = [
+  "web/*/{views,urls}.py",
+  "web/*/templates/**",
+]
+message = "Live equivalent: web/{1}/api/."
+"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(os.path.realpath(tmp.name))
+        (self.root / ".claude").mkdir()
+        (self.root / ".claude" / "classification.toml").write_text(self.RULES)
+        (self.root / "web" / "shop" / "api").mkdir(parents=True)
+        self.cfg = {"repos": {"backend": {"path": "web"}}}
+        self.events, self.rid = [], None
+        for p in (mock.patch.object(h, "ROOT", self.root), mock.patch.object(h, "RUNS_DIR", self.root / "runs"),
+                  mock.patch.object(h, "log_event", self.events.append),
+                  mock.patch.object(h, "current_run_id", lambda: self.rid),
+                  mock.patch.object(h, "current_branch", lambda path: "feat/x")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def hook(self, path, agent="harness:engineer", tool="Edit"):
+        payload = {"tool_name": tool, "tool_input": {"file_path": path}, "cwd": str(self.root)}
+        if agent:
+            payload.update(agent_id="a1", agent_type=agent)
+        with mock.patch.object(h.sys, "stdin", io.StringIO(json.dumps(payload))), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            h.hook_guard_bash(self.cfg)
+        return json.loads(out.getvalue()) if out.getvalue().strip() else None
+
+    def test_dead_and_dangerous_paths_are_blocked_with_the_reason(self):
+        for path in ("web/surveys2/models.py", str(self.root / "web/teams/views.py"),
+                     "web/transition_utilities/urls.py"):
+            out = self.hook(path)["hookSpecificOutput"]
+            self.assertEqual(out["permissionDecision"], "deny", path)
+        reason = self.hook("web/surveys2/models.py", tool="Write")["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("web/surveys2/models.py is dead code (dead-apps", reason)
+        self.assertIn("Not in INSTALLED_APPS.", reason)
+        self.assertIn("allow_classified", reason)
+        self.assertEqual(self.events[-1]["kind"], "guard_block")
+        main = self.hook("web/surveys2/models.py", agent=None)["hookSpecificOutput"]
+        self.assertEqual(main["permissionDecision"], "ask")  # the main session asks the user instead
+
+    def test_legacy_edit_warns_and_names_the_live_package(self):
+        for path in ("web/shop/views.py", "web/shop/templates/shop/list.html"):
+            out = self.hook(path)["hookSpecificOutput"]
+            self.assertNotIn("permissionDecision", out)
+            self.assertIn(f"{path} is legacy code (legacy-views). Live equivalent: web/shop/api/.", out["additionalContext"])
+
+    def test_live_code_and_exceptions_pass(self):
+        for path in ("web/shop/api/views.py", "web/events/templates/events/checkin.html", "web/shop/models.py",
+                     "/elsewhere/web/surveys2/x.py"):
+            self.assertIsNone(self.hook(path), path)
+        self.assertIsNone(self.hook("web/surveys2/models.py", tool="Read"))
+
+    def test_a_plan_task_can_allow_a_blocked_path(self):
+        self.rid = "r1"
+        d = self.root / "runs" / "r1"
+        d.mkdir(parents=True)
+        h.write_json(d / "tasks.json", {"tasks": [{"id": "T1", "repo": "backend", "allow_classified": ["surveys2/**"]}]})
+        self.assertIsNone(self.hook("web/surveys2/models.py"))
+        self.assertEqual(self.hook("web/teams/models.py")["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_no_file_or_a_broken_file(self):
+        (self.root / ".claude" / "classification.toml").write_text('[x]\nclass = "gone"\npaths = ["a"]\n')
+        self.assertIn("class must be one of", self.hook("web/surveys2/a.py")["systemMessage"])
+        (self.root / ".claude" / "classification.toml").unlink()
+        self.assertIsNone(self.hook("web/surveys2/a.py"))
+        self.assertEqual(h.classification_markdown(), "")
+
+    def test_mini_toml_reads_the_file(self):
+        with mock.patch.dict(os.environ, {"HARNESS_FORCE_MINITOML": "1"}):
+            rules = h.load_classification()
+        self.assertEqual([r["name"] for r in rules], ["onsite-pages", "dead-apps", "bypass", "legacy-views"])
+
+    def test_glob_matching(self):
+        m = lambda g, p: bool(h.glob_regex(g).match(p))
+        self.assertTrue(m("a/**/b.py", "a/b.py"))
+        self.assertTrue(m("a/**/b.py", "a/x/y/b.py"))
+        self.assertFalse(m("a/*/b.py", "a/x/y/b.py"))
+        self.assertTrue(m("t/{base.html,css/**}", "t/css/x/y.css"))
+        self.assertFalse(m("t/{base.html,css/**}", "t/js/a.js"))
+        self.assertTrue(m("html", "html/a/b.html"))
+        self.assertFalse(m("html", "htmlx/a.html"))
+
+    def test_scouts_get_the_rules_and_classify_cli(self):
+        text = h.classification_markdown()
+        self.assertIn("- `dead` (dead-apps): `web/{surveys2,teams}/**`. Not in INSTALLED_APPS.", text)
+        self.assertIn("Live equivalent: web/…/api/.", text)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(h.os, "getcwd", lambda: str(self.root)):
+            h.cmd_classify(mock.Mock(paths=["web/shop/views.py", "web/shop/api/x.py"]), self.cfg)
+        self.assertEqual(out.getvalue().splitlines(),
+                         ["legacy\tweb/shop/views.py\tLive equivalent: web/shop/api/.", "unclassified\tweb/shop/api/x.py"])
+
+    def test_agents_cannot_edit_the_classification_file(self):
+        self.assertTrue(h.enforcement_state_denial(
+            {"agent_id": "a1", "tool_input": {"file_path": str(self.root / ".claude" / "classification.toml")}}))

@@ -563,6 +563,9 @@ def profile_markdown(cfg: dict) -> str:
     traps = [f"- {t}" for t in s.get("traps") or []]
     classes = s.get("classification") or ""
     classes = "\n".join(f"- {c}" for c in classes) if isinstance(classes, list) else classes.strip()
+    path_rules = classification_markdown()
+    if path_rules:
+        classes = f"{classes}\n\n{path_rules}".strip()
     return "\n".join([
         "# Legacy-codebase profile",
         "",
@@ -582,6 +585,185 @@ def profile_markdown(cfg: dict) -> str:
         *(traps or ["None configured."]),
         "",
     ])
+
+
+# ---------------------------------------------------------------------------
+# Path classification. An optional .claude/classification.toml maps path globs (from the project root) to a class,
+# one [<rule name>] table per rule with `class`, `paths` and `message`; the first matching rule wins, so `live` rules
+# placed first carve out exceptions. The guard hook checks every Edit/Write: `dead` and `dangerous` paths are refused
+# (a subagent is denied, the main session asks the user) unless a task in the run's tasks.json lists the path under
+# `allow_classified`; `legacy` paths get the rule's message as a warning. Scouts get the rules in profile.md and can
+# run `harness classify <path>...`. Edits made through Bash are not checked.
+# ---------------------------------------------------------------------------
+PATH_CLASSES = ("live", "legacy", "dead", "dangerous")
+BLOCKED_CLASSES = ("dead", "dangerous")
+CLASSIFICATION_REL = Path(".claude") / "classification.toml"
+FILE_EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+
+
+def _glob_re(glob: str, groups: bool = True) -> str:
+    g = (lambda r: f"({r})") if groups else (lambda r: f"(?:{r})")
+    out, i = [], 0
+    while i < len(glob):
+        if glob.startswith("**/", i):
+            out.append(g("(?:.*/)?"))
+            i += 3
+        elif glob.startswith("**", i):
+            out.append(g(".*"))
+            i += 2
+        elif glob[i] in "*?":
+            out.append(g("[^/]*" if glob[i] == "*" else "[^/]"))
+            i += 1
+        elif glob[i] == "{":
+            j = glob.find("}", i)
+            if j < 0:
+                raise ValueError(f"unclosed {{ in {glob!r}")
+            out.append(g("|".join(_glob_re(x, False) for x in glob[i + 1:j].split(","))))
+            i = j + 1
+        else:
+            out.append(re.escape(glob[i]))
+            i += 1
+    return "".join(out)
+
+
+def glob_regex(glob: str) -> re.Pattern:
+    """`*` stays in one folder, `**` crosses folders (`**/` also matches none), `?`, `{a,b}` (with globs inside);
+    a folder matches everything under it. Each top-level wildcard or brace is a group, so a message can say {1}, {2}."""
+    return re.compile("^" + _glob_re(glob.strip().rstrip("/")) + "(?:/.*)?$")
+
+
+def load_classification() -> list[dict]:
+    """The rules in file order, or [] without a file. Raises ValueError for a malformed file."""
+    path = ROOT / CLASSIFICATION_REL
+    try:
+        data = _read_toml(path)
+    except Exception as exc:
+        raise ValueError(f"{CLASSIFICATION_REL}: {exc}") from None
+    rules = []
+    for name, r in data.items():
+        where = f"{CLASSIFICATION_REL} [{name}]"
+        if not isinstance(r, dict):
+            raise ValueError(f"{CLASSIFICATION_REL}: {name!r} must be a [{name}] table")
+        if r.get("class") not in PATH_CLASSES:
+            raise ValueError(f"{where}: class must be one of {', '.join(PATH_CLASSES)}")
+        paths = r.get("paths")
+        if not isinstance(paths, list) or not paths or not all(_nonempty_str(p) for p in paths):
+            raise ValueError(f"{where}: paths must be a non-empty list of globs")
+        try:
+            regexes = [glob_regex(p) for p in paths]
+        except ValueError as exc:
+            raise ValueError(f"{where}: {exc}") from None
+        rules.append({"name": name, "class": r["class"], "paths": paths, "message": str(r.get("message") or ""),
+                      "regexes": regexes})
+    return rules
+
+
+def classify_path(rel: str, rules: list[dict]) -> tuple[dict, str] | None:
+    """(rule, message) for the first rule matching a root-relative path; {path} and {1}, {2}... filled in."""
+    for r in rules:
+        for rx in r["regexes"]:
+            m = rx.match(rel)
+            if m:
+                msg = r["message"].replace("{path}", rel)
+                for n, val in enumerate(m.groups(), 1):
+                    msg = msg.replace(f"{{{n}}}", (val or "").strip("/"))
+                return r, msg
+    return None
+
+
+def root_relative(path: str, cwd: str | None = None) -> str | None:
+    p = Path(os.path.join(cwd or str(ROOT), os.path.expanduser(path))).resolve()
+    try:
+        return p.relative_to(ROOT).as_posix()
+    except ValueError:
+        return None
+
+
+def classified_edit_allowed(rel: str, cfg: dict) -> bool:
+    """A task in the active run lists the path (root- or repo-relative glob) under `allow_classified`."""
+    rid = current_run_id()
+    if not rid:
+        return False
+    rs = repos(cfg)
+    for t in (read_json(run_dir(rid) / "tasks.json", {}) or {}).get("tasks", []):
+        names = [rel]
+        repo = rs.get(t.get("repo"))
+        if repo:
+            try:
+                names.append((ROOT / rel).relative_to(repo["abs"]).as_posix())
+            except ValueError:
+                pass
+        for g in t.get("allow_classified") or []:
+            if isinstance(g, str) and any(glob_regex(g).match(n) for n in names):
+                return True
+    return False
+
+
+def classification_hook_output(payload: dict, cfg: dict, factory: dict | None) -> dict | None:
+    """The guard hook's answer for an Edit/Write on a classified path, or None to let it through untouched."""
+    if payload.get("tool_name") not in FILE_EDIT_TOOLS:
+        return None
+    ti = payload.get("tool_input") or {}
+    target = ti.get("file_path") or ti.get("notebook_path")
+    rel = root_relative(target, payload.get("cwd")) if target else None
+    if not rel:
+        return None
+    try:
+        hit = classify_path(rel, load_classification())
+    except ValueError as exc:
+        return {"systemMessage": f"[harness] edit not checked against the path classification: {exc}"}
+    if not hit:
+        return None
+    rule, msg = hit
+    if rule["class"] == "legacy":
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext":
+                f"[harness paths] {rel} is legacy code ({rule['name']}). {msg}".strip()}}
+    if rule["class"] not in BLOCKED_CLASSES or classified_edit_allowed(rel, cfg):
+        return None
+    subagent = is_subagent(payload, factory)
+    reason = f"{rel} is {rule['class']} code ({rule['name']} in {CLASSIFICATION_REL}). {msg}".strip()
+    reason += (" If the task really needs this file, stop and report it; a /ship plan task can allow it with "
+               "`allow_classified` in tasks.json." if subagent or factory else
+               " Edit it only if the user asked for this file.")
+    decision = "deny" if subagent or factory else "ask"
+    log_event({"kind": "guard_block", "run_id": current_run_id(), "decision": decision,
+               "stage": (payload.get("agent_type") or "manager").split(":")[-1],
+               "command": f"{payload.get('tool_name')} {rel}", "reason": reason})
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision,
+                                   "permissionDecisionReason": f"[harness paths] {reason}"}}
+
+
+def classification_markdown() -> str:
+    """The classification rules for profile.md (scouts label files from them)."""
+    try:
+        rules = load_classification()
+    except ValueError as exc:
+        return f"Path rules: {exc} (tell the user)."
+    if not rules:
+        return ""
+    lines = [f"Path rules from `{CLASSIFICATION_REL}` (globs from the project root, first match wins; edits to dead "
+             f"and dangerous paths are blocked, legacy edits get a warning). `{HARNESS_SCRIPT.name} classify <path>...` "
+             "prints a file's class:"]
+    for r in rules:
+        msg = re.sub(r"\{(?:\d+|path)\}", "…", r["message"])
+        lines.append(f"- `{r['class']}` ({r['name']}): " + ", ".join(f"`{p}`" for p in r["paths"]) +
+                     (f". {msg}" if msg else ""))
+    return "\n".join(lines)
+
+
+def cmd_classify(a, cfg):
+    try:
+        rules = load_classification()
+    except ValueError as exc:
+        sys.exit(str(exc))
+    if not rules:
+        sys.exit(f"No path classification: {CLASSIFICATION_REL} is missing or empty.")
+    for path in a.paths:
+        rel = root_relative(path, os.getcwd())
+        if rel is None or not (ROOT / rel).exists() and (ROOT / path).exists():
+            rel = root_relative(path)  # a root-relative path given from another folder
+        hit = classify_path(rel, rules) if rel else None
+        print(f"{hit[0]['class']}\t{rel}\t{hit[1]}".rstrip() if hit else f"unclassified\t{rel or path}")
 
 
 TIERS = ("tiny", "standard", "large")
@@ -1392,8 +1574,8 @@ def enforcement_state_denial(payload: dict) -> str | None:
         if "/.harness/" in target and (base in PROTECTED_RUN_FILES or
                                        (base == "tasks.json" and (payload.get("agent_type") or "").endswith("engineer"))):
             return f"{base} is managed by the harness, not by agents."
-        if target.endswith(".claude/harness.toml"):
-            return "Agents don't edit the project's harness config."
+        if target.endswith(".claude/harness.toml") or target.endswith(CLASSIFICATION_REL.as_posix()):
+            return "Agents don't edit the project's harness config or path classification."
     return None
 
 
@@ -1706,6 +1888,10 @@ def hook_guard_bash(cfg):
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "deny",
             "permissionDecisionReason": f"[harness guard] {reason}"}}))
+        return
+    out = classification_hook_output(payload, cfg, factory)
+    if out:
+        print(json.dumps(out))
 
 
 def account_dir(cfg: dict, name: str | None) -> str | None:
@@ -3279,6 +3465,9 @@ def validate_plan(plan, cfg: dict) -> list[str]:
         tmc = t.get("tests_may_change")
         if tmc is not None and (not isinstance(tmc, list) or not all(_nonempty_str(x) for x in tmc)):
             errors.append(f"{who}: tests_may_change must be a list of path globs")
+        ac_paths = t.get("allow_classified")
+        if ac_paths is not None and (not isinstance(ac_paths, list) or not all(_nonempty_str(x) for x in ac_paths)):
+            errors.append(f"{who}: allow_classified must be a list of path globs")
     for tid, t in ids.items():
         for dep in t.get("depends_on") if isinstance(t.get("depends_on"), list) else []:
             if dep == tid:
@@ -5921,6 +6110,17 @@ def cmd_doctor(a, cfg):
         for key in ("decision_docs", "classification", "traps"):
             if not ship.get(key):
                 print(f"  info legacy: no [ship] {key} configured")
+    print("\nPath classification:")
+    try:
+        rules = load_classification()
+        if rules:
+            counts = collections.Counter(r["class"] for r in rules)
+            line(True, f"{CLASSIFICATION_REL}: {len(rules)} rule(s) ("
+                 + ", ".join(f"{counts[c]} {c}" for c in PATH_CLASSES if counts[c]) + ")")
+        else:
+            print(f"  info no {CLASSIFICATION_REL} (optional: blocks edits to dead code, warns on legacy edits)")
+    except ValueError as exc:
+        line(False, str(exc))
     print("\nMetrics:")
     all_lost = unattributed_agent_events(read_events())
     legacy = legacy_lost_agent_events(all_lost)
@@ -6016,6 +6216,10 @@ def main(argv=None):
     s.add_argument("--name", help="build only this entry (no index is written)")
     s.add_argument("--force", action="store_true", help="rebuild even when the file is current")
     s.set_defaults(fn=cmd_knowledge)
+
+    s = sub.add_parser("classify", help=f"print each path's class from {CLASSIFICATION_REL} (live, legacy, dead, dangerous)")
+    s.add_argument("paths", nargs="+")
+    s.set_defaults(fn=cmd_classify)
 
     s = sub.add_parser("contracts", help="build the API contract map that scouts and the planner read")
     s.add_argument("action", choices=["map"])

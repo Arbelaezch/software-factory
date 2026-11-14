@@ -94,6 +94,8 @@ risk_markers = ["auth", "permission", "password", "token", "secret", "migration"
 #   classification  how to tell live from legacy, dead or dangerous code: a list, one line per class (or a pointer
 #                   to the document where the classes are written)
 #   traps           known pitfalls the scouts look for and the reviewers check
+# Path globs mapped to live/legacy/dead/dangerous go in .claude/classification.toml instead (README): the edit hook
+# enforces them and profile.md lists them for the scouts.
 # ---------------------------------------------------------------------------
 [ship]
 profile = "standard"

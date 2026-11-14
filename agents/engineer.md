@@ -27,6 +27,11 @@ the plan's Departures; don't copy other nearby code, which may be legacy. If you
 contract change not under Contract changes, or one of the profile's known traps), stop and report that the plan is
 wrong (what, where, why it matters) instead of working around it.
 
+Path classification: the harness refuses edits to files the project classifies as dead or dangerous, unless your task
+lists them under `allow_classified`, and warns when you edit a legacy file. A refused edit means the plan is wrong:
+stop and report it, never reach the file another way (Bash, a copy). After a legacy warning, check that the task
+really belongs in that file and not in the live code the warning names; if not, report it.
+
 Rules:
 - If you exceed roughly 60 tool calls without converging, stop and report what blocks you.
 - Stay inside the task's scope. If the plan is wrong or impossible, stop and say why instead of

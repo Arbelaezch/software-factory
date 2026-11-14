@@ -207,6 +207,14 @@ terminal is logged in to. Run `python3 scripts/usage.py` (exit code 0 go, 10 pau
   (from `classification`), the live code to copy and the `traps` that apply; every plan task cites the code it
   follows and the plan lists its departures from local convention for approval; engineers stop at traps the plan
   didn't expect; reviewers check against the cited examples and the traps. With the default `"standard"`, nothing changes.
+- `.claude/classification.toml` (optional, any profile): path globs from the project root mapped to a class, one
+  `[<rule name>]` table each with `class` (`live`, `legacy`, `dead` or `dangerous`), `paths` and `message`. The first
+  matching rule wins, so `live` exceptions go above the rule they carve out. The guard hook checks every Edit/Write:
+  a `dead` or `dangerous` path is denied for subagents (the main session asks you) unless a plan task lists it under
+  `allow_classified`; a `legacy` path gets the message as a warning, where `{1}`, `{2}`... are the parts the
+  wildcards matched (e.g. `"Live equivalent: {1}/api/"`). Globs support `*`, `**`, `?` and `{a,b}`; a folder covers
+  everything under it. Scouts get the rules in profile.md, `harness classify <path>...` prints a file's class, and
+  `harness doctor` checks the file. Edits made through Bash are not checked.
 - Any section from [`scripts/defaults.toml`](scripts/defaults.toml) can be overridden, such as
   `[reviewer]`, `[models]`, `[loop]` or `[providers.*]`.
 
