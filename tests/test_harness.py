@@ -14,6 +14,9 @@ from pathlib import Path
 
 # Never touch the real phone setup: with it configured, a raised blocker would reach the real Telegram bot.
 os.environ["FACTORY_PHONE_HOME"] = tempfile.mkdtemp(prefix="phone-test-")
+# Never write run state or metrics into the real repo: a test that forgets to patch log_event would
+# otherwise append to this checkout's .harness/metrics/events.jsonl.
+os.environ["HARNESS_ROOT"] = tempfile.mkdtemp(prefix="harness-root-test-")
 _spec = importlib.util.spec_from_file_location("harness", Path(__file__).parent.parent / "scripts" / "harness.py")
 h = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(h)
