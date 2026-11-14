@@ -147,13 +147,28 @@ source ~/code/software-factory/scripts/claude-accounts.sh
 ```
 
 Plain `claude` then starts with the account the project asks for in `.claude/harness.toml`
-(`[accounts] claude = "work"` or `"personal"`). Each account keeps its own config directory and login
-(set under `[accounts.dirs]` in `scripts/defaults.toml`). `claude-work`, `claude-personal` and
-`claude-as <name>` force a specific one. To install the plugin for a second account, prefix the install
-commands with `CLAUDE_CONFIG_DIR=~/.claude-personal`.
+(`[accounts] claude = "work"` or `"personal"`). Each account has its own config directory, set under
+`[accounts.dirs]` in `scripts/defaults.toml`: personal is the default `~/.claude`, work is `~/.claude-work`.
+Each directory keeps its own login, so a work session and a personal session can be open at once and
+`/login` in one never changes the other. `claude-work`, `claude-personal` and `claude-as <name>` force a
+specific one.
 
-The wrapper only applies to `claude` started from a terminal. The desktop app and IDE extensions use
-whatever account they're signed into, and the session-start hook warns if that doesn't match.
+Setting up the work account once:
+
+1. `claude-work`, then `/login` with the work account. `/status` shows which email a session uses.
+2. `harness accounts sync` copies the shared user settings (hooks, including the GitHub guard, statusline,
+   permissions, notifications; the list is `[accounts] shared_settings`) from `~/.claude/settings.json` to
+   the other account directories. Run it again after changing `~/.claude/settings.json`.
+3. Install the plugin for that account: prefix the install commands with `CLAUDE_CONFIG_DIR=~/.claude-work`.
+   Plugin installs are per directory, so updates have to be run in each one too.
+
+`harness accounts` lists every account with its directory, signed-in email and settings drift, and
+`harness doctor` does the same for the project's account (plus whether the plugin is installed for it).
+Both warn when two directories are signed in to the same account.
+
+The wrapper only applies to `claude` started from a terminal. The desktop app, IDE extensions and folders
+without a harness config always use `~/.claude`, so they are always on the personal account. The
+session-start hook warns when a session is on a different account than its project asks for.
 </details>
 
 <details>
@@ -189,10 +204,12 @@ the statusline command has to be set. This is a local setting, not part of the p
 }
 ```
 
-(Use the full path if `~` is not expanded.) The snapshot is saved to `~/.claude/statusline-latest.json` and
-only updates while a Claude Code session is open. When it is missing or older than 5 minutes,
-`usage.py` takes a fresh reading with a one-turn headless run instead. It reports the account the
-terminal is logged in to. Run `python3 scripts/usage.py` (exit code 0 go, 10 pause, 2 unknown;
+(Use the full path if `~` is not expanded.) The snapshot is saved to `statusline-latest.json` in the
+session's config directory (`~/.claude`, or the account's directory with multiple accounts), so each
+account has its own, and it only updates while a Claude Code session on that account is open. When it is
+missing or older than 5 minutes, `usage.py` takes a fresh reading with a one-turn headless run on the same
+account instead. `usage.py` reads `$CLAUDE_CONFIG_DIR` (else `~/.claude`), or `--config-dir`; the factory
+always checks the project's account. Run `python3 scripts/usage.py` (exit code 0 go, 10 pause, 2 unknown;
 `--json` for details). See [`docs/factory-design.md`](docs/factory-design.md) for how it fits the planned factory.
 </details>
 
