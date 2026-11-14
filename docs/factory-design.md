@@ -221,7 +221,9 @@ Phone access (decided 2026/11/14, issue #9)
   matched by the message it replies to.
 - The bridge is a small long-polling process (outgoing HTTPS only, so it works from any network). `factory run`
   and every blocker start it if it isn't running; it exits after 30 minutes with no supervisor running and nothing
-  waiting on me. `harness phone serve --forever` keeps it up (for a launchd agent).
+  waiting on me. While a blocker waits it holds `caffeinate -i`, because the supervisor stops (and lets the Mac
+  sleep) once every queued issue is blocked; an idle Mac still sleeps, and a closed lid on battery still sleeps.
+  `harness phone serve --forever` keeps it up (for a launchd agent).
 - A tap or a reply goes to a short Sonnet session in that project, under the project's Claude account, allowed only
   `harness factory decide|queue|start|status` and file reads. It records the answer and re-queues the issue the way
   `/factory` does (starting the supervisor if it has stopped), or answers a follow-up question from the run's files.

@@ -241,6 +241,33 @@ class HousekeepingTests(PhoneTestCase):
         self.assertEqual(ph._read("pending.json", {})[pid]["state"], "open")
         self.assertTrue(self.bridge.busy_projects())
 
+    def test_keeps_the_mac_awake_only_while_something_waits(self):
+        procs = []
+
+        def start():
+            procs.append(mock.Mock(**{"poll.return_value": None}))
+            return procs[-1]
+
+        awake = ph.KeepAwake(start)
+        self.assertFalse(self.bridge.waiting())
+        pid, _ = self.block()
+        self.assertTrue(self.bridge.waiting())
+        awake.set(self.bridge.waiting())
+        awake.set(self.bridge.waiting())
+        self.assertEqual(len(procs), 1)  # held, not restarted
+        self.replies = ["RESOLVED\nRecorded."]
+        self.tap(pid, 1)
+        awake.set(self.bridge.waiting())
+        procs[0].terminate.assert_called_once()
+        self.assertIsNone(awake.proc)
+
+    def test_a_dead_caffeinate_is_restarted(self):
+        procs = [mock.Mock(**{"poll.return_value": 0}), mock.Mock(**{"poll.return_value": None})]
+        awake = ph.KeepAwake(lambda: procs.pop(0))
+        awake.set(True)
+        awake.set(True)
+        self.assertEqual(procs, [])
+
     def test_parse_reply(self):
         self.assertEqual(ph.parse_reply("RESOLVED\nRecorded."), (True, "Recorded."))
         self.assertEqual(ph.parse_reply("\nopen\nWhich test?"), (False, "Which test?"))

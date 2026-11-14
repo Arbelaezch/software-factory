@@ -23,6 +23,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -485,10 +486,36 @@ class Bridge:
             except TelegramError:
                 pass
 
+    def waiting(self) -> bool:
+        """Something is waiting on the user, or an answer is being worked on."""
+        return bool(self.busy) or any(v["state"] == "open" for v in _read("pending.json", {}).values())
+
     def busy_projects(self) -> bool:
-        if any(v["state"] == "open" for v in _read("pending.json", {}).values()):
-            return True
-        return any(supervisor_running(r) for r in _read("projects.json", {}))
+        return self.waiting() or any(supervisor_running(r) for r in _read("projects.json", {}))
+
+
+class KeepAwake:
+    """Holds `caffeinate -i` while something waits on the user. A supervisor keeps the Mac awake only while it runs,
+    and it stops once every queued issue is blocked; without this the Mac would sleep on the answer. Released as soon
+    as nothing waits, so an idle Mac still sleeps. `-w` ties it to the bridge, so it never outlives it."""
+
+    def __init__(self, start: Callable[[], subprocess.Popen | None] | None = None):
+        self.start = start or self._caffeinate
+        self.proc = None
+
+    @staticmethod
+    def _caffeinate():
+        if not shutil.which("caffeinate"):
+            return None
+        return subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def set(self, on: bool) -> None:
+        if on and (self.proc is None or self.proc.poll() is not None):
+            self.proc = self.start()
+        elif not on and self.proc is not None:
+            self.proc.terminate()
+            self.proc = None
 
 
 HELP = ("I pass the factory's questions and blockers to you.\n"
@@ -512,7 +539,8 @@ def serve(bot: Bot | None = None, forever: bool = False) -> None:
     bridge = Bridge(bot or Bot(cfg))
     state = _read("state.json", {})
     offset = state.get("offset")
-    last_busy = last_prune = time.time()
+    last_busy, last_prune = time.time(), 0.0
+    awake = KeepAwake()
     print(f"{iso()} bridge started (pid {os.getpid()})", flush=True)
     try:
         while True:
@@ -534,12 +562,14 @@ def serve(bot: Bot | None = None, forever: bool = False) -> None:
             if now - last_prune > PRUNE_EVERY:
                 last_prune = now
                 bridge.prune()
-                if bridge.busy_projects() or bridge.busy:
+                awake.set(bridge.waiting())
+                if bridge.busy_projects():
                     last_busy = now
                 elif not forever and now - last_busy > IDLE_EXIT:
                     print(f"{iso()} idle, exiting", flush=True)
                     return
     finally:
+        awake.set(False)
         (HOME / "bridge.json").unlink(missing_ok=True)
 
 
