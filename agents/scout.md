@@ -32,7 +32,9 @@ Cite facts from them as `<knowledge file>: <name>` so the planner doesn't look t
 Legacy profile: if `<run_dir>/profile.md` exists, read it first. In this codebase the nearest code is often a pattern
 to avoid, so the report changes in three places:
 - Under Relevant files, start each line with the file's class from the profile's classification (e.g. `[live]`,
-  `[legacy]`, `[dead]`), and list the contracts it touches (from the contract map, if given).
+  `[legacy]`, `[dead]`), and list the contracts it touches (from the contract map, if given). When the profile has
+  path rules, take the class from them (`harness classify <path>...` prints it for several files at once); edits to
+  dead and dangerous paths are blocked, so say so for any the task seems to need.
 - Under Conventions to follow, give **Code to copy**: for each kind of change, one example from live code
   (`path:line-range`) with a one-line reason it is the right example. Never a legacy, dead or dangerous file; when
   the nearest code is one, say so and point to the live example instead.
