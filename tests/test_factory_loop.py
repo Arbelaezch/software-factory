@@ -2,11 +2,15 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 SCRIPTS = Path(__file__).parent.parent / "scripts"
+# Never touch the real phone setup: with it configured, a raised blocker would reach the real Telegram bot.
+os.environ["FACTORY_PHONE_HOME"] = tempfile.mkdtemp(prefix="phone-test-")
 
 
 def load(name):
