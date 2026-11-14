@@ -1277,8 +1277,10 @@ _SUBST_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
 
 
 def _balanced(text: str, i: int) -> tuple[str, int]:
-    """Text of a `$( ... )` whose body starts at i, and the index after its `)`."""
+    """Text of a `$( ... )` whose body starts at i, and the index after its `)`. Heredoc bodies inside it are skipped,
+    so an apostrophe in one doesn't look like an open quote."""
     depth, quote, j = 1, None, i
+    pending: list[tuple[bool, str]] = []  # heredocs opened on the current line: (strip tabs, delimiter)
     while j < len(text):
         c = text[j]
         if quote:
@@ -1288,6 +1290,22 @@ def _balanced(text: str, i: int) -> tuple[str, int]:
                 quote = None
         elif c in "'\"":
             quote = c
+        elif text.startswith("<<", j) and not text.startswith("<<<", j) and _HEREDOC_RE.match(text, j):
+            m = _HEREDOC_RE.match(text, j)
+            pending.append((m.group(1) == "-", next(g for g in (m.group(2), m.group(3), m.group(5)) if g is not None)))
+            j = m.end()
+            continue
+        elif c == "\n" and pending:
+            j += 1
+            for strip_tabs, delim in pending:
+                while j < len(text):
+                    e = text.find("\n", j)
+                    e = len(text) if e < 0 else e
+                    line, j = text[j:e], e + 1
+                    if (line.lstrip("\t") if strip_tabs else line) == delim:
+                        break
+            pending.clear()
+            continue
         elif c == "(":
             depth += 1
         elif c == ")":
@@ -1298,21 +1316,25 @@ def _balanced(text: str, i: int) -> tuple[str, int]:
     raise ValueError("unbalanced $(")
 
 
-def _scan(command: str) -> tuple[list[str], list[str]]:
-    """Split a shell command into segment texts on operators outside quotes and heredoc bodies. Also returns the
-    bodies of command substitutions ($(...), backticks), which run even inside double quotes or an unquoted heredoc.
-    Raises ValueError when quoting is unbalanced."""
-    segs: list[str] = []
+def _scan(command: str) -> tuple[list[tuple[str, str | None]], list[str]]:
+    """Split a shell command into (segment text, operator before it) on operators outside quotes and heredoc bodies.
+    Also returns the bodies of command substitutions ($(...), backticks), which run even inside double quotes or an
+    unquoted heredoc. Raises ValueError when quoting is unbalanced."""
+    segs: list[tuple[str, str | None]] = []
     subs: list[str] = []
     buf: list[str] = []
     pending: list[tuple[bool, bool, str]] = []  # heredocs opened on the current line: (strip tabs, literal, delimiter)
     quote, i, n = None, 0, len(command)
+    op: list[str | None] = [None]  # the operator since the last segment
 
-    def flush():
+    def flush(new_op: str | None = None):
         text = "".join(buf).strip()
         buf.clear()
         if text:
-            segs.append(text)
+            segs.append((text, op[0]))
+            op[0] = None
+        if new_op and not (new_op == "\n" and op[0]):  # `a &&<newline>b` is still `&&`
+            op[0] = new_op
 
     while i < n:
         c = command[i]
@@ -1357,7 +1379,7 @@ def _scan(command: str) -> tuple[list[str], list[str]]:
             buf.append(m.group(0))
             i = m.end()
         elif c == "\n":
-            flush()
+            flush("\n")
             i += 1
             for strip_tabs, literal, delim in pending:
                 body = []
@@ -1374,21 +1396,24 @@ def _scan(command: str) -> tuple[list[str], list[str]]:
                         subs.append(m.group(1) or m.group(2) or "")
             pending.clear()
         elif command.startswith("$(", i):
-            flush()
+            flush(";")
             inner, i = _balanced(command, i + 2)
             subs.append(inner)
         elif c == "`":
-            flush()
+            flush(";")
             j = command.find("`", i + 1)
             if j < 0:
                 raise ValueError("unbalanced backtick")
             subs.append(command[i + 1:j])
             i = j + 1
         elif command.startswith(("&&", "||"), i):
-            flush()
+            flush(command[i:i + 2])
             i += 2
+        elif c == "&" and (command.startswith(("<", ">"), i - 1) or command.startswith(">", i + 1)):
+            buf.append(c)  # a redirect (2>&1, &>file), not an operator
+            i += 1
         elif c in ";|&()":
-            flush()
+            flush(c)
             i += 1
         else:
             buf.append(c)
@@ -1403,13 +1428,23 @@ def parse_command(command: str, depth: int = 0) -> tuple[list[list[str]], list[s
     """(argv list for every command that would run, env-assignment tokens). Quoted text and heredoc bodies are data,
     not commands; `bash -c '...'`, `eval` and command substitutions are parsed too. Fails closed: if the quoting
     can't be parsed it falls back to splitting on every operator, so nothing is hidden."""
+    segs, env, _ = _parse(command, depth)
+    return segs, env
+
+
+def _parse(command: str, depth: int = 0) -> tuple[list[list[str]], list[str], list[bool]]:
+    """parse_command, plus for each segment whether it runs only if the one before it succeeded (joined by `&&`
+    alone). Segments from substitutions, `bash -c` and the fallback split never count as joined."""
     try:
         texts, subs = _scan(command)
     except ValueError:
-        texts, subs = [p for p in re.split(r"&&|\|\||;|\||\n|\$\(|`|\(|\)", command)], []
+        texts, subs = [(p, None) for p in re.split(r"&&|\|\||;|\||\n|\$\(|`|\(|\)", command)], []
     segs: list[list[str]] = []
     env: list[str] = []
-    for part in texts:
+    joined: list[bool] = []
+    linked = True  # every operator since the last recorded segment was `&&`
+    for part, op in texts:
+        linked = linked and op == "&&"
         part = part.strip()
         if not part:
             continue
@@ -1426,6 +1461,8 @@ def parse_command(command: str, depth: int = 0) -> tuple[list[list[str]], list[s
         if toks[0] == "export":
             env.extend(toks[1:])
         segs.append(toks)
+        joined.append(linked)
+        linked = True
         inner = None
         if Path(toks[0]).name in SHELLS and depth < 5:
             flag = next((k for k, t in enumerate(toks[1:], 1) if re.match(r"^-[a-z]*c[a-z]*$", t)), None)
@@ -1438,11 +1475,18 @@ def parse_command(command: str, depth: int = 0) -> tuple[list[list[str]], list[s
             more_segs, more_env = parse_command(sub, depth + 1)
             segs.extend(more_segs)
             env.extend(more_env)
-    return segs, env
+            joined.extend([False] * len(more_segs))
+    return segs, env, joined
 
 
 def split_segments(command: str) -> list[list[str]]:
     return parse_command(command)[0]
+
+
+def chain_segments(command: str) -> list[tuple[list[str], bool]]:
+    """(argv, joined) for every command that would run; joined = it runs only if the previous one succeeded."""
+    segs, _, joined = _parse(command)
+    return list(zip(segs, joined))
 
 
 def env_overrides(command: str) -> str:
@@ -1691,7 +1735,8 @@ def github_account_state(command: str, cfg: dict) -> tuple[str | None, str]:
 
 
 def subagent_denial(what: str) -> str:
-    return f"`{what}` is blocked for subagents. Only the main session can do this, and only as a [github].write_accounts account."
+    return (f"`{what}` is blocked for subagents. Only the main session can do this, and only as a [github].write_accounts "
+            "account." + SUBAGENT_NO_RETRY)
 
 
 def writer_denial(command: str, cfg: dict, what: str) -> str | None:
@@ -1714,11 +1759,79 @@ def any_account_denial(command: str, cfg: dict, what: str) -> str | None:
     return None
 
 
+NO_RETRY = " It's blocked however it's written, so don't retry it another way: ask the user to do it."
+SUBAGENT_NO_RETRY = " Don't retry it another way; say what you needed in your report."
+UNKNOWN_BRANCH = "?"  # a switch whose target can't be told (never a valid branch name)
+
+
+def switched_to(sub: str, args: list[str], target: str | None) -> str | None:
+    """The branch a `git switch` / `git checkout` moves target to: its name, "" for a detached HEAD, UNKNOWN_BRANCH
+    when it can't be told, or None when the command doesn't change branch."""
+    if sub not in ("switch", "checkout"):
+        return None
+    for k, a in enumerate(args):
+        if a in ("-c", "-C", "--create", "--force-create", "-b", "-B", "--orphan"):
+            return args[k + 1] if k + 1 < len(args) else UNKNOWN_BRANCH
+        if a.startswith(("--create=", "--force-create=", "--orphan=")):
+            return a.split("=", 1)[1]
+    if "--detach" in args or (sub == "switch" and "-d" in args):
+        return ""
+    names = [a for a in args if not a.startswith("-") and not re.search(r"[<>]", a)]
+    if len(names) != 1:
+        return None if names or sub == "checkout" else UNKNOWN_BRANCH  # `checkout <tree> <path>` keeps the branch
+    name = names[0]
+    if name == "-" or not target:
+        return UNKNOWN_BRANCH
+    if run_cmd(["git", "-C", target, "show-ref", "--verify", "--quiet", f"refs/heads/{name}"]).returncode == 0:
+        return name
+    remote = run_cmd(["git", "-C", target, "for-each-ref", "--format=%(refname)", f"refs/remotes/*/{name}"])
+    return name if remote.returncode == 0 and remote.stdout.strip() else UNKNOWN_BRANCH  # not a branch: a path
+
+
+class ChainBranches:
+    """The branch each repo is on when a later step of one command runs. The guard checks a command before any of it
+    runs, so it follows `git switch` / `git checkout` steps, but only while every step after them is joined with `&&`
+    (after `;`, `||` or a pipe the switch may have failed, so the real branch counts again)."""
+
+    def __init__(self):
+        self.moved: dict[str | None, str] = {}
+        self.saw_switch = False
+
+    def step(self, joined: bool) -> None:
+        if not joined:
+            self.moved.clear()
+
+    def branch(self, target: str | None) -> str | None:
+        k = os.path.realpath(target) if target else None
+        return self.moved[k] if k in self.moved else current_branch(target)
+
+    def followed(self, target: str | None) -> bool:
+        return (os.path.realpath(target) if target else None) in self.moved
+
+    def record(self, sub: str, args: list[str], target: str | None) -> None:
+        to = switched_to(sub, args, target)
+        if to is not None:
+            self.saw_switch = True
+            self.moved[os.path.realpath(target) if target else None] = to
+
+
+def protected_denial(sub: str, br: str, chain: ChainBranches, target: str | None) -> str:
+    if br == UNKNOWN_BRANCH:
+        return (f"Refusing `git {sub}`: the guard can't tell which branch the earlier `git switch` / `git checkout` in "
+                "this command moves to. Run the switch as its own command first.")
+    fix = "Run `harness branch` first." if current_run_id() else "Create a feature branch first (`git switch -c <name>`)."
+    note = ("" if not chain.saw_switch or chain.followed(target) else
+            " The guard checks the branch before the command runs, so an earlier branch switch only counts when every "
+            "step after it is joined with `&&` (not `;`, `||` or a pipe). Otherwise run the switch as its own command.")
+    return f"Refusing `git {sub}` on protected branch '{br}'. {fix}{note}"
+
+
 def push_denial(command: str, args: list[str], cfg: dict, target: str | None, subagent: bool = False,
-                factory: dict | None = None) -> str | None:
+                factory: dict | None = None, branch=None) -> str | None:
     """`git push` runs only in the main session, as a [github].write_accounts account, and never as a force
     push, a branch/tag deletion, a mirror push or a push to a protected branch. In factory mode a ci-fixer or
-    conflict-resolver may also push its PR branch (still as a writer account)."""
+    conflict-resolver may also push its PR branch (still as a writer account). `branch(target)` gives the branch
+    the push runs on (see ChainBranches)."""
     if subagent and not (factory and within(target, factory["marker"]["project"])
                          and factory_push_ok(args, target, factory)):
         return subagent_denial("git push")
@@ -1727,18 +1840,21 @@ def push_denial(command: str, args: list[str], cfg: dict, target: str | None, su
     for a in args:
         if a in ("--force", "--mirror", "--delete", "--prune") or a.startswith("--force-with-lease") or \
                 a == "--force-if-includes" or (not a.startswith("--") and a.startswith("-") and set(a[1:]) & {"f", "d"}):
-            return f"`git push {a}` is blocked: force pushes, deletions and mirror pushes aren't allowed."
+            return f"`git push {a}` is blocked: force pushes, deletions and mirror pushes aren't allowed." + NO_RETRY
     refspecs = positional[1:]  # first positional is the remote
-    if not refspecs:
-        br = current_branch(target)
-        refspecs = [br] if br else []
+    if not refspecs or "HEAD" in refspecs:
+        br = (branch or current_branch)(target)
+        if br == UNKNOWN_BRANCH:
+            return ("Refusing `git push`: the guard can't tell which branch the earlier `git switch` / `git checkout` "
+                    "in this command moves to. Run the switch as its own command first, or name the branch to push.")
+        refspecs = [(br or r) if r == "HEAD" else r for r in refspecs] or ([br] if br else [])
     for ref in refspecs:
         if ref.startswith("+"):
-            return "Force pushes (`+refspec`) are blocked."
+            return "Force pushes (`+refspec`) are blocked." + NO_RETRY
         if ref.startswith(":"):
-            return "Deleting remote branches via `git push` is blocked."
+            return "Deleting remote branches via `git push` is blocked." + NO_RETRY
         dst = ref.split(":", 1)[-1].removeprefix("refs/heads/")
-        if dst in protected or dst == "HEAD" and current_branch(target) in protected:
+        if dst in protected:
             return f"Refusing to push to protected branch '{dst}'."
     return writer_denial(command, cfg, "git push")
 
@@ -1761,7 +1877,7 @@ def gh_denial(toks: list[str], command: str, cfg: dict, subagent: bool, strict: 
     if pair == ("auth", "switch"):
         return "`gh auth switch` is blocked: the GitHub identity can't be changed from inside a session."
     if pair in GH_NEVER:
-        return None if (pair[0] == "repo" and not strict) else f"`{what}` is blocked: the harness never deletes or transfers issues or changes repos."
+        return None if (pair[0] == "repo" and not strict) else f"`{what}` is blocked: the harness never deletes or transfers issues or changes repos." + NO_RETRY
     if pair in GH_ANY_ACCOUNT:
         return subagent_denial(what) if subagent else any_account_denial(command, cfg, what)
     if pair in GH_WRITER_ONLY:
@@ -1789,7 +1905,9 @@ def check_bash(command: str, cfg: dict, cwd: str | None = None, subagent: bool =
     mode = gcfg.get("mode", "uncommitted")
     protected = set(gcfg.get("protected_branches", []))
     workdir = cwd
-    for toks in split_segments(command):
+    chain = ChainBranches()
+    for toks, joined in chain_segments(command):
+        chain.step(joined)
         if toks[0] == "cd" and len(toks) > 1:
             workdir = toks[1] if os.path.isabs(toks[1]) else os.path.join(workdir or ".", toks[1])
             continue
@@ -1808,49 +1926,50 @@ def check_bash(command: str, cfg: dict, cwd: str | None = None, subagent: bool =
             if denial:
                 return denial
         if sub == "remote" and args and args[0] in ("add", "remove", "rm", "rename", "set-url", "set-head"):
-            return "Changing git remotes is blocked."
+            return "Changing git remotes is blocked." + NO_RETRY
         if sub == "push":
-            denial = push_denial(command, args, cfg, target, subagent, factory)
+            denial = push_denial(command, args, cfg, target, subagent, factory, chain.branch)
             if denial:
                 return denial
             continue
         if sub in ALWAYS_BLOCKED and ALWAYS_BLOCKED[sub]:
-            return f"`git {sub}` is blocked by the harness. {ALWAYS_BLOCKED[sub]}"
+            return f"`git {sub}` is blocked by the harness. {ALWAYS_BLOCKED[sub]}" + NO_RETRY
         if sub == "reset" and ("--hard" in args or "--merge" in args or "--keep" in args):
-            return "`git reset --hard` discards work and is blocked."
+            return "`git reset --hard` discards work and is blocked." + NO_RETRY
         if sub == "restore" and "--staged" not in args:
-            return "`git restore` discards working-tree changes and is blocked."
+            return "`git restore` discards working-tree changes and is blocked." + NO_RETRY
         if sub in ("checkout", "switch"):
             creating = any(x in args for x in ("-b", "-B", "-c", "-C", "--create", "--orphan"))
             if "--" in args or "." in args:
-                return "`git checkout -- <path>` discards changes and is blocked."
+                return "`git checkout -- <path>` discards changes and is blocked." + NO_RETRY
             if subagent and not creating:
                 return (f"`git {sub}` between branches is blocked for subagents "
-                        "(branches are managed by `harness branch`).")
+                        "(branches are managed by `harness branch`)." + SUBAGENT_NO_RETRY)
         if sub == "branch" and any(x in args for x in ("-D", "-d", "--delete", "-m", "-M", "--force", "-f")):
-            return "Deleting, renaming or forcing branches is blocked."
+            return "Deleting, renaming or forcing branches is blocked." + NO_RETRY
         if sub == "tag" and args and not args[0].startswith("-l") and args[0] not in ("--list",):
             if subagent or args[0] in ("-d", "--delete"):
-                return "Deleting tags, or creating them from a subagent, is blocked."
+                return "Deleting tags, or creating them from a subagent, is blocked." + (SUBAGENT_NO_RETRY if subagent else NO_RETRY)
         if sub == "commit" and ("--amend" in args):
-            return "`git commit --amend` rewrites history and is blocked."
+            return "`git commit --amend` rewrites history and is blocked." + NO_RETRY
         if subagent:
             if sub == "pull":
-                return f"`git pull` is blocked for subagents. {SUBAGENT_BLOCKED['pull']}"
+                return f"`git pull` is blocked for subagents. {SUBAGENT_BLOCKED['pull']}" + SUBAGENT_NO_RETRY
             if sub == "stash":
-                return f"`git stash` is blocked for subagents. {SUBAGENT_BLOCKED['stash']}"
+                return f"`git stash` is blocked for subagents. {SUBAGENT_BLOCKED['stash']}" + SUBAGENT_NO_RETRY
             if sub in ("commit", "add", "merge") and factory_commit_ok(sub, args, target, factory):
                 pass  # factory engineer/resolver on its own branch; the account check below still applies
             elif sub in GIT_WRITER_ONLY and (mode != "commit" or sub not in ("commit", "add")):
                 hint = " (Set git.mode = \"commit\" in `.claude/harness.toml` to let the engineer commit.)" if sub in ("commit", "add") else ""
-                return f"`git {sub}` is blocked for subagents. {SUBAGENT_BLOCKED[sub]}{hint}"
+                return f"`git {sub}` is blocked for subagents. {SUBAGENT_BLOCKED[sub]}{hint}" + SUBAGENT_NO_RETRY
         if sub in GIT_WRITER_ONLY:
-            br = current_branch(target)
-            if br and br in protected:
-                return f"Refusing `git {sub}` on protected branch '{br}'. Run `harness branch` first."
+            br = chain.branch(target)
+            if br == UNKNOWN_BRANCH or br and br in protected:
+                return protected_denial(sub, br, chain, target)
         denial = git_writer_denial(sub, args, command, cfg)
         if denial:
             return denial
+        chain.record(sub, args, target)
     return None
 
 
@@ -1859,7 +1978,9 @@ def check_github_global(command: str, cfg: dict, cwd: str | None = None, subagen
     """Hard stop for every project (also ones without a harness config): the account rules for push, commit,
     merge, tag and PR/issue writes, via git, gh or `gh api`."""
     workdir = cwd
-    for toks in split_segments(command):
+    chain = ChainBranches()
+    for toks, joined in chain_segments(command):
+        chain.step(joined)
         if toks[0] == "cd" and len(toks) > 1:
             workdir = toks[1] if os.path.isabs(toks[1]) else os.path.join(workdir or ".", toks[1])
             continue
@@ -1868,15 +1989,16 @@ def check_github_global(command: str, cfg: dict, cwd: str | None = None, subagen
             denial = factory_git_denial(toks, sub, args)
             if denial:
                 return denial
+        target = cdir if cdir and os.path.isabs(cdir) else (os.path.join(workdir or ".", cdir) if cdir else workdir)
         if sub == "push":
-            target = cdir if cdir and os.path.isabs(cdir) else (os.path.join(workdir or ".", cdir) if cdir else workdir)
-            denial = push_denial(command, args, cfg, target, subagent, factory)
+            denial = push_denial(command, args, cfg, target, subagent, factory, chain.branch)
             if denial:
                 return denial
         elif sub:
             denial = git_writer_denial(sub, args, command, cfg)
             if denial:
                 return denial
+            chain.record(sub, args, target)
         if Path(toks[0]).name == "gh":
             denial = gh_denial(toks, command, cfg, subagent, strict=False)
             if denial:

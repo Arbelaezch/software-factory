@@ -88,6 +88,10 @@ which keeps its context small over long runs.
   - **Always blocked:** history rewrites, force/deleting/mirror pushes, pushes or commits on protected
     branches, `gh auth switch`, token/host overrides, an unknown gh identity, and deleting repos or issues.
 
+  The guard checks a command before any of it runs. In `git switch -c x && git add f && git commit ...` it
+  follows the switch, because each step runs only if the previous one succeeded; after `;`, `||` or a pipe
+  it checks the branch the repo is really on, so run the switch as its own command.
+
   It supports an `uncommitted` mode and a `commit` mode per project; the mode only governs subagents.
 - **Pluggable outside reviewer.** Any OpenAI-compatible chat API works (DeepSeek, Z.ai GLM, OpenRouter).
   Cost tracking includes peak/off-peak pricing windows.
