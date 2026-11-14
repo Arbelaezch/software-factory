@@ -4892,11 +4892,12 @@ class TerminalChannel(Channel):
 
 
 class PushChannel(Channel):
-    """Scaffolding only (design section 7, 'Phone access'): phone push does not arrive yet."""
+    """The phone, through the Telegram bot set up with `harness phone setup` (scripts/phone.py). Blockers raised by the
+    factory go there with answer buttons through phone_blocker(); this sends plain text."""
     name = "push"
 
     def send(self, text: str) -> None:
-        raise NotImplementedError("the push channel is not built yet; use terminal")
+        phone_module().send_text(text, str(ROOT))
 
 
 CHANNELS: dict[str, type[Channel]] = {c.name: c for c in (TerminalChannel, PushChannel)}
@@ -4912,8 +4913,8 @@ def notify(text: str, channels: tuple[str, ...] = ("terminal",)) -> None:
         try:
             CHANNELS[name]().send(text)
             sent_terminal = sent_terminal or name == "terminal"
-        except NotImplementedError as exc:
-            print(f"[notify] {exc}", file=sys.stderr)
+        except Exception as exc:  # a broken channel must never stop the factory or lose the message
+            print(f"[notify] {name}: {exc}", file=sys.stderr)
     if not sent_terminal:
         TerminalChannel().send(text)
 
@@ -5288,10 +5289,52 @@ def cmd_factory_watch(a, cfg):
         lock.unlink(missing_ok=True)
 
 
+def phone_module():
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import phone
+    return phone
+
+
+def phone_enabled(cfg) -> bool:
+    return bool((cfg.get("factory") or {}).get("phone", True)) and phone_module().configured()
+
+
+def project_claude_dir(cfg) -> str | None:
+    """The Claude config dir the bridge answers this project with: the pinned account's, else this process's."""
+    name = (cfg.get("accounts") or {}).get("claude")
+    return account_dir(cfg, name) if name else os.environ.get("CLAUDE_CONFIG_DIR")
+
+
+def phone_start(cfg) -> None:
+    """Give the project its topic and make sure the bridge runs, so `status` from the phone works during a run."""
+    try:
+        if phone_enabled(cfg):
+            ph = phone_module()
+            ph.register_project(str(ROOT), (cfg.get("project") or {}).get("name") or ROOT.name, project_claude_dir(cfg))
+            ph.ensure_bridge()
+    except Exception as exc:  # the phone is optional; the factory runs without it
+        print(f"[phone] {exc}", file=sys.stderr)
+
+
+def phone_blocker(cfg, project, kind, issue, text, need, options, recommended) -> None:
+    """Send a QUESTION or BLOCKER to the phone with answer buttons. Never fails the caller: the terminal and the
+    issue comment already have the message."""
+    try:
+        if kind == "DONE" or not phone_enabled(cfg):
+            return
+        ph = phone_module()
+        ph.send_blocker(str(ROOT), project, issue, kind, text, need, options, recommended, project_claude_dir(cfg))
+        ph.ensure_bridge()
+    except Exception as exc:
+        print(f"[phone] {exc}", file=sys.stderr)
+        factory_log({"kind": "phone_failed", "issue": issue, "error": str(exc)[:200]})
+
+
 def factory_raise_blocker(cfg, slug, kind, issue, situation, need, options=None, recommended=None, detail=""):
     project = (cfg.get("project") or {}).get("name") or ROOT.name
     text = format_message(kind, project, issue if issue is not None else "", situation, need, options, recommended, detail)
     notify(text)
+    phone_blocker(cfg, project, kind, issue, text, need, options, recommended)
     if issue is not None and slug:
         factory_comment(slug, issue, f"```\n{text}\n```")
     factory_log({"kind": "message", "message_kind": kind, "issue": issue, "text": " ".join(situation.split())[:140]})
@@ -5660,6 +5703,7 @@ def cmd_factory_run(a, cfg):
         print(f"{len(pool)} issue(s) could run now: " + (", ".join(f"#{p['number']} {p['title']}" for p in pool) or "none"))
         return
     acquire_supervisor(a.issues or [])
+    phone_start(cfg)
     why = "error"
     try:
         ensure_labels(slug, set(FACTORY_LABELS))
@@ -6010,6 +6054,45 @@ def set_toml_key(path: Path, section: str, key: str, value: str) -> None:
 
 
 # --------------------------------------------------------------------------- doctor
+def cmd_phone(a, cfg):
+    """Set up and look after the phone channel (scripts/phone.py). Machine-wide: one bot for every project."""
+    ph = phone_module()
+    if a.action == "setup":
+        token = a.token or os.environ.get("TELEGRAM_BOT_TOKEN")
+        if not token:
+            sys.exit("pass the token from @BotFather: harness phone setup --token <token> (or set TELEGRAM_BOT_TOKEN)")
+        cfg_ = ph.setup(token, a.wait)
+        print(f"saved to {ph.HOME / 'config.json'}. Topics per project: {'on' if cfg_['topics'] else 'off'}")
+        return
+    if a.action == "serve":
+        ph.serve(forever=a.forever)
+        return
+    conf = ph.load_config()
+    if not conf:
+        sys.exit("the phone is not set up: create a bot with @BotFather, then run `harness phone setup --token <token>`")
+    if a.action == "test":
+        root = str(ROOT) if CONFIGURED else None
+        if root:
+            ph.register_project(root, (cfg.get("project") or {}).get("name") or ROOT.name, project_claude_dir(cfg))
+        ph.send_text(f"Test from the factory on {os.uname().nodename}" + (f" ({ROOT.name})" if root else ""), root)
+        ph.ensure_bridge()
+        print("sent")
+    elif a.action == "stop":
+        pid = ph.bridge_pid()
+        if pid:
+            os.kill(pid, signal.SIGTERM)
+        print("bridge stopped" if pid else "no bridge is running")
+    else:  # status
+        pid = ph.bridge_pid()
+        topics = "on" if conf.get("topics") else f"off ({conf.get('topics_error') or 'not enabled for the bot'})"
+        print(f"bot: @{conf.get('bot')}  topics: {topics}\nbridge: {f'running (pid {pid})' if pid else 'not running'}")
+        for root, e in ph._read("projects.json", {}).items():
+            print(f"  {e['name']:<20} {root}  account: {e.get('config_dir') or '~/.claude'}")
+        waiting = [v for v in ph._read("pending.json", {}).values() if v["state"] == "open"]
+        for v in waiting:
+            print(f"  waiting: {v['project']} #{v['issue']} {v['kind']} since {v['ts']}")
+
+
 def cmd_doctor(a, cfg):
     ok = True
 
@@ -6406,6 +6489,18 @@ def main(argv=None):
     f.add_argument("--source", help="doc line it comes from, if any")
     f.set_defaults(fn=cmd_factory_decide)
 
+    s = sub.add_parser("phone", help="the phone channel: factory blockers to a Telegram bot, answered from the phone")
+    psub = s.add_subparsers(dest="action", required=True)
+    f = psub.add_parser("setup", help="save the bot token and find your chat (message the bot first)")
+    f.add_argument("--token", help="from @BotFather (or set TELEGRAM_BOT_TOKEN)")
+    f.add_argument("--wait", type=int, default=120, help="seconds to wait for your message to the bot")
+    psub.add_parser("test", help="send a test message (to this project's topic when run in a project)")
+    psub.add_parser("status", help="the bot, the bridge, known projects and what is waiting on you")
+    f = psub.add_parser("serve", help="run the bridge in the foreground (normally started for you)")
+    f.add_argument("--forever", action="store_true", help="don't exit when idle (for a launchd agent)")
+    psub.add_parser("stop", help="stop the bridge")
+    s.set_defaults(fn=cmd_phone)
+
     s = sub.add_parser("doctor", help="check the setup")
     s.add_argument("--ping", action="store_true", help="also send a tiny request to the reviewer API")
     s.set_defaults(fn=cmd_doctor)
@@ -6413,7 +6508,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.cmd == "models" and a.action == "set" and not (a.agent and a.model):
         ap.error("usage: harness models set <agent> <model> [--effort level] [--project]")
-    if a.cmd not in ("hook", "account", "init", "doctor", "models", "report"):
+    if a.cmd not in ("hook", "account", "init", "doctor", "models", "report", "phone"):
         require_project()
     a.fn(a, load_config())
 
