@@ -63,6 +63,9 @@ and `acceptance`.
 `repos` lists every repo any task touches (the names under [repos] in .claude/harness.toml).
 If a task must change existing tests (e.g. an assertion that encodes old behaviour), add
 `"tests_may_change": ["<repo-relative path globs>"]` to it; otherwise changes to existing tests are flagged.
+If a task must edit a path the project's classification marks dead or dangerous (`.claude/classification.toml`, also
+in profile.md), add `"allow_classified": ["<path globs>"]` to it and say why in the task; the edit hook refuses those
+paths otherwise. Only when the task is explicitly about that code; the user sees it at approval.
 
 Planning rules:
 - API contracts: if the delegation message gives contract map paths, the gates snapshot the repo's API contract
