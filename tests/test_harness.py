@@ -911,6 +911,8 @@ class ClaudeAccountTests(AccountDirsCase):
         self.login(self.home / ".claude.json", "me@personal")
         self.login(work / ".claude.json", "me@work")
         h.sync_account_settings(self.cfg)
+        for d in (self.home / ".claude", work):
+            (d / "CLAUDE.md").write_text(h.with_setup_note(""))
         market, plugin = h._marketplace_ids()
         h.write_json(work / "plugins" / "installed_plugins.json", {"plugins": {f"{plugin}@{market}": [
             {"scope": "project", "projectPath": str(self.home / "proj")}]}})
@@ -924,6 +926,16 @@ class ClaudeAccountTests(AccountDirsCase):
                              str(h.Path.home() / ".claude"))
             self.assertEqual(h.project_account_dir({}), "/acc/other")
         self.assertEqual(h.project_account_dir(self.cfg), str(self.home / ".claude-work"))
+
+
+class SetupNoteTests(unittest.TestCase):
+    def test_the_note_is_added_once_and_replaced_when_it_changes(self):
+        once = h.with_setup_note("# Mine\nkeep this\n")
+        self.assertTrue(once.startswith("# Mine\nkeep this\n\n" + h.SETUP_NOTE_START))
+        self.assertEqual(h.with_setup_note(once), once)
+        old = once.replace("follow its steps", "an older wording") + "after\n"
+        self.assertEqual(h.with_setup_note(old), once + "after\n")
+        self.assertEqual(h.with_setup_note(""), h.setup_note() + "\n")
 
 
 class PluginInstallTests(AccountDirsCase):
