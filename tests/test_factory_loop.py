@@ -11,6 +11,9 @@ from unittest import mock
 SCRIPTS = Path(__file__).parent.parent / "scripts"
 # Never touch the real phone setup: with it configured, a raised blocker would reach the real Telegram bot.
 os.environ["FACTORY_PHONE_HOME"] = tempfile.mkdtemp(prefix="phone-test-")
+# Never write run state or metrics into the real repo: a test that forgets to patch log_event would
+# otherwise append to this checkout's .harness/metrics/events.jsonl.
+os.environ["HARNESS_ROOT"] = tempfile.mkdtemp(prefix="harness-root-test-")
 
 
 def load(name):
@@ -445,12 +448,13 @@ echo "args: $@"
 
             usage = types.SimpleNamespace(check=lambda limits, **kw: {"decision": "go"})
             a = mock.Mock(merge="auto", issues=None, dry_run=False, max_issues=5, repo=None, auto_queue=True, until_limit=False)
-            env = {"HARNESS_CLAUDE": str(fake), "SOFTWARE_FACTORY_HOME": tmp}
+            env = {"HARNESS_CLAUDE": str(fake), "SOFTWARE_FACTORY_HOME": tmp, "CLAUDE_CONFIG_DIR": tmp}
             with mock.patch.dict("os.environ", env), mock.patch.object(h, "ROOT", root), \
                     mock.patch.object(h, "factory_repo", lambda a, c: "o/r"), \
                     mock.patch.object(h, "factory_modules", lambda: (fl, usage)), \
                     mock.patch.object(h, "gh_json", fake_json), mock.patch.object(h, "gh", fake_gh), \
                     mock.patch.object(h, "set_issue_state", set_state), mock.patch.object(h, "ensure_labels"), \
+                    mock.patch.object(h, "log_event"), \
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 h.cmd_factory_run(a, {"factory": {"claude_args": []}})
             events = [json.loads(x) for x in (root / ".factory" / "log.jsonl").read_text().splitlines()]
