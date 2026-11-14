@@ -356,6 +356,81 @@ class ShellParsingTests(unittest.TestCase):
             self.assertTrue(any(self.guard(cmd)), cmd)
 
 
+class ChainBranchTests(unittest.TestCase):
+    """The guard checks a command before it runs, so it follows branch switches through `&&` chains (issue #100)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = os.path.realpath(self.tmp.name)
+        self.git = lambda *a: subprocess.run(["git", "-C", self.repo, *a], check=True, capture_output=True, text=True)
+        self.git("init", "-q", "-b", "main")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init")
+        self.git("branch", "feat/old")
+        Path(self.repo, "README.md").write_text("x\n")
+        for p in (mock.patch.object(h, "github_account_state", lambda c, cfg: ("writer", "stub")),
+                  mock.patch.object(h, "current_run_id", lambda: None)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def guard(self, command, cwd=None, **kw):
+        cwd = cwd or self.repo
+        return h.check_bash(command, CFG, cwd, **kw) or h.check_github_global(command, CFG, cwd, **kw)
+
+    def test_a_switch_joined_with_and_counts(self):
+        for cmd in ("git switch -c x && git add f && git commit -m m",
+                    "git checkout -b x 2>&1 && git commit -m m",
+                    "git switch -c x &&\n  git add f",
+                    "git switch feat/old && git commit -m m",
+                    "git switch -c x && git push -u origin x",
+                    "git switch -c x && git push"):
+            self.assertIsNone(self.guard(cmd), cmd)
+
+    def test_a_switch_that_may_have_failed_does_not_count(self):
+        for cmd in ("git switch -c x; git add f", "git switch -c x || git commit -m m",
+                    "git switch -c x 2>&1 | tail -1 && git commit -m m", "git switch -c x & git add f"):
+            reason = self.guard(cmd)
+            self.assertIn("protected branch 'main'", reason or "", cmd)
+            self.assertIn("joined with `&&`", reason, cmd)
+            self.assertIn("git switch -c <name>", reason, cmd)
+        self.assertIn("protected branch 'main'", self.guard("git switch -c x; git push") or "")
+
+    def test_switching_to_main_or_somewhere_unknown_is_refused(self):
+        self.git("switch", "-q", "feat/old")
+        self.assertIn("protected branch 'main'", self.guard("git switch main && git commit -m m") or "")
+        self.assertIn("protected branch 'main'", self.guard("git checkout -B main && git commit -m m") or "")
+        self.assertIn("protected branch 'main'", self.guard("git switch main && git push") or "")
+        for cmd in ("git switch - && git commit -m m", "git checkout README.md && git commit -m m",
+                    "git switch -c x && git switch - && git add f", "git switch - && git push"):
+            self.assertIn("can't tell which branch", self.guard(cmd) or "", cmd)
+
+    def test_a_switch_in_another_repo_does_not_move_this_one(self):
+        other = Path(self.repo, "other")
+        other.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True)
+        self.assertIsNotNone(self.guard(f"git -C {other} switch -c x && git commit -m m"))
+        self.assertIsNone(self.guard(f"cd {other} && git switch -c x && git commit -m m"))
+
+    def test_without_a_switch_main_is_still_protected(self):
+        reason = self.guard("git add f")
+        self.assertIn("protected branch 'main'", reason or "")
+        self.assertNotIn("joined with", reason)
+        with mock.patch.object(h, "current_run_id", lambda: "run-1"):
+            self.assertIn("harness branch", self.guard("git commit -m m"))
+
+    def test_hard_blocks_say_not_to_retry(self):
+        for cmd in ("git branch -D x", "git checkout -- f", "git reset --hard", "git clean -fd", "git push --force",
+                    "git commit --amend", "git remote add o u", "gh issue delete 1"):
+            self.assertIn("don't retry", self.guard(cmd) or "", cmd)
+        self.assertIn("Don't retry", self.guard("git stash", subagent=True) or "")
+        self.assertIsNone(self.guard("git stash"))  # the main session may stash
+
+    def test_heredoc_inside_a_substitution_is_data(self):
+        body = "gh issue create --title t --body \"$(cat <<'EOF'\nit's `git push origin main` (and `gh auth switch`)\nEOF\n)\""
+        self.assertIsNone(self.guard(body))
+        self.assertIsNotNone(self.guard('echo "$(cat <<EOF\n$(git push origin main)\nEOF\n)"'))
+
+
 class NotifyTests(unittest.TestCase):
     def msg(self, **kw):
         base = dict(kind="BLOCKER", project="Callback", issue=12, situation="CI failed twice on the PR. The fix did not help.",
