@@ -26,7 +26,9 @@ For each concern, check quickly (a few reads or greps, not an investigation):
 Write the survivors to the output path as a JSON list, at most 5 items, most important first:
 `[{"title": "<imperative, specific, under 80 chars>", "body": "<what and where, why it matters, how to tell it is
 fixed (acceptance criteria as a short list)>"}]`. If none survive, write `[]`. Keep bodies self-contained: the
-reader has not seen this run. The factory adds the link back to the issue and the `backlog` label.
+reader has not seen this run. When a criterion names a command, use the repo's own script (`npm run
+format:check`), not the raw tool (`npx prettier --check .`), which factory sessions are refused. The factory adds
+the link back to the issue and the `backlog` label.
 
 Rules: read-only except the output file; never commit, push, comment or create issues; stop after about 25 tool
 calls and write what you have.

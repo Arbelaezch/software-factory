@@ -53,5 +53,8 @@ start, naming the rule to add (`"Bash(pnpm install*)"`), so the first issue does
 
 ## When a blocker says a command was refused
 
-The blocker names the command. Add a rule to the repo's `harness.toml` that follows the above, commit
-it, and restart the issue. If the command cannot be expressed within the rules, wrap it in a script.
+Sessions first look for an allowed way to run the same thing (a `package.json` script under `npm run`, a
+Makefile target, `scripts/*`, the harness gates) and block only when there is none. The blocker names the
+command. Add a rule to the repo's `harness.toml` that follows the above, commit it, and restart the issue. If the
+command cannot be expressed within the rules, wrap it in a script. `harness factory block` refuses a message that
+suggests a rule this page rejects or points rules at `.claude/settings.json`.

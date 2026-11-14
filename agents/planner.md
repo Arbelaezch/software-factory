@@ -80,7 +80,9 @@ Planning rules:
   migrations, money, or a public API contract that other code consumes.
 - Every task's `acceptance` must be observable (a test passes, an endpoint returns X); reviewers
   check these mechanically.
-- Take test, lint and format commands from the scout context rather than rediscovering them.
+- Take test, lint and format commands from the scout context rather than rediscovering them. Where acceptance
+  or a task names a command, use the repo's script (`npm run format:check`), not the raw tool
+  (`npx prettier --check .`), which headless sessions refuse.
 - Be concrete: field names, function names, file paths. Engineers won't see this conversation.
 - If the brief leaves a decision open, make the conservative choice and record it under Approach.
 

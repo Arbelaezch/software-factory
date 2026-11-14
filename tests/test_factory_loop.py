@@ -500,6 +500,26 @@ class HarnessWiringTests(unittest.TestCase):
         with mock.patch.object(h, "factory_repo", lambda a, c: "o/r"), self.assertRaises(SystemExit):
             h.cmd_factory_block(a, {})
 
+    def test_block_refuses_a_rule_the_factory_would_reject(self):
+        # court-vision #62: the blocker suggested `Bash(npx prettier *)` in .claude/settings.json.
+        a = mock.Mock(issue=62, kind="BLOCKER", situation="`npx prettier --check .` was refused.",
+                      need="Add Bash(npx prettier *) to .claude/settings.json.", option=None, recommend=None,
+                      detail="", repo=None)
+        states = []
+        with mock.patch.object(h, "factory_repo", lambda a, c: "o/r"), \
+                mock.patch.object(h, "set_issue_state", lambda s, n, st: states.append(st)), \
+                self.assertRaises(SystemExit) as cm:
+            h.cmd_factory_block(a, {})
+        self.assertIn("`npx` is not allowed", str(cm.exception))
+        self.assertIn("harness.toml [factory] allowed_tools", str(cm.exception))
+        self.assertEqual(states, [])
+
+    def test_blocker_rule_problems(self):
+        self.assertEqual(h.blocker_rule_problems("Add Bash(scripts/format.sh*) to harness.toml [factory] allowed_tools."), [])
+        self.assertEqual(h.blocker_rule_problems("Gates keep failing.", "/x/log"), [])
+        self.assertEqual(len(h.blocker_rule_problems("Allow Bash(npx prettier *)", "or Bash(make fmt)")), 1)
+        self.assertEqual(len(h.blocker_rule_problems("Add Bash(make fmt) to .claude/settings.json")), 1)
+
     def test_done_labels_awaiting_merge(self):
         import tempfile
         a = mock.Mock(issue=7, pr="https://x/pull/9", note=None, repo=None)

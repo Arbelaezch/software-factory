@@ -27,7 +27,9 @@ Draft the issues:
 - **Vertical slices over layers** when you can: a user-visible behaviour end to end, not "all the models".
   Foundations that several issues need (schema, config, a shared component) become their own early issue.
 - **Acceptance criteria are observable.** "Uploading a PDF over 5 MB returns a 400 with a message", not "handles
-  large files well". Include the test or check that proves it when the project has a test setup.
+  large files well". Include the test or check that proves it when the project has a test setup. When a criterion
+  names a command, use the repo's own script (`npm run format:check`, `make lint`), not the raw tool
+  (`npx prettier --check .`): factory sessions can run the scripts, and most raw tool commands are refused.
 - **Carry the decisions into the issues.** When a settled decision shapes an issue, put it in the body with its
   source, so the engineer and the `question-resolver` find it where they work.
 - **Dependencies only where real**: issue B cannot be built or tested without A merged. Prefer fewer. The

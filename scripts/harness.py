@@ -4590,6 +4590,9 @@ def cmd_factory_block(a, cfg):
         format_message(a.kind, "x", a.issue, a.situation, a.need or "", a.option, a.recommend, a.detail or "")
     except ValueError as exc:
         sys.exit(f"block: {exc}")
+    problems = blocker_rule_problems(a.situation, a.need or "", *(a.option or []), a.detail or "")
+    if problems:
+        sys.exit("block: " + "; ".join(problems))
     set_issue_state(slug, a.issue, "blocked")
     factory_raise_blocker(cfg, slug, a.kind, a.issue, a.situation, a.need or "", a.option, a.recommend, a.detail or "")
 
@@ -5029,6 +5032,22 @@ def project_allow_rules(fc: dict) -> tuple[list[str], list[str]]:
         else:
             ok.append(f"Bash({body})")
     return ok, bad
+
+
+def blocker_rule_problems(*texts: str) -> list[str]:
+    """Why a blocker's suggested allow rules would not work: a rule `project_allow_rules` rejects, or a rule
+    pointed at `.claude/settings.json` (per-repo rules go in harness.toml). Empty when there is nothing to fix."""
+    text = "\n".join(texts)
+    rules = re.findall(r"Bash\([^()\n]*\)", text)
+    if not rules:
+        return []
+    _, bad = project_allow_rules({"allowed_tools": rules})
+    problems = [f"suggested rule {why}. Suggest adding a repo script (package.json, Makefile, scripts/) and "
+                "allowing that, per docs/factory-allowlist.md" for why in bad]
+    if "settings.json" in text:
+        problems.append("allow rules for factory sessions go in .claude/harness.toml [factory] allowed_tools, "
+                        "not .claude/settings.json")
+    return problems
 
 
 def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):

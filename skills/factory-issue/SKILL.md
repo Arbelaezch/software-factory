@@ -46,6 +46,14 @@ changes where humans were involved.
    Do the same as ESCALATE, without trying a workaround, for: a dirty tree you didn't create, changed
    dependencies, gates still failing after the retries /ship allows, an ESCALATE verdict, two failed fix attempts,
    a command the guard blocked, or any error you can't fix by following /ship.
+   **A refused command is not a blocker yet.** Before blocking on one (yours or an engineer's `NEEDS USER: ...
+   denied`), look for an allowed way to run the same thing: a `package.json` script (`npm run *` is pre-approved,
+   so `npm run format:check` instead of `npx prettier --check .`), a Makefile target or `scripts/*` entry, or the
+   harness gates. If one exists, use it (or resume the engineer with it) and continue. Block only when none does.
+   A blocker that suggests an allow rule must follow `docs/factory-allowlist.md` in this plugin: name
+   `.claude/harness.toml` `[factory] allowed_tools` (never `.claude/settings.json`) and never suggest a rule it
+   rejects, such as one starting with `npx`, `npm`, `python3` or `git`. If no allowed rule would work, suggest
+   adding a repo script and allowing that. `H factory block` refuses a message that breaks this.
 3. **Finish with a pull request.** When the verdict is DONE and the summary is written. Headless sessions can only
    run a command that matches a pre-approved pattern, and anything else is refused with no one to approve it. So
    **run every step below as its own Bash call: one plain command, no `&&`, `;` or `|`, no `cd`, no `git -C`, no
