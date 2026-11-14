@@ -9,7 +9,8 @@
 # Each directory keeps its own login, so both accounts stay signed in. Outside harness projects,
 # or when you set CLAUDE_CONFIG_DIR yourself, `claude` behaves exactly as before.
 #
-# Also adds `claude-as <account>`, `claude-work` and `claude-personal` to pick one explicitly.
+# Also adds `claude-as <account>`, `claude-work` and `claude-personal` to pick one explicitly, and
+# `harness-setup` to set up the harness in a new project folder.
 
 if [ -n "${ZSH_VERSION:-}" ]; then
   eval '_HARNESS_HOME="${${(%):-%x}:A:h:h}"'
@@ -50,3 +51,13 @@ claude-as() {
 }
 claude-work() { claude-as work "$@"; }
 claude-personal() { claude-as personal "$@"; }
+
+# Set up the harness in the current folder. The plugin is installed per project, so a new folder doesn't have
+# /harness-init yet: this runs it in a one-off session that loads the plugin straight from this repo. At the end
+# /harness-init installs the plugin for the project's account and closes the session ($HARNESS_SETUP_PID).
+harness-setup() {
+  sh -c 'HARNESS_SETUP_PID=$$ exec claude --plugin-dir "$0" "/harness:harness-init"' "$_HARNESS_HOME"
+  if [ -f .claude/harness.toml ]; then
+    printf 'harness-setup: done. Start `claude` here (it picks the project'"'"'s account) to use /ship and /factory.\n' >&2
+  fi
+}

@@ -28,7 +28,9 @@ allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/harness.py *)
 3. **Write.** `H init --write --account <a> --github-user <g> --git-mode <uncommitted|commit>
    [--base <branch>] [--name "<project name>"] [--description "<one line>"]`. It writes
    `.claude/harness.toml`, enables the plugin in `.claude/settings.json`, creates `CLAUDE.md` if there
-   isn't one, and keeps `.harness/` out of git.
+   isn't one, and keeps `.harness/` out of git. Then run `H plugin install`: it installs the plugin for
+   this project (project scope) under the project's Claude account, which is what makes `/ship` and the
+   other commands available here. If it fails, relay the error and continue.
 
 4. **Describe the project.** This is what makes the agents good in this codebase. Look at the repos
    briefly (README, package.json/pyproject, top-level folders, existing CLAUDE.md files; read
@@ -54,3 +56,7 @@ allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/harness.py *)
      `/login`;
    - to restart Claude Code in this folder and accept the trust prompt so the project's settings
      load; then `/ship <issue or task>` and `/review-pr <PR>` are ready.
+
+7. **Close a setup session.** If you wrote the config, run `H setup-close` as your very last action, after
+   the message from step 6. When the user started this with `harness-setup`, it ends this session (they
+   then start `claude` here); in any other session it only prints that there is nothing to close.

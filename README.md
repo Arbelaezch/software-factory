@@ -124,18 +124,25 @@ Requires [Claude Code](https://claude.com/claude-code), Python 3.11+ and the [Gi
 
 ```sh
 git clone https://github.com/Arbelaezch/software-factory.git ~/code/software-factory
-claude plugin marketplace add ~/code/software-factory
-claude plugin install harness@personal-harness
+echo 'source ~/code/software-factory/scripts/claude-accounts.sh' >> ~/.zshrc   # then open a new terminal
 
 export DEEPSEEK_API_KEY=...   # optional; without it, reviews fall back to a Claude reviewer
 
 cd ~/code/my-project          # one git repo, or a folder of repos
-claude
-/harness-init                 # detects repos, base branches and test commands
+harness-setup                 # runs /harness-init, installs the plugin for this project, then closes
+claude                        # /ship, /factory, /review-pr are ready
 ```
 
-`/harness-init` writes `.claude/harness.toml`, `.claude/settings.json` and a `CLAUDE.md`. Restart
-`claude` afterwards and run `/ship`.
+The plugin is installed per project (project scope), so it only loads in harness projects. A new folder
+doesn't have `/harness-init` yet, so `harness-setup` (a shell command, typed in the terminal) starts a
+one-off session that loads the plugin straight from this repo and runs `/harness-init`. That asks a few
+questions, writes `.claude/harness.toml`, `.claude/settings.json` and a `CLAUDE.md`, installs the plugin
+for the project's Claude account, and closes the session. Running `/harness-init` again inside a project
+reconfigures it.
+
+After merging changes to the plugin, update every install (every project, every account) with
+`python3 ~/code/software-factory/scripts/harness.py plugin update`, then restart open sessions.
+`plugin list` shows each install and its version.
 
 <details>
 <summary><b>Optional: multiple Claude accounts</b></summary>
@@ -159,8 +166,9 @@ Setting up the work account once:
 2. `harness accounts sync` copies the shared user settings (hooks, including the GitHub guard, statusline,
    permissions, notifications; the list is `[accounts] shared_settings`) from `~/.claude/settings.json` to
    the other account directories. Run it again after changing `~/.claude/settings.json`.
-3. Install the plugin for that account: prefix the install commands with `CLAUDE_CONFIG_DIR=~/.claude-work`.
-   Plugin installs are per directory, so updates have to be run in each one too.
+3. The plugin is installed per project under the project's account: `harness-setup` does it for new
+   projects, and `harness plugin install` inside a project does it for an existing one.
+   `harness plugin update` updates the installs of every account.
 
 `harness accounts` lists every account with its directory, signed-in email and settings drift, and
 `harness doctor` does the same for the project's account (plus whether the plugin is installed for it).

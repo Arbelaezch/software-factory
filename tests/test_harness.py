@@ -861,7 +861,8 @@ class SessionStartTests(unittest.TestCase):
         self.assertIsNone(h.session_start([{"type": "attachment", "attachment": {"type": "date"}}]))
 
 
-class ClaudeAccountTests(unittest.TestCase):
+class AccountDirsCase(unittest.TestCase):
+    """A temp home with ~/.claude (personal, default) and ~/.claude-work (work, this project's account)."""
     def setUp(self):
         self.home = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.home)
@@ -876,6 +877,8 @@ class ClaudeAccountTests(unittest.TestCase):
     def login(self, path, email):
         h.write_json(path, {"oauthAccount": {"emailAddress": email}})
 
+
+class ClaudeAccountTests(AccountDirsCase):
     def test_email_comes_from_home_for_the_default_dir_and_from_the_dir_otherwise(self):
         self.login(self.home / ".claude.json", "me@personal")
         self.login(self.home / ".claude-work" / ".claude.json", "me@work")
@@ -921,6 +924,45 @@ class ClaudeAccountTests(unittest.TestCase):
                              str(h.Path.home() / ".claude"))
             self.assertEqual(h.project_account_dir({}), "/acc/other")
         self.assertEqual(h.project_account_dir(self.cfg), str(self.home / ".claude-work"))
+
+
+class PluginInstallTests(AccountDirsCase):
+    def record(self, d, *entries):
+        market, plugin = h._marketplace_ids()
+        h.write_json(d / "plugins" / "installed_plugins.json", {"plugins": {f"{plugin}@{market}": list(entries)}})
+
+    def test_the_default_account_runs_without_a_config_dir(self):
+        with mock.patch.dict(h.os.environ, {"CLAUDE_CONFIG_DIR": "/acc/other"}):
+            self.assertNotIn("CLAUDE_CONFIG_DIR", h.account_env(self.home / ".claude"))
+            self.assertEqual(h.account_env(self.home / ".claude-work")["CLAUDE_CONFIG_DIR"], str(self.home / ".claude-work"))
+
+    def test_update_covers_every_install_of_every_account_and_skips_gone_folders(self):
+        proj = self.home / "proj"
+        proj.mkdir()
+        self.record(self.home / ".claude", {"scope": "user"}, {"scope": "project", "projectPath": str(proj)},
+                    {"scope": "project", "projectPath": str(self.home / "gone")})
+        self.record(self.home / ".claude-work", {"scope": "project", "projectPath": str(proj)})
+        calls = []
+        fake = lambda d, *args, cwd=None: calls.append((d.name, args[:2], args[-1], cwd)) or (True, "updated")
+        with mock.patch.object(h, "claude_plugin", fake), contextlib.redirect_stdout(io.StringIO()) as out:
+            h.cmd_plugin(mock.Mock(action="update"), self.cfg)
+        updates = [(d, scope, cwd) for d, args, scope, cwd in calls if args[0] == "update"]
+        self.assertEqual(updates, [(".claude", "user", None), (".claude", "project", proj), (".claude-work", "project", proj)])
+        self.assertEqual(sum(1 for _, args, _, _ in calls if args == ("marketplace", "update")), 2)
+        self.assertIn("folder is gone", out.getvalue())
+
+    def test_setup_close_only_ends_a_claude_setup_session(self):
+        with mock.patch.object(h.os, "kill") as kill, contextlib.redirect_stdout(io.StringIO()) as out:
+            with mock.patch.dict(h.os.environ, {"HARNESS_SETUP_PID": ""}):
+                h.cmd_setup_close(None, {})
+            with mock.patch.dict(h.os.environ, {"HARNESS_SETUP_PID": str(os.getpid())}):
+                h.cmd_setup_close(None, {})  # this test process is python, not claude
+            kill.assert_not_called()
+            with mock.patch.dict(h.os.environ, {"HARNESS_SETUP_PID": "4242"}), \
+                    mock.patch.object(h, "run_cmd", return_value=mock.Mock(stdout="/usr/local/bin/claude\n")):
+                h.cmd_setup_close(None, {})
+            kill.assert_called_once_with(4242, h.signal.SIGTERM)
+        self.assertIn("nothing to close", out.getvalue())
 
 
 class SessionUsageTests(unittest.TestCase):
