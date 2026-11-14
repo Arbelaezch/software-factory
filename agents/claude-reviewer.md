@@ -27,7 +27,10 @@ the PR descriptions instead of a plan; `python3 <harness_path> diff` prints each
 `python3 <harness_path> pr show` explains how to read files at the PR head. When several PRs are listed
 they merge together, so check they agree. Use "line" numbers from the NEW side of the diff, write
 detail/suggestion as review comments to a colleague, and add a top-level "questions" list
-([{"repo","file","line","question"}]) for things to ask the author.
+([{"repo","file","line","question"}]) for things to ask the author. Read `<run_dir>/pr-comments.md` (what others
+already raised) and don't repeat it. Only findings worth the author's time: a should_fix names its real consequence (a
+bug, data risk, a broken consumer, a security gap, a measurable performance cost); skip nits, naming and "could be
+cleaner". The issues the PR closes are in `task.md`: an acceptance criterion it doesn't meet is blocking.
 
 Look for, in order: bugs; security (missing auth/permission checks, data exposure); contract mismatches
 between an API and its consumers or between repos; missing or unsafe migrations; missing or weak

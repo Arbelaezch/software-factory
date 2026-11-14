@@ -2223,3 +2223,73 @@ message = "Live equivalent: web/{1}/api/."
     def test_agents_cannot_edit_the_classification_file(self):
         self.assertTrue(h.enforcement_state_denial(
             {"agent_id": "a1", "tool_input": {"file_path": str(self.root / ".claude" / "classification.toml")}}))
+
+
+class PrReviewReportTests(unittest.TestCase):
+    """/review-pr: the report bar, existing PR discussion, and the issues a PR closes."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.d = Path(tmp.name)
+        self.pr = {"repo": "app", "slug": "o/app", "number": 5, "title": "t", "url": "u", "author": "a",
+                   "head_branch": "feat/x", "base": "dev", "reason": "requested"}
+        self.run = {"task": "Review o/app#5: t", "prs": [self.pr]}
+
+    def test_report_bar_keeps_only_findings_worth_acting_on(self):
+        final = [{"id": "1", "verdict": "confirmed", "severity": "blocking"},
+                 {"id": "2", "verdict": "confirmed", "severity": "should_fix"},
+                 {"id": "3", "verdict": "confirmed", "severity": "nit"},
+                 {"id": "4", "verdict": "uncertain", "severity": "blocking"},
+                 {"id": "5", "verdict": "uncertain", "severity": "should_fix"},
+                 {"id": "6", "verdict": "rejected", "severity": "blocking"}]
+        keep, dropped = h.report_bar(final, {})
+        self.assertEqual([f["id"] for f in keep], ["1", "2", "4"])
+        self.assertEqual(dropped, 2)
+        keep, dropped = h.report_bar(final, {"review_pr": {"report_severities": ["blocking", "should_fix", "nit"],
+                                                            "report_uncertain": []}})
+        self.assertEqual([f["id"] for f in keep], ["1", "2", "3"])
+        self.assertEqual(dropped, 2)
+
+    def test_defaults_define_the_report_bar(self):
+        defaults = h._read_toml(Path(h.__file__).with_name("defaults.toml"))
+        self.assertEqual(defaults["review_pr"], {"report_severities": ["blocking", "should_fix"],
+                                                 "report_uncertain": ["blocking"]})
+
+    def test_existing_discussion_is_saved(self):
+        def fake_json(*args):
+            if args[1].endswith("/reviews?per_page=100"):
+                return [{"user": {"login": "rev"}, "state": "CHANGES_REQUESTED", "body": "Missing permission check"},
+                        {"user": {"login": "rev"}, "state": "COMMENTED", "body": ""}]
+            return [{"user": {"login": "rev"}, "path": "api/views.py", "line": 12, "body": "N+1 here"},
+                    {"user": {"login": "rev"}, "path": "api/old.py", "line": None, "original_line": 3, "body": "typo"}]
+        metas = {("app", 5): {"comments": [{"author": {"login": "pm"}, "body": "Does this cover drafts?"}]}}
+        with mock.patch.object(h, "gh_json", fake_json):
+            h.write_pr_comments(self.d, self.run, metas)
+        text = (self.d / "pr-comments.md").read_text()
+        self.assertIn("- @pm (conversation): Does this cover drafts?", text)
+        self.assertIn("- @rev (review, changes_requested): Missing permission check", text)
+        self.assertIn("- @rev on `api/views.py:12`: N+1 here", text)
+        self.assertIn("- @rev on `api/old.py:3` (outdated): typo", text)
+        self.assertEqual(text.count("(review"), 1)
+
+        def broken(*args):
+            raise RuntimeError("HTTP 403")
+        with mock.patch.object(h, "gh_json", broken):
+            h.write_pr_comments(self.d, self.run, {})
+        self.assertIn("couldn't load reviews and inline comments", (self.d / "pr-comments.md").read_text())
+
+    def test_task_includes_the_issues_the_pr_closes(self):
+        calls = []
+
+        def fake_json(*args):
+            calls.append(args)
+            return {"title": "Drafts are hidden", "body": "## Acceptance\n- drafts never listed"}
+        metas = {("app", 5): {"body": "desc", "closingIssuesReferences": [
+            {"number": 9, "url": "https://github.com/o/backend/issues/9"}]}}
+        with mock.patch.object(h, "gh_json", fake_json):
+            h.write_pr_task(self.d, self.run, metas)
+        text = (self.d / "task.md").read_text()
+        self.assertIn("### Closes #9: Drafts are hidden", text)
+        self.assertIn("- drafts never listed", text)
+        self.assertEqual(calls[0][:5], ("issue", "view", "9", "--repo", "o/backend"))

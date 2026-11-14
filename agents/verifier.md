@@ -40,6 +40,9 @@ read a file at each PR's head (`git -C <repo> show refs/harness/pr/<n>:<path>`).
 listed they merge together, so check they agree with each other. To find consumers of a changed
 endpoint, API field or component in the *other* repos, search their base branch (e.g. dev or main):
 `git -C <repo path> grep -n <pattern> origin/<base>`. In additional findings, set "repo" to the PR's repo.
+Only what is worth the author's time reaches them: reject a finding already raised in `<run_dir>/pr-comments.md`
+(unless the PR head still has the problem and nobody answered), and set severity `nit` for one whose consequence is
+style, naming or "could be cleaner" (nits are left out of the draft). A should_fix needs a real consequence.
 
 If `<run_dir>/tamper.json` lists findings, the engineer changed pre-existing tests or test config
 (removed or altered assertions, skips, deleted tests, loosened thresholds). Judge each against the plan: add

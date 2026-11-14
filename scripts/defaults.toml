@@ -124,6 +124,11 @@ max_diff_chars = 300000        # diffs beyond this are truncated (with a notice 
 max_findings = 15
 request_timeout_seconds = 600
 
+# /review-pr: which verified findings reach the draft review. Everything else stays in final-<n>.json.
+[review_pr]
+report_severities = ["blocking", "should_fix"]   # confirmed findings at these severities
+report_uncertain = ["blocking"]                  # uncertain findings at these severities, posted as questions
+
 [providers.deepseek]
 base_url = "https://api.deepseek.com"
 model = "deepseek-v4-pro"      # cheaper: "deepseek-flash"

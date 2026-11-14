@@ -3385,6 +3385,8 @@ def build_pr_review_prompt(run: dict, d: Path, cfg: dict) -> tuple[str, bool]:
     rcfg = cfg.get("reviewer") or {}
     rs = repos(cfg)
     parts = [(d / "task.md").read_text(encoding="utf-8"), ""]
+    if (d / PR_COMMENTS_FILE).exists():
+        parts.append((d / PR_COMMENTS_FILE).read_text(encoding="utf-8"))
     diffs = []
     for pr in run.get("prs", []):
         desc = rs[pr["repo"]].get("description", "")
@@ -3408,7 +3410,10 @@ Findings will be posted as inline review comments, so "repo" must be the harness
 "## Repo:" header, "file" a path in that PR, and "line" a line number on the NEW side of the diff.
 Write "detail" and "suggestion" the way you'd write a review comment to a colleague: direct, specific, polite.
 Also return "questions": [{"repo": "...", "file": "...", "line": <int or null>, "question": "..."}] for things
-you'd ask the author (intent, missing context) rather than assert as problems."""
+you'd ask the author (intent, missing context) rather than assert as problems.
+Report only what is worth the author's time: a "should_fix" must name its real consequence (a bug, data risk, a broken
+consumer, a security gap, a measurable performance cost). Leave out style, naming, "could be cleaner" and nits; the
+user drops them anyway. Existing discussion on the PR is listed in the task; don't repeat what was already raised."""
 
 
 def project_context(cfg: dict) -> str:
@@ -4146,6 +4151,7 @@ def cmd_pr_start(a, cfg):
     run["pr_candidates"], run["warnings"] = list(candidates.values()), warnings
     save_run(d, run)
     write_pr_task(d, run, metas)
+    write_pr_comments(d, run, metas)
     print_pr_set(d, run)
 
 
@@ -4179,13 +4185,58 @@ def write_pr_task(d: Path, run: dict, metas: dict) -> None:
                   f"{'  (draft)' if pr.get('draft') else ''}  [{pr['reason']}]", ""]
         body = (m.get("body") or "(no description)").strip()
         lines += [body[:6000] + ("\n[truncated]" if len(body) > 6000 else ""), ""]
-        issues = m.get("closingIssuesReferences") or []
-        if issues:
-            lines += ["Closes: " + ", ".join(f"#{i.get('number')} {i.get('title', '')}" for i in issues), ""]
+        for i in m.get("closingIssuesReferences") or []:
+            title, body = closing_issue(i, pr["slug"])
+            lines += [f"### Closes #{i.get('number')}: {title}".rstrip(": "),
+                      "Check that the PR meets this issue's acceptance criteria.", "",
+                      body[:4000] + ("\n[truncated]" if len(body) > 4000 else ""), ""]
     if run.get("pr_context"):
         lines += ["## Linked PRs not under review"] + [
             f"- {c['repo']}#{c['number']} {c['title']} ({c['state'].lower()})" for c in run["pr_context"]] + [""]
     (d / "task.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def closing_issue(ref: dict, pr_slug: str) -> tuple[str, str]:
+    """(title, body) of an issue the PR closes; the body is fetched because `gh pr view` only gives the reference."""
+    m = re.search(r"github\.com/([^/]+/[^/]+)/issues/\d+", ref.get("url") or "")
+    try:
+        data = gh_json("issue", "view", str(ref.get("number")), "--repo", m.group(1) if m else pr_slug,
+                       "--json", "title,body")
+        return data.get("title") or ref.get("title") or "", (data.get("body") or "(no description)").strip()
+    except RuntimeError as exc:
+        return ref.get("title") or "", f"(couldn't load the issue: {exc})"
+
+
+PR_COMMENTS_FILE = "pr-comments.md"
+
+
+def write_pr_comments(d: Path, run: dict, metas: dict) -> None:
+    """<run_dir>/pr-comments.md: what others already said on each PR (conversation, reviews, inline comments), so
+    the reviewers don't raise it again."""
+    def clip(text):
+        text = (text or "").strip()
+        return text[:1500] + (" [truncated]" if len(text) > 1500 else "")
+
+    lines = ["# Existing discussion on the PRs",
+             "Already raised by someone. Don't report these again unless the PR head still has the problem and nobody "
+             "has answered it.", ""]
+    for pr in run["prs"]:
+        m = metas.get((pr["repo"], pr["number"])) or {}
+        items = [f"- @{(c.get('author') or {}).get('login', '?')} (conversation): {clip(c.get('body'))}"
+                 for c in m.get("comments") or [] if (c.get("body") or "").strip()]
+        try:
+            for r in gh_json("api", f"repos/{pr['slug']}/pulls/{pr['number']}/reviews?per_page=100") or []:
+                if (r.get("body") or "").strip():
+                    items.append(f"- @{(r.get('user') or {}).get('login', '?')} (review, {r.get('state', '').lower()}): "
+                                 f"{clip(r.get('body'))}")
+            for c in gh_json("api", f"repos/{pr['slug']}/pulls/{pr['number']}/comments?per_page=100") or []:
+                line = c.get("line") or c.get("original_line")
+                items.append(f"- @{(c.get('user') or {}).get('login', '?')} on `{c.get('path')}:{line}`"
+                             f"{'' if c.get('line') else ' (outdated)'}: {clip(c.get('body'))}")
+        except (RuntimeError, json.JSONDecodeError) as exc:
+            items.append(f"- (couldn't load reviews and inline comments: {exc})")
+        lines += [f"## {pr['slug']}#{pr['number']}", *(items or ["None."]), ""]
+    (d / PR_COMMENTS_FILE).write_text("\n".join(lines)[:60000], encoding="utf-8")
 
 
 def print_pr_set(d: Path, run: dict) -> None:
@@ -4218,6 +4269,7 @@ def cmd_pr_add(a, cfg):
     save_run(d, run)
     metas = {(p["repo"], p["number"]): pr_meta(cfg, p["repo"], p["number"]) for p in run["prs"]}
     write_pr_task(d, run, metas)
+    write_pr_comments(d, run, metas)
     print_pr_set(d, run)
 
 
@@ -4261,6 +4313,17 @@ def right_side_lines(diff: str) -> dict:
 SEV_LABEL = {"blocking": "Blocking", "should_fix": "Should fix", "nit": "Nit"}
 
 
+def report_bar(final: list[dict], cfg: dict) -> tuple[list[dict], int]:
+    """(findings that go in the draft, how many confirmed or uncertain ones were left out). Only findings worth acting
+    on reach the user: by default confirmed blocking and should_fix, and uncertain only when blocking."""
+    pcfg = cfg.get("review_pr") or {}
+    bar = {"confirmed": set(pcfg.get("report_severities", ["blocking", "should_fix"])),
+           "uncertain": set(pcfg.get("report_uncertain", ["blocking"]))}
+    candidates = [f for f in final if f.get("verdict") in bar]
+    keep = [f for f in candidates if f.get("severity") in bar[f["verdict"]]]
+    return keep, len(candidates) - len(keep)
+
+
 def cmd_pr_draft(a, cfg):
     d, run = load_run()
     finals = sorted(d.glob("final-*.json"), key=lambda p: int(p.stem.split("-")[1]))
@@ -4283,7 +4346,7 @@ def cmd_pr_draft(a, cfg):
             cands = [p for p in cands if num and p["number"] == int(num.group(1))] or cands
         return cands[0] if cands else (open_prs_[0] if len(open_prs_) == 1 else None)
 
-    keep = [f for f in final if f.get("verdict") in ("confirmed", "uncertain")]
+    keep, dropped = report_bar(final, cfg)
     questions = review.get("questions") or []
     written = []
     for pr in open_prs_:
@@ -4335,6 +4398,9 @@ def cmd_pr_draft(a, cfg):
         written.append(jpath)
         print(f"{pr['repo']}#{pr['number']}: {len(comments)} inline comment(s), {len(body_items)} note(s) in the body, "
               f"{len(qs)} question(s)  -> {jpath.with_suffix('.md')}")
+    if dropped:
+        print(f"Left out {dropped} confirmed or uncertain finding(s) below the report bar ([review_pr] "
+              f"report_severities / report_uncertain); all findings are in {finals[-1]}")
     if not written:
         print("No open PRs with a fetched diff to draft for.")
 
