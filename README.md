@@ -195,6 +195,12 @@ terminal is logged in to. Run `python3 scripts/usage.py` (exit code 0 go, 10 pau
   snapshot before any edits and the `contracts` gate takes another and diffs them, so nothing is committed to the repo.
   `cwd` is where the commands run. The plan must declare every contract change with a consumer task, reviewers get
   the contract diff, and an undeclared change fails the gate and is a blocking finding.
+- `[knowledge.<name>]` (optional): a reference file generated from the code, such as a Django model map, that
+  scouts, the planner and engineers read instead of opening the files it covers. `repo` and `cwd` say where `cmd`
+  runs; `cmd` writes Markdown to `{out}`; `covers` lists the pathspecs it is built from (`"<repo>:<pathspec>"` for
+  another repo; default the whole repo); `description` is one line telling agents what it lists. `harness knowledge`
+  (run by /ship before scouting) rebuilds it only when a covered path changed since the commit recorded in its stamp,
+  and writes `<run_dir>/knowledge.md` for the agents. `harness report --tools` counts reads of covered files per run.
 - `[ship]` (optional): `profile = "legacy"` for a large codebase where the nearest code is often a pattern to avoid
   (retiring or dead code next to live code). The grill always runs (except tiny) and asks only about product
   behaviour and important trade-offs the project's `decision_docs` don't settle; scouts report each file's class

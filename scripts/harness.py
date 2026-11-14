@@ -2229,30 +2229,31 @@ def contract_covers(rname: str, c: dict, rs: dict) -> dict[str, list[str]]:
 
 
 def covered_state(path: Path, sha: str, specs: list[str]) -> tuple[list[str], str]:
-    """(covered files that differ from `sha`, a hash of those differences), uncommitted and untracked files included."""
-    diff = git(path, "diff", "--no-color", sha, "--", *specs)
-    names = git(path, "diff", "--name-only", sha, "--", *specs).split()
-    h = hashlib.sha1(diff.encode())
-    for u in sorted(git(path, "ls-files", "--others", "--exclude-standard", "--", *specs).split()):
-        names.append(u)
-        h.update(u.encode())
+    """(covered files that differ from `sha`, a hash of their current contents), uncommitted and untracked files
+    included. The hash depends only on the files' contents, so committing an edit doesn't change it."""
+    names = sorted(set(git(path, "diff", "--name-only", sha, "--", *specs).splitlines())
+                   | set(git(path, "ls-files", "--others", "--exclude-standard", "--", *specs).splitlines()))
+    h = hashlib.sha1()
+    for n in names:
+        h.update(n.encode() + b"\0")
         try:
-            h.update((path / u).read_bytes())
+            h.update((path / n).read_bytes())
         except OSError:
-            pass
+            h.update(b"\0deleted")
+        h.update(b"\0")
     return names, h.hexdigest()
 
 
-def contract_map_stale(rname: str, rs: dict) -> str | None:
-    """Why the map must be rebuilt, or None when it is current: a covered file is not as it was when the map was
-    built (a commit since, or an uncommitted or untracked edit), or the map, its stamp or its command changed."""
-    c = rs[rname]["contracts"]
-    stamp = read_json(CONTRACTS_DIR / f"{rname}.json")
-    if not stamp or not contract_map_path(rname).exists():
-        return "no map yet"
-    if stamp.get("cmd") != c["map_cmd"]:
-        return "map_cmd changed"
-    for repo, specs in contract_covers(rname, c, rs).items():
+def generated_stale(cmd: str, out_path: Path, stamp_path: Path, covers: dict[str, list[str]], rs: dict,
+                    what: str = "map") -> str | None:
+    """Why a generated file must be rebuilt, or None when it is current: a covered file is not as it was when it was
+    built (a commit since, or an uncommitted or untracked edit), or the file, its stamp or its command changed."""
+    stamp = read_json(stamp_path)
+    if not stamp or not out_path.exists():
+        return f"no {what} yet"
+    if stamp.get("cmd") != cmd:
+        return f"{'map_cmd' if what == 'map' else 'cmd'} changed"
+    for repo, specs in covers.items():
         built = (stamp.get("repos") or {}).get(repo) or {}
         if not built.get("commit"):
             return f"no recorded commit for {repo}"
@@ -2265,9 +2266,34 @@ def contract_map_stale(rname: str, rs: dict) -> str | None:
     return None
 
 
-def run_out_cmd(cmd: str, out_path: Path, rcfg: dict, cfg: dict) -> tuple[bool, str]:
-    """Run a [contracts] command that writes to {out}. (ok, output tail)."""
-    c = rcfg["contracts"]
+def build_generated(cmd: str, out_path: Path, stamp_path: Path, covers: dict[str, list[str]], rcfg: dict, opts: dict,
+                    rs: dict, cfg: dict, force: bool = False, what: str = "map") -> tuple[str, str]:
+    """Run `cmd` (writes {out}) unless the file is current, and stamp the commit and state of each covered repo.
+    (state, detail): state is fresh | rebuilt | failed."""
+    reason = "forced" if force else generated_stale(cmd, out_path, stamp_path, covers, rs, what)
+    if reason is None:
+        return "fresh", ""
+    ok, tail = run_out_cmd(cmd, out_path, rcfg, cfg, opts)
+    if not ok:
+        return "failed", f"{reason}; {'map_cmd' if what == 'map' else 'cmd'} failed:\n{tail}"
+    built = {}
+    for repo, specs in covers.items():
+        sha = git(rs[repo]["abs"], "rev-parse", "HEAD").strip()
+        built[repo] = {"commit": sha, "state": covered_state(rs[repo]["abs"], sha, specs)[1]}
+    write_json(stamp_path, {"cmd": cmd, "repos": built, "built_at": iso()})
+    return "rebuilt", reason
+
+
+def contract_map_stale(rname: str, rs: dict) -> str | None:
+    c = rs[rname]["contracts"]
+    return generated_stale(c["map_cmd"], contract_map_path(rname), CONTRACTS_DIR / f"{rname}.json",
+                           contract_covers(rname, c, rs), rs)
+
+
+def run_out_cmd(cmd: str, out_path: Path, rcfg: dict, cfg: dict, opts: dict | None = None) -> tuple[bool, str]:
+    """Run a command that writes to {out}, from rcfg's repo and opts' `cwd` (default: rcfg's [contracts]).
+    (ok, output tail)."""
+    c = rcfg["contracts"] if opts is None else opts
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.unlink(missing_ok=True)
     try:
@@ -2286,18 +2312,8 @@ def run_out_cmd(cmd: str, out_path: Path, rcfg: dict, cfg: dict) -> tuple[bool, 
 def build_contract_map(rname: str, rs: dict, cfg: dict, force: bool = False) -> tuple[str, str]:
     """(state, detail): state is fresh | rebuilt | failed."""
     c = rs[rname]["contracts"]
-    reason = "forced" if force else contract_map_stale(rname, rs)
-    if reason is None:
-        return "fresh", ""
-    ok, tail = run_out_cmd(c["map_cmd"], contract_map_path(rname), rs[rname], cfg)
-    if not ok:
-        return "failed", f"{reason}; map_cmd failed:\n{tail}"
-    built = {}
-    for repo, specs in contract_covers(rname, c, rs).items():
-        sha = git(rs[repo]["abs"], "rev-parse", "HEAD").strip()
-        built[repo] = {"commit": sha, "state": covered_state(rs[repo]["abs"], sha, specs)[1]}
-    write_json(CONTRACTS_DIR / f"{rname}.json", {"cmd": c["map_cmd"], "repos": built, "built_at": iso()})
-    return "rebuilt", reason
+    return build_generated(c["map_cmd"], contract_map_path(rname), CONTRACTS_DIR / f"{rname}.json",
+                           contract_covers(rname, c, rs), rs[rname], c, rs, cfg, force)
 
 
 def snapshot_path(d: Path, rname: str, which: str) -> Path:
@@ -2428,6 +2444,124 @@ def cmd_contracts(a, cfg):
         ok = ok and state != "failed"
         print(f"[{rname}] contract map {state}: {contract_map_path(rname)}" + (f" ({detail})" if detail else ""))
     sys.exit(0 if ok else 1)
+
+
+# --------------------------------------------------------------------------- generated knowledge
+# [knowledge.<name>] (README, per-project config): a reference file generated from the code, such as a Django model
+# map, that agents read instead of opening the files it covers.
+#   repo         the repo the command runs in
+#   cmd          writes the file (Markdown) to {out}
+#   covers       pathspecs it is built from ("<repo>:<pathspec>" for another repo); default: the whole repo
+#   cwd          repo-relative folder the command runs in (default: the repo root)
+#   description  one line for the agents: what the file lists
+# `harness knowledge` rebuilds a file only when a covered path changed since the commit recorded in its stamp, and
+# writes <run_dir>/knowledge.md, the index that scouts, the planner and engineers read.
+KNOWLEDGE_DIR = STATE_DIR / "knowledge"
+KNOWLEDGE_INDEX = "knowledge.md"
+
+
+def knowledge_entries(cfg: dict) -> dict[str, dict]:
+    return {n: k for n, k in (cfg.get("knowledge") or {}).items() if isinstance(k, dict) and k.get("cmd")}
+
+
+def knowledge_path(name: str) -> Path:
+    return KNOWLEDGE_DIR / f"{name}.md"
+
+
+def knowledge_covers(k: dict, rs: dict) -> dict[str, list[str]]:
+    return contract_covers(k.get("repo", ""), k, rs)
+
+
+def knowledge_problem(name: str, k: dict, rs: dict) -> str | None:
+    """A config error that keeps the entry from being built, or None."""
+    if k.get("repo") not in rs:
+        return f"repo = {k.get('repo')!r} is not one of [repos.*]"
+    if "{out}" not in k["cmd"]:
+        return "cmd must write to {out} (the harness picks the path)"
+    return None
+
+
+def build_knowledge(name: str, k: dict, rs: dict, cfg: dict, force: bool = False) -> tuple[str, str]:
+    """(state, detail): state is fresh | rebuilt | failed."""
+    problem = knowledge_problem(name, k, rs)
+    if problem:
+        return "failed", problem
+    return build_generated(k["cmd"], knowledge_path(name), KNOWLEDGE_DIR / f"{name}.json", knowledge_covers(k, rs),
+                           rs[k["repo"]], k, rs, cfg, force, what="file")
+
+
+def knowledge_built_from(name: str) -> str:
+    """'backend@1a2b3c4' for each repo the file was built from."""
+    built = (read_json(KNOWLEDGE_DIR / f"{name}.json") or {}).get("repos") or {}
+    return ", ".join(f"{r}@{(b.get('commit') or '?')[:7]}" for r, b in built.items())
+
+
+def knowledge_index(entries: dict[str, dict], states: dict[str, tuple[str, str]], rs: dict) -> str:
+    lines = ["# Generated knowledge",
+             "Reference files generated from the code and rebuilt whenever a file they cover changes, so they match the "
+             "code you are working on. Look facts up here (Grep for the name, don't read a file whole) instead of "
+             "opening the covered files to find them. Open a covered file only to see code you will copy or edit. "
+             "If a file disagrees with code you or an earlier task just edited, the code wins.", ""]
+    for name, k in entries.items():
+        covers = "; ".join(f"{r}: {', '.join(s) or 'whole repo'}" for r, s in knowledge_covers(k, rs).items()) \
+            if k.get("repo") in rs else ""
+        state, _ = states[name]
+        if state == "failed":
+            lines.append(f"- {name}: unavailable this run (the build failed); read the covered files ({covers}).")
+            continue
+        lines.append(f"- {name}: `{knowledge_path(name)}`. {k.get('description', '').strip()} "
+                     f"(covers {covers}; built from {knowledge_built_from(name)})")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_knowledge(a, cfg):
+    entries = knowledge_entries(cfg)
+    if not entries:
+        print("No [knowledge] entries; nothing to do.")
+        return
+    if a.name:
+        if a.name not in entries:
+            sys.exit(f"No [knowledge.{a.name}] with a cmd. Configured: {', '.join(entries)}")
+        targets = {a.name: entries[a.name]}
+    else:
+        targets = entries
+    rs = repos(cfg)
+    states = {}
+    for name, k in targets.items():
+        t0 = time.time()
+        states[name] = state, detail = build_knowledge(name, k, rs, cfg, a.force)
+        took = f", {round(time.time() - t0)}s" if state != "fresh" else ""
+        print(f"[{name}] {state}: {knowledge_path(name)}"
+              + (f" (built from {knowledge_built_from(name)}{took})" if state != "failed" else "")
+              + (f"\n  {detail}" if detail and state == "failed" else f" ({detail})" if detail else ""))
+    rid = current_run_id()
+    if rid and not a.name:
+        index = RUNS_DIR / rid / KNOWLEDGE_INDEX
+        index.write_text(knowledge_index(targets, states, rs), encoding="utf-8")
+        print(f"Index for this run: {index}")
+    sys.exit(0 if all(s != "failed" for s, _ in states.values()) else 1)
+
+
+def _pathspec_match(rel: str, spec: str) -> bool:
+    """Roughly git's default pathspec matching: a folder prefix, or a glob whose * also crosses '/'."""
+    s = spec.rstrip("/")
+    return rel == s or rel.startswith(s + "/") or fnmatch.fnmatchcase(rel, spec) or fnmatch.fnmatchcase(rel, s + "/*")
+
+
+def knowledge_covered(path: str, cfg: dict) -> str | None:
+    """The [knowledge] entry whose covered paths include this absolute path, or None."""
+    rs = repos(cfg)
+    for name, k in knowledge_entries(cfg).items():
+        if k.get("repo") not in rs:
+            continue
+        for repo, specs in knowledge_covers(k, rs).items():
+            try:
+                rel = Path(path).resolve().relative_to(rs[repo]["abs"]).as_posix()
+            except ValueError:
+                continue
+            if not specs or any(_pathspec_match(rel, s) for s in specs):
+                return name
+    return None
 
 
 # --------------------------------------------------------------------------- gate state (engineer stop hook)
@@ -4005,13 +4139,15 @@ def print_manager_start(events: list[dict], top: int) -> None:
                     ["item", "tokens"]))
 
 
-def print_tool_report(events: list[dict], top: int) -> None:
+def print_tool_report(events: list[dict], top: int, cfg: dict | None = None) -> None:
     """Where the context goes: per tool, the size of results and what carrying them cost; the single biggest
-    results; and files read by more than one agent of the same run."""
+    results; files read by more than one agent of the same run; and reads of files a [knowledge] entry covers."""
     sessions = transcripts_for(events)
     rows: dict[str, dict] = {}
     big: list[dict] = []
     reads: dict[tuple, set] = {}
+    covered: dict[str, collections.Counter] = {}
+    has_knowledge = bool(cfg and knowledge_entries(cfg))
     for stage, rid, entries in sessions:
         for c in tool_calls(entries):
             r = rows.setdefault(c["tool"], {"calls": 0, "chars": 0, "max": 0, "carried": 0})
@@ -4022,6 +4158,8 @@ def print_tool_report(events: list[dict], top: int) -> None:
             big.append({**c, "stage": stage})
             if c["tool"] == "Read" and c["target"]:
                 reads.setdefault((rid, c["target"]), set()).add((stage, id(entries)))
+                if has_knowledge and knowledge_covered(c["target"], cfg):
+                    covered.setdefault(rid or "-", collections.Counter())[stage] += 1
     if not rows:
         print("(no transcripts found for these events)")
         return
@@ -4050,6 +4188,11 @@ def print_tool_report(events: list[dict], top: int) -> None:
                         ["agents", "run", "file"]))
         print(f"{len(repeated)} file(s) in total, {sum(n - 1 for _, n in repeated)} repeat read(s). Some are needed "
               "(each engineer reads its own task); the rest are what the plan could carry.")
+    if has_knowledge:
+        print("\n== Reads of files covered by [knowledge] (fewer is better: agents used the generated file) ==")
+        print(fmt_table([[rid[:15], sum(c.values()), ", ".join(f"{st} {n}" for st, n in c.most_common())]
+                         for rid, c in sorted(covered.items())], ["run", "reads", "by stage"])
+              if covered else "(none)")
 
 
 def print_tier_rollup(run_ends: list[dict]) -> None:
@@ -4079,7 +4222,7 @@ def cmd_report(a, cfg):
     if a.run:
         events = [e for e in events if e.get("run_id") == a.run]
     if a.tools:
-        print_tool_report(events, a.top)
+        print_tool_report(events, a.top, cfg)
         print_manager_start(events, a.top)
         return
     if a.csv:
@@ -5751,6 +5894,19 @@ def cmd_doctor(a, cfg):
             unknown = [s.partition(":")[0] for s in c.get("covers") or [] if ":" in s and s.partition(":")[0] not in repos(cfg)]
             if unknown:
                 print(f"  info {name}: contracts covers {', '.join(unknown)} as pathspecs, not repo names")
+    entries = knowledge_entries(cfg)
+    if entries:
+        print("\nGenerated knowledge:")
+        rs = repos(cfg)
+        for name, k in entries.items():
+            problem = knowledge_problem(name, k, rs)
+            if problem:
+                line(False, f"knowledge {name}: {problem}")
+                continue
+            stale = generated_stale(k["cmd"], knowledge_path(name), KNOWLEDGE_DIR / f"{name}.json",
+                                    knowledge_covers(k, rs), rs, "file")
+            line(True, f"knowledge {name}: " + (f"current, built from {knowledge_built_from(name)}" if stale is None
+                                                 else f"rebuilt at the next run ({stale})"))
     ship = cfg.get("ship") or {}
     profile = ship.get("profile") or "standard"
     print("\n/ship profile:")
@@ -5855,6 +6011,11 @@ def main(argv=None):
     s.add_argument("--task", help="task id (for metrics)")
     s.add_argument("--attempt", type=int, help="engineer attempt number; 1 = first try after implementing (for metrics)")
     s.set_defaults(fn=cmd_gates)
+
+    s = sub.add_parser("knowledge", help="rebuild stale [knowledge] files and write the run's knowledge.md index")
+    s.add_argument("--name", help="build only this entry (no index is written)")
+    s.add_argument("--force", action="store_true", help="rebuild even when the file is current")
+    s.set_defaults(fn=cmd_knowledge)
 
     s = sub.add_parser("contracts", help="build the API contract map that scouts and the planner read")
     s.add_argument("action", choices=["map"])

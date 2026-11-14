@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import types
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -1706,3 +1707,113 @@ class LegacyProfileTests(unittest.TestCase):
         self.assertIn("- Follows: src/views.py:1-3", out)
         self.assertIn("Departures:\nT1 scopes the queryset", out)
         self.assertNotIn("- Do: steps", out)
+
+
+class KnowledgeTests(unittest.TestCase):
+    """[knowledge.<name>]: generated reference files, rebuilt only when a covered path changes, and the run index."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        repo = self.root / "api"
+        (repo / "shop" / "migrations").mkdir(parents=True)
+        (repo / "shop" / "models.py").write_text("class Item: pass\n")
+        (repo / "shop" / "views.py").write_text("x = 1\n")
+        (repo / "shop" / "migrations" / "0001_initial.py").write_text("ops = []\n")
+        self.git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, text=True).stdout.strip()
+        self.git("init", "-q", "-b", "main")
+        self.git("add", ".")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init")
+        self.models = {"repo": "api", "cmd": "echo '# models' > {out}", "description": "Model fields and relations.",
+                       "covers": ["**/models.py", "**/models/*", "**/migrations/*"]}
+        self.cfg = {"repos": {"api": {"path": "api"}}, "knowledge": {"models": self.models}}
+        state = self.root / ".harness"
+        for p in (mock.patch.object(h, "ROOT", self.root), mock.patch.object(h, "KNOWLEDGE_DIR", state / "knowledge"),
+                  mock.patch.object(h, "RUNS_DIR", state / "runs"), mock.patch.object(h, "CURRENT_FILE", state / "current")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def build(self, force=False):
+        return h.build_knowledge("models", self.models, h.repos(self.cfg), self.cfg, force)[0]
+
+    def cmd(self, name=None, cfg=None):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            try:
+                h.cmd_knowledge(types.SimpleNamespace(name=name, force=False), cfg or self.cfg)
+            except SystemExit as exc:
+                return out.getvalue(), exc.code
+        return out.getvalue(), None
+
+    def test_projects_without_knowledge_are_unchanged(self):
+        out, code = self.cmd(cfg={"repos": self.cfg["repos"]})
+        self.assertIn("No [knowledge] entries", out)
+        self.assertIsNone(code)
+        self.assertEqual(h.knowledge_entries({}), {})
+        self.assertIsNone(h.knowledge_covered(str(self.root / "api" / "shop" / "models.py"), {"repos": self.cfg["repos"]}))
+        sessions = [("scout", "r1", tool_entries(("Read", str(self.root / "api" / "shop" / "models.py"), "x" * 40)))]
+        buf = io.StringIO()
+        with mock.patch.object(h, "transcripts_for", return_value=sessions), mock.patch.object(h.sys, "stdout", buf):
+            h.print_tool_report([], 5, {"repos": self.cfg["repos"]})
+        self.assertNotIn("[knowledge]", buf.getvalue())
+
+    def test_rebuilt_only_when_a_model_or_migration_changes(self):
+        self.assertEqual(self.build(), "rebuilt")
+        stamp = h.read_json(h.KNOWLEDGE_DIR / "models.json")
+        self.assertEqual(stamp["repos"]["api"]["commit"], self.git("rev-parse", "HEAD"))
+        self.assertEqual(self.build(), "fresh")
+        (self.root / "api" / "shop" / "views.py").write_text("x = 2\n")  # not covered
+        self.assertEqual(self.build(), "fresh")
+        (self.root / "api" / "shop" / "models.py").write_text("class Item: name = 1\n")
+        self.assertEqual(self.build(), "rebuilt")
+        (self.root / "api" / "shop" / "migrations" / "0002_item_name.py").write_text("ops = [1]\n")  # untracked
+        self.assertEqual(self.build(), "rebuilt")
+        self.git("add", ".")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "name")
+        self.assertEqual(self.build(), "fresh")
+        (self.root / "api" / "shop" / "models").mkdir()
+        (self.root / "api" / "shop" / "models" / "base.py").write_text("y = 1\n")
+        self.assertEqual(self.build(), "rebuilt")
+        self.models["cmd"] = "echo '# models v2' > {out}"
+        self.assertEqual(h.generated_stale(self.models["cmd"], h.knowledge_path("models"), h.KNOWLEDGE_DIR / "models.json",
+                                           h.knowledge_covers(self.models, h.repos(self.cfg)), h.repos(self.cfg), "file"),
+                         "cmd changed")
+
+    def test_bad_config_and_failing_cmd_are_reported(self):
+        self.models["repo"] = "nope"
+        self.assertIn("not one of [repos.*]", h.build_knowledge("models", self.models, h.repos(self.cfg), self.cfg)[1])
+        self.models.update(repo="api", cmd="echo boom")
+        self.assertIn("{out}", h.build_knowledge("models", self.models, h.repos(self.cfg), self.cfg)[1])
+        self.models["cmd"] = "echo boom; exit 2 # {out}"
+        state, detail = h.build_knowledge("models", self.models, h.repos(self.cfg), self.cfg)
+        self.assertEqual(state, "failed")
+        self.assertIn("boom", detail)
+        out, code = self.cmd()
+        self.assertEqual(code, 1)
+        self.assertIn("[models] failed", out)
+
+    def test_run_index_lists_the_files_for_the_agents(self):
+        out, code = self.cmd()
+        self.assertEqual(code, 0)
+        self.assertNotIn("Index for this run", out)  # no active run
+        (h.RUNS_DIR / "r1").mkdir(parents=True)
+        h.CURRENT_FILE.write_text("r1")
+        out, code = self.cmd()
+        self.assertIn("[models] fresh", out)
+        index = (h.RUNS_DIR / "r1" / h.KNOWLEDGE_INDEX).read_text()
+        self.assertIn(f"- models: `{h.knowledge_path('models')}`. Model fields and relations.", index)
+        self.assertIn("covers api: **/models.py, **/models/*, **/migrations/*", index)
+        self.assertIn(f"built from api@{self.git('rev-parse', 'HEAD')[:7]}", index)
+        self.models["cmd"] = "exit 1 # {out}"
+        self.cmd()
+        self.assertIn("- models: unavailable this run", (h.RUNS_DIR / "r1" / h.KNOWLEDGE_INDEX).read_text())
+
+    def test_report_counts_reads_of_covered_files(self):
+        api = self.root / "api" / "shop"
+        sessions = [("scout", "r1", tool_entries(("Read", str(api / "models.py"), "x" * 40), ("Read", str(api / "views.py"), "y"))),
+                    ("planner", "r1", tool_entries(("Read", str(api / "migrations" / "0001_initial.py"), "z")))]
+        buf = io.StringIO()
+        with mock.patch.object(h, "transcripts_for", return_value=sessions), mock.patch.object(h.sys, "stdout", buf):
+            h.print_tool_report([], 5, self.cfg)
+        self.assertRegex(buf.getvalue(), r"r1\s+2\s+scout 1, planner 1")

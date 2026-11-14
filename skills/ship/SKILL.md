@@ -83,9 +83,14 @@ When unsure whether a repo is involved, include it; scouts are cheap. Legacy pro
 `<run_dir>/profile.md`. **Tiny tier: skip the scouts** (the
 planner reads the files itself).
 
-API contracts (every tier): first run `H contracts map`. If it prints "No repo has [contracts]", skip this. Otherwise it
+API contracts (every tier, before spawning scouts): run `H contracts map`. If it prints "No repo has [contracts]", skip this. Otherwise it
 rebuilds a stale contract map and prints each map's path: give those paths to every scout and to the planner. If a map
 `failed`, relay the reason to the user and continue without it (the snapshot gate still runs).
+
+Generated knowledge (every tier, before spawning scouts): run `H knowledge`. If it prints "No [knowledge] entries",
+skip this. Otherwise it rebuilds stale reference files (such as a model map; this can take a minute) and writes `<run_dir>/knowledge.md`,
+which scouts, the planner and engineers read on their own. If an entry `failed`, relay the reason to the user in
+one line and continue: the index tells agents to read the covered files instead.
 
 ## 3. Plan
 Spawn the `harness:planner` subagent with the run directory. It writes `plan.md` and `tasks.json`.

@@ -71,6 +71,9 @@ Planning rules:
   error code change goes under "Contract changes" with each consumer file from the map and the task that updates it.
   A contract change without a consumer task means the plan is wrong. With no contract change, write "None": an
   undeclared change fails the gates and is a blocking review finding. `harness validate plan` checks the section.
+- Generated knowledge: if `<run_dir>/knowledge.md` exists, Grep the files it lists (such as a model map) for the
+  names, fields and relations the plan uses, instead of opening the files they cover. Use their exact names in the
+  tasks, so engineers don't have to look them up.
 - Order tasks so contracts are built before consumers: data model/migration -> API -> shared libraries
   -> UI. Follow any planning notes in CLAUDE.md (e.g. how repos depend on each other).
 - 1-6 tasks for a typical feature. A task should be one coherent change in one repo that an engineer
