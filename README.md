@@ -140,7 +140,8 @@ questions, writes `.claude/harness.toml`, `.claude/settings.json` and a `CLAUDE.
 for the project's Claude account, and closes the session. Running `/harness-init` again inside a project
 reconfigures it. You can also open `claude` in the new folder and ask it to set up the harness:
 `harness accounts sync` puts a short note in each account's user-level `CLAUDE.md` telling sessions to
-follow the `/harness-init` steps from this repo, since the plugin isn't loaded there yet.
+follow the `/harness-init` steps from this repo, since the plugin isn't loaded there yet. The same note
+tells sessions about `harness plugin update`, so asking any session to update the plugins works.
 
 After merging changes to the plugin, update every install (every project, every account) with
 `python3 ~/code/software-factory/scripts/harness.py plugin update`, then restart open sessions.

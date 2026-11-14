@@ -1938,6 +1938,10 @@ To set up the harness (/ship, /factory) in a folder without `.claude/harness.tom
 `{PLUGIN_DIR}/skills/harness-init/SKILL.md` and follow its steps, using
 `H = python3 {PLUGIN_DIR}/scripts/harness.py --root <the folder>` as its `H`. Don't run the terminal command
 `harness-setup` from a session: it starts its own interactive Claude session.
+
+To update the harness plugin (asked to "update the plugins", or after merging harness changes), run
+`python3 {PLUGIN_DIR}/scripts/harness.py plugin update`. It updates every project's install on every Claude
+account, including newly set up projects; then tell the user to restart open sessions.
 {SETUP_NOTE_END}"""
 
 
