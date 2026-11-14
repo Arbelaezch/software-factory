@@ -34,12 +34,20 @@ If there are POSSIBLY RELATED PRs, ask with AskUserQuestion (multiSelect) which 
 `H pr add <repo>#<n>` for each one chosen. Relay every WARNING to the user. For example, a warning
 that the app installs a component-library branch with no open PR means the set is incomplete.
 
+Reference files (before the review): run `H contracts map`, then `H knowledge`. Skip each one if it prints "No repo has
+[contracts]" or "No [knowledge] entries". `contracts map` rebuilds a stale API contract map and prints each map's
+path; `knowledge` rebuilds stale generated files (such as a model map; this can take a minute) and writes
+`<run_dir>/knowledge.md`. Both describe the code on the user's checkout, not the PR head. If one `failed`, relay the
+reason in one line and continue without it.
+
 ## 2. Review
 1. `H review --round 1`. If it prints `FALLBACK`, spawn the `harness:claude-reviewer` subagent for round 1 and
-   tell it this is a **PR review run** (the run directory, the harness path, round 1).
+   tell it this is a **PR review run** (the run directory, the harness path, round 1, and the contract map paths if
+   any).
 2. Spawn the `harness:verifier` subagent for round 1. Tell it this is a **PR review run**: the code is not
    checked out, so it reads files with `git show <ref>:<path>` (`H pr show` prints the exact
-   commands) and checks consumers in the other repos with `git grep ... origin/<base>`.
+   commands) and checks consumers in the other repos with `git grep ... origin/<base>`. Give it the contract map
+   paths if any.
 3. `H verdict --round 1` (prints `DECISION: DRAFT`).
 
 ## 3. Draft

@@ -1983,6 +1983,7 @@ class LegacyProfileTests(unittest.TestCase):
         self.assertLess(ship.index("Known traps"), ship.index("Look for, in priority order"))
         pr = h.review_system_prompt({"mode": "review", "profile": "legacy"}, self.cfg)
         self.assertNotIn("\"Follows:\"", pr)
+        self.assertIn("there is no plan to check against", pr)
         self.assertIn("- replica reads need .using(alias)", pr)
         self.assertNotIn("Known traps", h.review_system_prompt({"mode": "full"}, self.cfg))
 
@@ -2219,6 +2220,46 @@ message = "Live equivalent: web/{1}/api/."
             h.cmd_classify(mock.Mock(paths=["web/shop/views.py", "web/shop/api/x.py"]), self.cfg)
         self.assertEqual(out.getvalue().splitlines(),
                          ["legacy\tweb/shop/views.py\tLive equivalent: web/shop/api/.", "unclassified\tweb/shop/api/x.py"])
+
+    def test_pr_review_lists_classified_paths(self):
+        repo = self.root / "web"
+        git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, text=True).stdout.strip()
+        git("init", "-q", "-b", "dev")
+        git("config", "user.email", "t@example.com")
+        git("config", "user.name", "t")
+        (repo / "shop" / "api" / "x.py").write_text("x = 1\n")
+        git("add", "-A")
+        git("commit", "-qm", "base")
+        base = git("rev-parse", "HEAD")
+        for f in ("surveys2/models.py", "shop/views.py", "shop/api/x.py", "events/templates/events/checkin.html"):
+            (repo / f).parent.mkdir(parents=True, exist_ok=True)
+            (repo / f).write_text("y = 2\n")
+        git("add", "-A")
+        git("commit", "-qm", "pr")
+        git("update-ref", "refs/harness/pr/7", "HEAD")
+        pr = {"repo": "backend", "number": 7, "path": str(repo), "merge_base": base, "ref": "refs/harness/pr/7",
+              "title": "t", "head_branch": "feat/x", "base": "dev", "author": "a", "reason": "requested"}
+        run = {"mode": "review", "profile": "legacy", "prs": [pr]}
+        lines = h.pr_classified_paths(run).splitlines()
+        self.assertEqual(lines, ["- backend#7 `shop/views.py`: legacy (legacy-views). Live equivalent: web/shop/api/.",
+                                 "- backend#7 `surveys2/models.py`: dead (dead-apps). Not in INSTALLED_APPS."])
+        d = self.root / "runs" / "r1"
+        d.mkdir(parents=True)
+        (d / "task.md").write_text("# Review\n")
+        cfg = {**self.cfg, "repos": {"backend": {"path": "web"}}}
+        prompt, _ = h.build_pr_review_prompt(run, d, cfg)
+        self.assertIn("# Classified paths", prompt)
+        self.assertIn("`surveys2/models.py`: dead", prompt)
+        prompt, _ = h.build_pr_review_prompt({**run, "profile": None}, d, cfg)
+        self.assertNotIn("# Classified paths", prompt)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(h, "load_run", lambda: (d, run)):
+            h.cmd_diff(mock.Mock(stat=False, round=1), cfg)
+        self.assertTrue(out.getvalue().startswith("=== Classified paths ===\n"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            h.print_pr_set(d, run)
+        self.assertIn("profile: legacy\n", out.getvalue())
 
     def test_agents_cannot_edit_the_classification_file(self):
         self.assertTrue(h.enforcement_state_denial(

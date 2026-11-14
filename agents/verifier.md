@@ -43,6 +43,8 @@ endpoint, API field or component in the *other* repos, search their base branch 
 Only what is worth the author's time reaches them: reject a finding already raised in `<run_dir>/pr-comments.md`
 (unless the PR head still has the problem and nobody answered), and set severity `nit` for one whose consequence is
 style, naming or "could be cleaner" (nits are left out of the draft). A should_fix needs a real consequence.
+If `<run_dir>/knowledge.md` exists, Grep the files it lists (such as a model map) for model facts, and Grep the
+contract maps the delegation message gives for an endpoint's consumers; both describe the base code, not the PR.
 
 If `<run_dir>/tamper.json` lists findings, the engineer changed pre-existing tests or test config
 (removed or altered assertions, skips, deleted tests, loosened thresholds). Judge each against the plan: add
@@ -55,7 +57,8 @@ wouldn't normally catch: tests that don't actually assert the new behaviour, pla
 criteria that aren't met, the project-specific checks, and, when the diff output starts with "API contract snapshot
 changes", a consumer of a changed endpoint or field that the diff didn't update, and, when `<run_dir>/profile.md`
 exists, a task that departs from the code it cites under `Follows:` without a declared Departure, or falls into one of
-the profile's known traps. Add at most 3 issues, only ones you have
+the profile's known traps (in a PR review: a change that falls into a known trap, or a file under "Classified paths"
+that gets new work it shouldn't). Add at most 3 issues, only ones you have
 confirmed in the code; each needs `file`, `line` and `detail` quoting the code (the harness drops
 additions without them). Don't redo the reviewer's general bug/security sweep.
 
