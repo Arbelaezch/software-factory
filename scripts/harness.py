@@ -1220,6 +1220,8 @@ def hook_subagent_stop(cfg):
     rid = current_run_id()
     if not rid and not (payload.get("agent_type") or "").startswith("harness:"):
         return  # a subagent of the user's own session, not part of any run: nothing to attribute
+    if not payload.get("agent_type") and not find_agent_transcript(payload):
+        return  # Claude Code's own background agent (one after each main-session turn): no type, no transcript
     if rid and payload.get("transcript_path"):
         d = RUNS_DIR / rid
         run = read_json(d / "run.json", {})
@@ -4767,10 +4769,11 @@ def unattributed_agent_events(events: list[dict]) -> list[dict]:
 
 
 def legacy_lost_agent_events(lost: list[dict]) -> list[dict]:
-    """Lost events written before the SubagentStop hook recorded its payload (#68). Their transcripts are gone, so
-    they cannot be recovered, unlike a recent loss which still points at a path to check."""
+    """Lost events that need no follow-up: written before the SubagentStop hook recorded its payload (#68), so their
+    transcripts are gone, or from Claude Code's own untyped background agents, which never write one (the hook skips
+    those now). A recent loss of a real agent still points at a path to check."""
     return [e for e in lost if e.get("error") == "transcript not found" and e.get("stage") == "unknown"
-            and "payload" not in e]
+            and ("payload" not in e or not (e["payload"] or {}).get("agent_type"))]
 
 
 def issue_rollup(events: list[dict]) -> dict[int, dict]:
@@ -4953,8 +4956,8 @@ def cmd_report(a, cfg):
         print(f"{len(recent)} agent event(s) have no usage data (transcript not found or no agent type); "
               "they are excluded above.")
     if legacy:
-        print(f"{len(legacy)} older agent event(s) predate payload logging (#68) and cannot be recovered; "
-              "they are excluded above and not counted as a problem.")
+        print(f"{len(legacy)} older agent event(s) predate payload logging (#68) or came from Claude Code's own "
+              "untyped background agents; they are excluded above and not counted as a problem.")
 
     issues = issue_rollup(events)
     if issues:

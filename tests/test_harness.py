@@ -803,6 +803,21 @@ class SubagentStopTests(unittest.TestCase):
             self.assertEqual(events, [])
             find.assert_not_called()
 
+    def test_untyped_agent_without_transcript_is_skipped_inside_a_run(self):
+        for agent_type in ("", None):
+            events, find = self.run_hook({"agent_id": "a1", "agent_type": agent_type}, rid="r1")
+            self.assertEqual(events, [])
+            find.assert_called_once()
+
+    def test_untyped_agent_with_transcript_inside_a_run_is_logged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tr = Path(tmp) / "agent.jsonl"
+            tr.write_text(json.dumps({"type": "assistant", "message": {
+                "id": "m1", "model": "claude-sonnet-5-5", "content": [], "usage": {"input_tokens": 5, "output_tokens": 2}}}) + "\n")
+            with mock.patch.object(h, "SEEN_DIR", Path(tmp) / "seen"), mock.patch.object(h, "RUNS_DIR", Path(tmp)):
+                events, _ = self.run_hook({"agent_id": "a1", "agent_type": ""}, rid="r1", path=tr)
+        self.assertEqual([e["stage"] for e in events], ["unknown"])
+
     def test_harness_agent_with_missing_transcript_logs_an_error(self):
         events, _ = self.run_hook({"agent_id": "a1", "agent_type": "harness:scout"})
         self.assertEqual([(e["stage"], e["error"]) for e in events], [("scout", "transcript not found")])
@@ -847,8 +862,9 @@ class SubagentStopTests(unittest.TestCase):
 
     def test_legacy_lost_events_are_split_out(self):
         old = {"kind": "agent", "stage": "unknown", "error": "transcript not found"}
-        new = {**old, "payload": {"agent_type": None}}
-        self.assertEqual(h.legacy_lost_agent_events([old, new]), [old])
+        untyped = {**old, "payload": {"agent_type": ""}}
+        real = {**old, "stage": "scout", "payload": {"agent_type": "harness:scout"}}
+        self.assertEqual(h.legacy_lost_agent_events([old, untyped, real]), [old, untyped])
 
 
 def assistant_line(mid, inp, out=1, cache_read=0, cache_write=0):
