@@ -39,7 +39,9 @@ naming, error handling, how API calls are made from the frontend), with one file
 
 ## Tests
 Where the related tests live, the test style, the exact command to run just those tests, and the
-repo's lint/format/typecheck commands (from package scripts, Makefile or CI config).
+repo's lint/format/typecheck commands (from package scripts, Makefile or CI config). Give them as the repo's
+script (`npm run format:check`, `make lint`) when one exists, not the raw tool (`npx prettier --check .`):
+headless sessions refuse most raw tool commands.
 
 ## Cross-repo touchpoints
 Endpoints, payload fields or exported components that other repos or modules depend on.

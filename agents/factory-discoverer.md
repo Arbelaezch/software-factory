@@ -35,7 +35,8 @@ missing. Draft issues only for what is **missing**:
 - **A question the documents don't settle** goes in `notes` with the issue it would affect. Don't invent the answer
   in an issue body, and don't file the issue that depends on it.
 - Same shape rules as the planner: one concern each and one /ship run each, 2 to 5 observable acceptance criteria,
-  vertical slices over layers, dependencies only between issues in this draft (by key), labels `enhancement` or
+  vertical slices over layers, commands named as the repo's scripts (`npm run format:check`, not
+  `npx prettier --check .`), dependencies only between issues in this draft (by key), labels `enhancement` or
   `bug`. Never add `todo` or `backlog`: the supervisor labels what you draft.
 - At most the number of issues the prompt allows, the most valuable first. If more are missing, file the first ones
   now; the next round will find the rest.

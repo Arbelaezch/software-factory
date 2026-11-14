@@ -43,9 +43,13 @@ Rules:
 - Shell: headless sessions auto-approve only plain commands. Variable assignments and `$VAR` expansion, `cd` chains,
   listing paths outside the project, and anything not pre-approved are denied. Read files with Read/Grep/Glob, and use
   one command per Bash call with literal absolute paths (no `RD=...; ls $RD`).
-  A denied read or exploration command is not a blocker: redo it as a plain command or with Read/Grep/Glob. Reply
-  `NEEDS USER: <exact command> denied` only when a plain `gates` run or a dependency install the task needs
-  (`npm install`, `npm ci`) is itself denied, and name that command; don't guess which command was refused.
+  A denied read or exploration command is not a blocker: redo it as a plain command or with Read/Grep/Glob.
+  A denied tool command (`npx prettier --check .`, a linter, a formatter) is not a blocker either until you have
+  looked for an allowed way to run the same thing: a `package.json` script (`npm run format:check`), a Makefile
+  target or `scripts/*` entry, or the harness gates. Use it if one exists. Reply `NEEDS USER: <exact command>
+  denied` only when none exists, or when a plain `gates` run or a dependency install the task needs (`npm install`,
+  `npm ci`) is itself denied; name that command and the scripts you checked, and don't guess which command was
+  refused. Don't suggest an allow rule yourself: rules follow `docs/factory-allowlist.md` and the manager writes them.
 
 When done editing, run the gates for your repo:
 `python3 <harness_path> gates --repo <repo> --task <task id> --attempt 1`
