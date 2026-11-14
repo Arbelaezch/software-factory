@@ -1926,6 +1926,40 @@ def plugin_installed(d: Path, root: Path) -> bool:
                for e in installed_entries(d))
 
 
+# The plugin is on only in harness projects, so a session in a new folder doesn't know /harness-init. Every
+# account's user-level CLAUDE.md carries this note (kept by `harness accounts sync`) so it can set one up.
+SETUP_NOTE_START, SETUP_NOTE_END = "<!-- harness:setup-note (kept by `harness accounts sync`) -->", "<!-- /harness:setup-note -->"
+
+
+def setup_note() -> str:
+    return f"""{SETUP_NOTE_START}
+## Software factory harness
+To set up the harness (/ship, /factory) in a folder without `.claude/harness.toml`, read
+`{PLUGIN_DIR}/skills/harness-init/SKILL.md` and follow its steps, using
+`H = python3 {PLUGIN_DIR}/scripts/harness.py --root <the folder>` as its `H`. Don't run the terminal command
+`harness-setup` from a session: it starts its own interactive Claude session.
+{SETUP_NOTE_END}"""
+
+
+def with_setup_note(text: str) -> str:
+    """text with the setup note added, or replaced if an older one is there."""
+    i, j = text.find(SETUP_NOTE_START), text.find(SETUP_NOTE_END)
+    if i != -1 and j > i:
+        return text[:i] + setup_note() + text[j + len(SETUP_NOTE_END):]
+    return (text.rstrip("\n") + "\n\n" if text.strip() else "") + setup_note() + "\n"
+
+
+def setup_note_missing(cfg) -> list[str]:
+    """Accounts whose user-level CLAUDE.md lacks the current setup note."""
+    out = []
+    for name, d in account_dirs(cfg).items():
+        path = d / "CLAUDE.md"
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+        if with_setup_note(text) != text:
+            out.append(name)
+    return out
+
+
 def settings_drift(cfg) -> dict[str, list[str]]:
     """Account -> the shared settings keys whose value differs from ~/.claude/settings.json."""
     keys = (cfg.get("accounts") or {}).get("shared_settings") or []
@@ -6116,6 +6150,8 @@ def account_lines(cfg, root: Path | None = None) -> list[tuple[bool | None, str]
         elif not email:
             text += f" (run `claude-{name}` or `claude-as {name}` and /login)"
         out.append((not shared and bool(email) if mine or shared else None, text))
+        if name in setup_note_missing(cfg):
+            out.append((False, f"{name}: {d / 'CLAUDE.md'} lacks the harness setup note; run `harness accounts sync`"))
         if name in drift:
             out.append((False, f"{name}: settings differ from ~/.claude/settings.json ({', '.join(drift[name])}); "
                                "run `harness accounts sync`"))
@@ -6131,7 +6167,13 @@ def cmd_accounts(a, cfg):
         changed = sync_account_settings(cfg)
         for name, keys in changed.items():
             print(f"{name}: updated {', '.join(keys)} in {account_dirs(cfg)[name] / 'settings.json'}")
-        print("all account directories already match ~/.claude/settings.json" if not changed else "done")
+        for name in setup_note_missing(cfg):
+            path = account_dirs(cfg)[name] / "CLAUDE.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(with_setup_note(path.read_text(encoding="utf-8") if path.exists() else ""), encoding="utf-8")
+            changed.setdefault(name, [])
+            print(f"{name}: wrote the harness setup note to {path}")
+        print("all account directories are already in sync" if not changed else "done")
         return
     for good, text in account_lines(cfg, ROOT if CONFIGURED else None):
         print(("  info " if good is None else "  ok   " if good else "  !!   ") + text)
