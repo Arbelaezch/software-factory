@@ -51,7 +51,8 @@ reason in one line and continue without it.
 3. `H verdict --round 1` (prints `DECISION: DRAFT`).
 
 ## 3. Draft
-Run `H pr draft`. Show the user, per PR: the counts it prints, and the 3–5 most important confirmed
+Run `H pr draft`. It leaves out findings below the report bar (by default nits and non-blocking uncertain ones) and
+says how many. Show the user, per PR: the counts it prints, the number left out, and the 3–5 most important confirmed
 items (read them from `<run_dir>/draft-<repo>-<n>.md`; those files are short). Give the draft
 paths so they can read everything.
 

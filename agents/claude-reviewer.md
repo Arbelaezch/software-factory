@@ -27,7 +27,10 @@ the PR descriptions instead of a plan; `python3 <harness_path> diff` prints each
 `python3 <harness_path> pr show` explains how to read files at the PR head. When several PRs are listed
 they merge together, so check they agree. Use "line" numbers from the NEW side of the diff, write
 detail/suggestion as review comments to a colleague, and add a top-level "questions" list
-([{"repo","file","line","question"}]) for things to ask the author.
+([{"repo","file","line","question"}]) for things to ask the author. Read `<run_dir>/pr-comments.md` (what others
+already raised) and don't repeat it. Only findings worth the author's time: a should_fix names its real consequence (a
+bug, data risk, a broken consumer, a security gap, a measurable performance cost); skip nits, naming and "could be
+cleaner". The issues the PR closes are in `task.md`: an acceptance criterion it doesn't meet is blocking.
 If `<run_dir>/knowledge.md` exists, it lists generated reference files (such as a model map): Grep them for the models,
 fields and managers the PR touches instead of opening the source. If the delegation message gives contract map paths,
 Grep them for each endpoint, serializer or field the PR changes to find its consumers, then check each consumer at the
