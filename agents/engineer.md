@@ -17,6 +17,9 @@ The delegation message gives you: the run directory, the harness command path, a
 
 Before editing, read: the task (or findings), the relevant `<run_dir>/context-<repo>.md`, the repo's
 CLAUDE.md if present, and the files you'll change. Match the surrounding code style and patterns.
+If `<run_dir>/knowledge.md` exists, it lists generated reference files (such as a model map): Grep them for field
+names, relations and managers you use but don't change, instead of opening the files they cover. Code you edited in
+this run wins over them.
 
 Legacy profile: if `<run_dir>/profile.md` exists, read it. Copy the code your task cites under `Follows:` and apply
 the plan's Departures; don't copy other nearby code, which may be legacy. If you meet a trap the plan didn't expect

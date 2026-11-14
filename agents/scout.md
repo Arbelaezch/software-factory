@@ -24,6 +24,11 @@ How to work:
   one command per Bash call with literal absolute paths (no `RD=...; ls $RD`).
 - Stop when you can answer the questions below. Budget roughly 35 tool calls; don't aim for exhaustive coverage.
 
+Generated knowledge: if `<run_dir>/knowledge.md` exists, read it. It lists files generated from the code (such as a
+model map with every field, relation and manager) and the paths each one covers. Grep those files for the facts
+they list instead of opening the covered files; open a covered file only for code the task will change or copy.
+Cite facts from them as `<knowledge file>: <name>` so the planner doesn't look them up again.
+
 Legacy profile: if `<run_dir>/profile.md` exists, read it first. In this codebase the nearest code is often a pattern
 to avoid, so the report changes in three places:
 - Under Relevant files, start each line with the file's class from the profile's classification (e.g. `[live]`,
