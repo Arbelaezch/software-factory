@@ -188,6 +188,13 @@ terminal is logged in to. Run `python3 scripts/usage.py` (exit code 0 go, 10 pau
 - `[git]`: `base_branch`, `mode = "uncommitted" | "commit"` (what subagents may do; committing as a subagent also needs a `write_accounts` login).
 - `[repos.<name>]`: `path`, `description`, `gates = [{ name, kind, cmd, cwd }]`, where `kind` is
   jest, pytest, django, tsc or eslint.
+- `[repos.<name>.contracts]` (optional, for a repo that serves an API to other repos): `map_cmd` writes a contract
+  map (endpoints, fields, consumers) to `{out}`, rebuilt by `harness contracts map` only when a file under `covers`
+  (pathspecs; `"<repo>:<pathspec>"` for another repo) changed since it was built. Scouts and the planner read it.
+  `snapshot_cmd` writes the contract (fields and status codes per endpoint) to `{out}`: `harness baseline` takes a
+  snapshot before any edits and the `contracts` gate takes another and diffs them, so nothing is committed to the repo.
+  `cwd` is where the commands run. The plan must declare every contract change with a consumer task, reviewers get
+  the contract diff, and an undeclared change fails the gate and is a blocking finding.
 - Any section from [`scripts/defaults.toml`](scripts/defaults.toml) can be overridden, such as
   `[reviewer]`, `[models]`, `[loop]` or `[providers.*]`.
 

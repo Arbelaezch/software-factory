@@ -1433,3 +1433,175 @@ class TierTests(unittest.TestCase):
         text = out.getvalue()
         self.assertRegex(text, r"tiny\s+2\s+100%\s+1\.0\s+\$0\.30")
         self.assertRegex(text, r"standard\s+1\s+0%\s+3\.0\s+\$3\.00")
+
+
+class ContractTests(unittest.TestCase):
+    """[repos.<name>.contracts]: the contract map, the per-run snapshot gate, and the plan, review and verdict checks."""
+
+    PLAN_NONE = "# Plan: x\n## Contract changes\nNone\n## Tasks\n### T1: x\n"
+    PLAN_DECLARED = ("# Plan: x\n## Contract changes\nGET /api/x drops `name`; consumer web/x.js updated by T2\n"
+                     "## Tasks\n### T1: x\n")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.gits = {}
+        for name in ("api", "web"):
+            repo = self.root / name
+            (repo / "src").mkdir(parents=True)
+            (repo / "src" / "views.py").write_text("x = 1\n")
+            (repo / "README.md").write_text("readme\n")
+            g = lambda *a, repo=repo: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, text=True).stdout.strip()
+            g("init", "-q", "-b", "main")
+            g("add", ".")
+            g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init")
+            self.gits[name] = g
+        # The "contract" is whatever src/contract.json says; a real snapshot_cmd introspects the API.
+        (self.root / "api" / "contract.json").write_text('{"GET /api/x": ["id", "name"]}')
+        self.contracts = {"map_cmd": "echo '# map' > {out}", "covers": ["src", "web:src"], "snapshot_cmd": "cp contract.json {out}"}
+        self.cfg = {"repos": {"api": {"path": "api", "gates": [{"name": "tests", "cmd": "true"}],
+                                      "contracts": self.contracts},
+                              "web": {"path": "web", "gates": [{"name": "tests", "cmd": "true"}]}}}
+        self.d = self.root / "run"
+        self.d.mkdir()
+        self.run_ = {"id": "r1", "mode": "full", "task": "t",
+                     "repos": {n: {"base_commit": g("rev-parse", "HEAD")} for n, g in self.gits.items()}}
+        for p in (mock.patch.object(h, "ROOT", self.root), mock.patch.object(h, "CONTRACTS_DIR", self.root / ".harness" / "contracts")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def build(self, force=False):
+        return h.build_contract_map("api", h.repos(self.cfg), self.cfg, force)[0]
+
+    def baseline(self):
+        with mock.patch.object(h, "load_run", return_value=(self.d, self.run_)), mock.patch.object(h, "log_event"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            h.cmd_baseline(mock.Mock(repos="api"), self.cfg)
+        return out.getvalue()
+
+    def gate(self):
+        return h.contract_gate(self.d, "api", h.repos(self.cfg)["api"], self.cfg)
+
+    def change_contract(self):
+        (self.root / "api" / "contract.json").write_text('{"GET /api/x": ["id"]}')
+
+    def test_projects_without_contracts_are_unchanged(self):
+        cfg = {"repos": {"web": self.cfg["repos"]["web"]}}
+        self.assertEqual(h.gates_for("web", h.repos(cfg)["web"], cfg), ([{"name": "tests", "cmd": "true"}], False))
+        self.assertEqual(h.contract_snapshot_diffs(self.d), {})
+        self.assertEqual(h.validate_contract_plan(None, {"repos": ["web"], "tasks": []}, cfg), [])
+        self.assertEqual(h.undeclared_contract_findings(self.d), [])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            h.cmd_contracts(mock.Mock(action="map", repo=None, force=False), cfg)
+        self.assertIn("No repo has [contracts]", out.getvalue())
+        with mock.patch.object(h, "load_run", return_value=(self.d, self.run_)), contextlib.redirect_stdout(io.StringIO()) as out:
+            h.cmd_baseline(mock.Mock(repos="web"), cfg)
+        self.assertNotIn("contracts", out.getvalue())
+
+    def test_snapshot_cmd_runs_as_the_contracts_gate(self):
+        gates, _ = h.gates_for("api", h.repos(self.cfg)["api"], self.cfg)
+        self.assertEqual([g["name"] for g in gates], ["tests", "contracts"])
+        self.assertTrue(gates[-1]["contracts"])
+
+    def test_map_is_rebuilt_only_when_a_covered_file_changes(self):
+        self.assertEqual(self.build(), "rebuilt")
+        self.assertTrue(h.contract_map_path("api").exists())
+        self.assertEqual(self.build(), "fresh")
+        (self.root / "api" / "README.md").write_text("changed\n")  # not covered
+        self.assertEqual(self.build(), "fresh")
+        (self.root / "web" / "src" / "views.py").write_text("x = 2\n")  # covered, in the other repo, uncommitted
+        self.assertEqual(h.contract_map_stale("api", h.repos(self.cfg)), "covered files in web changed (src/views.py)")
+        self.assertEqual(self.build(), "rebuilt")
+        self.gits["web"]("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "edit")
+        self.assertEqual(self.build(), "fresh")
+        self.assertEqual(self.build(force=True), "rebuilt")
+        (self.root / "api" / "src" / "serializers.py").write_text("y = 1\n")  # a new, untracked covered file
+        self.assertIn("src/serializers.py", h.contract_map_stale("api", h.repos(self.cfg)))
+        self.contracts["map_cmd"] = "echo '# map v2' > {out}"
+        self.assertEqual(h.contract_map_stale("api", h.repos(self.cfg)), "map_cmd changed")
+
+    def test_a_failing_or_silent_map_cmd_is_reported(self):
+        self.contracts["map_cmd"] = "echo boom; exit 3"
+        state, detail = h.build_contract_map("api", h.repos(self.cfg), self.cfg)
+        self.assertEqual(state, "failed")
+        self.assertIn("boom", detail)
+        self.contracts["map_cmd"] = "true"
+        self.assertEqual(self.build(), "failed")
+
+    def test_gate_needs_a_pre_edit_snapshot(self):
+        ok, out = self.gate()
+        self.assertFalse(ok)
+        self.assertIn("harness baseline --repos api", out)
+        self.assertIn("contracts: baseline snapshot recorded", self.baseline())
+        self.assertEqual(self.gate(), (True, "API contract unchanged."))
+        self.contracts["snapshot_cmd"] = "echo boom; exit 1"
+        ok, out = self.gate()
+        self.assertFalse(ok)
+        self.assertIn("boom", out)
+
+    def test_key_order_is_not_a_contract_change(self):
+        self.baseline()
+        (self.root / "api" / "contract.json").write_text('{\n  "GET /api/x": ["id", "name"]\n}\n')
+        self.assertTrue(self.gate()[0])
+        self.assertEqual(h.contract_snapshot_diffs(self.d), {})
+
+    def test_undeclared_change_fails_the_gate_and_the_verdict(self):
+        (self.d / "plan.md").write_text(self.PLAN_NONE)
+        self.baseline()
+        self.change_contract()
+        ok, out = self.gate()
+        self.assertFalse(ok)
+        self.assertIn("declares none", out)
+        self.assertIn('-"GET /api/x"[]: "name"', h.contract_snapshot_diffs(self.d)["api"])
+        found = h.undeclared_contract_findings(self.d)
+        self.assertEqual([(f["id"], f["severity"], f["verdict"]) for f in found], [("C-api", "blocking", "confirmed")])
+        h.write_json(self.d / "review-1.json", {"round": 1, "provider": "claude", "findings": []})
+        h.write_json(self.d / "verified-1.json", {"findings": []})
+        with mock.patch.object(h, "load_run", return_value=(self.d, self.run_)), mock.patch.object(h, "log_event"), \
+                mock.patch.object(h, "tamper_scan", return_value=[]), contextlib.redirect_stdout(io.StringIO()) as out:
+            h.cmd_verdict(mock.Mock(round=1), self.cfg)
+        self.assertIn("DECISION: FIX", out.getvalue())
+        self.assertEqual([f["id"] for f in json.loads((self.d / "fix-1.json").read_text())["findings"]], ["C-api"])
+        # reverting the change clears the saved diff on the next gates run
+        (self.root / "api" / "contract.json").write_text('{"GET /api/x": ["id", "name"]}')
+        self.assertTrue(self.gate()[0])
+        self.assertEqual(h.undeclared_contract_findings(self.d), [])
+
+    def test_declared_change_passes_and_reviewers_see_the_diff(self):
+        (self.d / "plan.md").write_text(self.PLAN_DECLARED)
+        self.baseline()
+        self.change_contract()
+        ok, out = self.gate()
+        self.assertTrue(ok)
+        self.assertIn("changed as declared", out)
+        self.assertEqual(h.undeclared_contract_findings(self.d), [])
+        prompt, _ = h.build_review_prompt(self.run_, self.d, self.cfg, 1)
+        self.assertIn("# API contract snapshot changes", prompt)
+        self.assertLess(prompt.index("API contract snapshot"), prompt.index("# Changes"))
+        with mock.patch.object(h, "load_run", return_value=(self.d, self.run_)), contextlib.redirect_stdout(io.StringIO()) as out:
+            h.cmd_diff(mock.Mock(round=1, stat=False), self.cfg)
+        self.assertTrue(out.getvalue().startswith("=== API contract snapshot changes ==="))
+
+    def test_plan_must_declare_contract_changes_with_a_consumer_task(self):
+        tasks = {"repos": ["api", "web"], "tasks": [{"id": "T1"}, {"id": "T2"}]}
+        self.assertIn("plan.md is missing", h.validate_contract_plan(None, tasks, self.cfg)[0])
+        self.assertIn("Contract changes", h.validate_contract_plan("# Plan\n## Tasks\n", tasks, self.cfg)[0])
+        self.assertEqual(h.validate_contract_plan(self.PLAN_NONE, tasks, self.cfg), [])
+        self.assertEqual(h.validate_contract_plan(self.PLAN_NONE.replace("None", "No contract change."), tasks, self.cfg), [])
+        self.assertEqual(h.validate_contract_plan(self.PLAN_DECLARED, tasks, self.cfg), [])
+        no_task = self.PLAN_DECLARED.replace("updated by T2", "updated")
+        self.assertIn("consumer task", h.validate_contract_plan(no_task, tasks, self.cfg)[0])
+        self.assertEqual(h.validate_contract_plan(no_task, {"repos": ["web"], "tasks": []}, self.cfg), [])
+
+    def test_gates_command_runs_the_contracts_gate_in_process(self):
+        (self.d / "plan.md").write_text(self.PLAN_NONE)
+        self.baseline()
+        self.change_contract()
+        (self.root / "api" / "src" / "views.py").write_text("x = 2\n")
+        with mock.patch.object(h, "load_run", return_value=(self.d, self.run_)), mock.patch.object(h, "log_event"), \
+                contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as cm:
+            h.cmd_gates(mock.Mock(repo=["api"], task="T1", attempt=1), self.cfg)
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("[api] contracts: FAIL", out.getvalue())
+        self.assertIn("declares none", out.getvalue())

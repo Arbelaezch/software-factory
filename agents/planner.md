@@ -37,7 +37,8 @@ Write two files.
 ## Approach
 <why this design; alternatives rejected in one line each>
 ## Contract changes
-<API endpoints / payload fields / component props that change, with exact shapes. "None" if none.>
+<API endpoints / payload fields / component props that change, with exact shapes, and for each one the consumer
+files and the task (T1, T2, ...) that updates them. "None" if none.>
 ## Tasks
 ### T1: <title>  (repo: backend, model: sonnet)
 - Files: <paths to create/modify>
@@ -64,6 +65,12 @@ If a task must change existing tests (e.g. an assertion that encodes old behavio
 `"tests_may_change": ["<repo-relative path globs>"]` to it; otherwise changes to existing tests are flagged.
 
 Planning rules:
+- API contracts: if the delegation message gives contract map paths, the gates snapshot the repo's API contract
+  before and after the edits and fail on a change the plan doesn't declare. Check the endpoints the task touches
+  against the map (Grep it) and the scouts' "Cross-repo touchpoints". Every serializer field, URL, status code or
+  error code change goes under "Contract changes" with each consumer file from the map and the task that updates it.
+  A contract change without a consumer task means the plan is wrong. With no contract change, write "None": an
+  undeclared change fails the gates and is a blocking review finding. `harness validate plan` checks the section.
 - Order tasks so contracts are built before consumers: data model/migration -> API -> shared libraries
   -> UI. Follow any planning notes in CLAUDE.md (e.g. how repos depend on each other).
 - 1-6 tasks for a typical feature. A task should be one coherent change in one repo that an engineer

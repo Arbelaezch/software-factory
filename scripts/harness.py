@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime as dt
+import difflib
 import fnmatch
 import hashlib
 import json
@@ -1888,8 +1889,13 @@ def detect_gates(repo: Path, cfg: dict) -> list[dict]:
 
 def gates_for(rname: str, rcfg: dict, cfg: dict) -> tuple[list[dict], bool]:
     if rcfg.get("gates"):
-        return list(rcfg["gates"]), False
-    return detect_gates(rcfg["abs"], cfg), True
+        gates, auto = list(rcfg["gates"]), False
+    else:
+        gates, auto = detect_gates(rcfg["abs"], cfg), True
+    c = rcfg.get("contracts") or {}
+    if c.get("snapshot_cmd"):
+        gates.append({"name": "contracts", "cmd": c["snapshot_cmd"], "cwd": c.get("cwd", "."), "contracts": True})
+    return gates, auto
 
 
 def run_untracked(path: Path, rname: str, run: dict) -> list[str]:
@@ -1974,6 +1980,11 @@ def cmd_baseline(a, cfg):
         if rname not in rs:
             print(f"[{rname}] unknown repo")
             continue
+        if ((rs[rname].get("contracts") or {}).get("snapshot_cmd")):
+            t0 = time.time()
+            ok, detail = take_contract_snapshot(d, rname, rs[rname], cfg, "base")
+            print(f"[{rname}] contracts: baseline snapshot {'recorded' if ok else 'FAILED'} ({round(time.time() - t0)}s)"
+                  + ("" if ok else f"\n{detail}"))
         gates, _ = gates_for(rname, rs[rname], cfg)
         files = planned_files(d, rname)
         repo_prefix = rs[rname].get("path", rname).rstrip("/") + "/"
@@ -2075,11 +2086,14 @@ def cmd_gates(a, cfg):
                 print(f"[{rname}] {g['name']}: SKIP (no relevant changed files)")
                 continue
             t0 = time.time()
-            try:
-                r = run_cmd(cmd, cwd=cwd, timeout=g.get("timeout_seconds", gcfg.get("timeout_seconds", 900)), env=env, shell=True)
-                ok, out = r.returncode == 0, (r.stdout or "") + (r.stderr or "")
-            except subprocess.TimeoutExpired as exc:
-                ok, out = False, f"TIMEOUT after {exc.timeout}s\n{exc.stdout or ''}"
+            if g.get("contracts"):
+                ok, out = contract_gate(d, rname, rs[rname], cfg)
+            else:
+                try:
+                    r = run_cmd(cmd, cwd=cwd, timeout=g.get("timeout_seconds", gcfg.get("timeout_seconds", 900)), env=env, shell=True)
+                    ok, out = r.returncode == 0, (r.stdout or "") + (r.stderr or "")
+                except subprocess.TimeoutExpired as exc:
+                    ok, out = False, f"TIMEOUT after {exc.timeout}s\n{exc.stdout or ''}"
             secs = round(time.time() - t0, 1)
             log = logs / f"{attempt:03d}-{rname}-{g['name']}.log"
             log.write_text(f"$ (cd {cwd} && {cmd})\n\n{out}", encoding="utf-8")
@@ -2119,6 +2133,246 @@ def cmd_gates(a, cfg):
     report_tampering(cfg, run, d, targets)
     print("GATES: PASS" if all_ok else "GATES: FAIL")
     sys.exit(0 if all_ok else 1)
+
+
+# --------------------------------------------------------------------------- API contracts
+# A repo that serves an API to other repos can set [repos.<name>.contracts] (README, per-project config):
+#   map_cmd    writes the contract map (Markdown: endpoints, fields, consumers) to {out}; scouts and the planner grep it
+#   covers     pathspecs the map is built from ("<repo>:<pathspec>" for another repo); default: this whole repo
+#   snapshot_cmd writes the contract (fields and status codes per endpoint) to {out}. `harness baseline` takes one
+#              before any edits and the "contracts" gate takes another and diffs them, so nothing is committed
+#   cwd        repo-relative folder the commands run in (default: the repo root)
+CONTRACTS_DIR = STATE_DIR / "contracts"
+CONTRACT_NONE_RE = re.compile(r"^\W*(none|no contract changes?)\b", re.I)
+TASK_ID_RE = re.compile(r"\bT\d+\b")
+
+CONTRACT_REVIEW_NOTE = (
+    "The API contract snapshot differs from the one taken before any edits, so this diff changes an API contract. Check every consumer of "
+    "each changed endpoint, field or status code (in every repo) against it, and check that the plan's "
+    "\"Contract changes\" section declares the change with a task that updates those consumers.")
+
+
+def contract_repos(cfg: dict) -> dict[str, dict]:
+    return {n: r for n, r in repos(cfg).items() if (r.get("contracts") or {}).get("map_cmd")
+            or (r.get("contracts") or {}).get("snapshot_cmd")}
+
+
+def contract_map_path(rname: str) -> Path:
+    return CONTRACTS_DIR / f"{rname}-map.md"
+
+
+def contract_covers(rname: str, c: dict, rs: dict) -> dict[str, list[str]]:
+    """{repo: pathspecs} the map is built from. An empty list means the whole repo."""
+    out: dict[str, list[str]] = {}
+    for spec in c.get("covers") or []:
+        repo, _, rest = spec.partition(":")
+        if rest and repo in rs:
+            out.setdefault(repo, []).append(rest)
+        else:
+            out.setdefault(rname, []).append(spec)
+    return out or {rname: []}
+
+
+def covered_state(path: Path, sha: str, specs: list[str]) -> tuple[list[str], str]:
+    """(covered files that differ from `sha`, a hash of those differences), uncommitted and untracked files included."""
+    diff = git(path, "diff", "--no-color", sha, "--", *specs)
+    names = git(path, "diff", "--name-only", sha, "--", *specs).split()
+    h = hashlib.sha1(diff.encode())
+    for u in sorted(git(path, "ls-files", "--others", "--exclude-standard", "--", *specs).split()):
+        names.append(u)
+        h.update(u.encode())
+        try:
+            h.update((path / u).read_bytes())
+        except OSError:
+            pass
+    return names, h.hexdigest()
+
+
+def contract_map_stale(rname: str, rs: dict) -> str | None:
+    """Why the map must be rebuilt, or None when it is current: a covered file is not as it was when the map was
+    built (a commit since, or an uncommitted or untracked edit), or the map, its stamp or its command changed."""
+    c = rs[rname]["contracts"]
+    stamp = read_json(CONTRACTS_DIR / f"{rname}.json")
+    if not stamp or not contract_map_path(rname).exists():
+        return "no map yet"
+    if stamp.get("cmd") != c["map_cmd"]:
+        return "map_cmd changed"
+    for repo, specs in contract_covers(rname, c, rs).items():
+        built = (stamp.get("repos") or {}).get(repo) or {}
+        if not built.get("commit"):
+            return f"no recorded commit for {repo}"
+        try:
+            names, digest = covered_state(rs[repo]["abs"], built["commit"], specs)
+        except RuntimeError:
+            return f"recorded commit of {repo} is gone"
+        if digest != built.get("state"):
+            return f"covered files in {repo} changed ({', '.join(names[:3]) or 'reverted'}{', ...' if len(names) > 3 else ''})"
+    return None
+
+
+def run_out_cmd(cmd: str, out_path: Path, rcfg: dict, cfg: dict) -> tuple[bool, str]:
+    """Run a [contracts] command that writes to {out}. (ok, output tail)."""
+    c = rcfg["contracts"]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.unlink(missing_ok=True)
+    try:
+        r = run_cmd(cmd.replace("{out}", shlex.quote(str(out_path))), cwd=rcfg["abs"] / c.get("cwd", "."), shell=True,
+                    timeout=c.get("timeout_seconds", (cfg.get("gates") or {}).get("timeout_seconds", 900)),
+                    env={**os.environ, "CI": "true", "FORCE_COLOR": "0"})
+        ok, out = r.returncode == 0, (r.stdout or "") + (r.stderr or "")
+    except subprocess.TimeoutExpired as exc:
+        ok, out = False, f"TIMEOUT after {exc.timeout}s"
+    tail = "\n".join(out.strip().splitlines()[-20:])
+    if ok and not out_path.exists():
+        return False, f"the command did not write {{out}}\n{tail}"
+    return ok, tail
+
+
+def build_contract_map(rname: str, rs: dict, cfg: dict, force: bool = False) -> tuple[str, str]:
+    """(state, detail): state is fresh | rebuilt | failed."""
+    c = rs[rname]["contracts"]
+    reason = "forced" if force else contract_map_stale(rname, rs)
+    if reason is None:
+        return "fresh", ""
+    ok, tail = run_out_cmd(c["map_cmd"], contract_map_path(rname), rs[rname], cfg)
+    if not ok:
+        return "failed", f"{reason}; map_cmd failed:\n{tail}"
+    built = {}
+    for repo, specs in contract_covers(rname, c, rs).items():
+        sha = git(rs[repo]["abs"], "rev-parse", "HEAD").strip()
+        built[repo] = {"commit": sha, "state": covered_state(rs[repo]["abs"], sha, specs)[1]}
+    write_json(CONTRACTS_DIR / f"{rname}.json", {"cmd": c["map_cmd"], "repos": built, "built_at": iso()})
+    return "rebuilt", reason
+
+
+def snapshot_path(d: Path, rname: str, which: str) -> Path:
+    return d / "contracts" / f"{rname}-{which}.json"
+
+
+def take_contract_snapshot(d: Path, rname: str, rcfg: dict, cfg: dict, which: str) -> tuple[bool, str]:
+    return run_out_cmd(rcfg["contracts"]["snapshot_cmd"], snapshot_path(d, rname, which), rcfg, cfg)
+
+
+def _flatten(value, path: str, out: list[str]) -> None:
+    if isinstance(value, dict) and value:
+        for k in sorted(value):
+            key = json.dumps(k) if re.search(r"[^\w-]", k) else k
+            _flatten(value[k], f"{path}.{key}" if path else key, out)
+    elif isinstance(value, list) and value and all(not isinstance(v, (dict, list)) for v in value):
+        out += sorted(f"{path}[]: {json.dumps(v)}" for v in value)
+    elif isinstance(value, list) and value:
+        for i, v in enumerate(value):
+            _flatten(v, f"{path}[{i}]", out)
+    else:
+        out.append(f"{path}: {json.dumps(value)}")
+
+
+def _snapshot_lines(path: Path) -> list[str]:
+    """A JSON snapshot becomes one sorted `a.b."key with spaces".c: value` line per leaf, so every diff line says
+    which endpoint and field it is about, and key order never shows up as a change. Other text is diffed as is."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return text.splitlines(keepends=True)
+    lines: list[str] = []
+    _flatten(data, "", lines)
+    return [ln + "\n" for ln in lines]
+
+
+def contract_gate(d: Path, rname: str, rcfg: dict, cfg: dict) -> tuple[bool, str]:
+    """The "contracts" gate: snapshot the contract now, diff it with the pre-edit snapshot, and save the diff for the
+    reviewers. Fails on a change that plan.md doesn't declare."""
+    base = snapshot_path(d, rname, "base")
+    diff_file = d / "contracts" / f"{rname}.diff"
+    diff_file.unlink(missing_ok=True)
+    if not base.exists():
+        return False, (f"No pre-edit contract snapshot for {rname}. Run `harness baseline --repos {rname}` before "
+                       f"editing (on the untouched code), or ask the user if the code is already edited.")
+    ok, tail = take_contract_snapshot(d, rname, rcfg, cfg, "now")
+    if not ok:
+        return False, f"snapshot_cmd failed:\n{tail}"
+    diff = "".join(difflib.unified_diff(_snapshot_lines(base), _snapshot_lines(snapshot_path(d, rname, "now")),
+                                        "before", "after", n=3))
+    if not diff:
+        return True, "API contract unchanged."
+    diff_file.write_text(diff, encoding="utf-8")
+    plan_md = (d / "plan.md").read_text(encoding="utf-8") if (d / "plan.md").exists() else ""
+    if plan_declares_contract_change(plan_md):
+        return True, f"API contract changed as declared; reviewers get the diff ({diff_file}).\n{diff[:4000]}"
+    return False, ("The API contract changed, but plan.md's \"Contract changes\" declares none. Undo the change, or "
+                   f"report that the plan is wrong if the task can't be done without it.\n{diff[:4000]}")
+
+
+def contract_snapshot_diffs(d: Path) -> dict[str, str]:
+    """{repo: contract diff} from the latest contracts gate run, for repos whose contract changed."""
+    folder = d / "contracts"
+    return {p.stem: p.read_text(encoding="utf-8") for p in sorted(folder.glob("*.diff"))} if folder.is_dir() else {}
+
+
+def plan_declares_contract_change(plan_md: str) -> bool:
+    section = _plan_section(plan_md, "Contract changes")
+    return bool(section) and not CONTRACT_NONE_RE.match(section)
+
+
+def validate_contract_plan(plan_md: str | None, tasks: dict, cfg: dict) -> list[str]:
+    """plan.md checks for repos with [contracts]: a Contract changes section, and a task for each declared change."""
+    listed = tasks.get("repos") if isinstance(tasks, dict) and isinstance(tasks.get("repos"), list) else []
+    guarded = [r for r in contract_repos(cfg) if r in listed]
+    if not guarded:
+        return []
+    if plan_md is None:
+        return ["plan.md is missing"]
+    section = _plan_section(plan_md, "Contract changes")
+    if not section:
+        return [f"plan.md needs a \"## Contract changes\" section ({', '.join(guarded)} has an API contract "
+                f"snapshot): list each change with its consumer files and the task that updates them, or write \"None\""]
+    if CONTRACT_NONE_RE.match(section):
+        return []
+    ids = {t.get("id") for t in tasks.get("tasks") or [] if isinstance(t, dict)}
+    if not set(TASK_ID_RE.findall(section)) & ids:
+        return ["\"Contract changes\" in plan.md must name the task (T1, T2, ...) that updates each change's consumers; "
+                "a contract change without a consumer task means the plan is wrong"]
+    return []
+
+
+def undeclared_contract_findings(d: Path) -> list[dict]:
+    """Blocking findings for snapshot changes that plan.md's Contract changes section does not declare."""
+    plan_md = (d / "plan.md").read_text(encoding="utf-8") if (d / "plan.md").exists() else ""
+    if plan_declares_contract_change(plan_md):
+        return []
+    out = []
+    for rname in contract_snapshot_diffs(d):
+        diff = d / "contracts" / f"{rname}.diff"
+        out.append({"id": f"C-{rname}", "severity": "blocking", "source": "contracts", "verdict": "confirmed",
+                    "repo": rname, "file": str(diff), "line": None, "title": "Undeclared API contract change",
+                    "detail": f"The API contract changed ({diff}), but plan.md declares no contract change.",
+                    "suggestion": "Undo the change to the API contract. If the change is needed, "
+                                  "report that the plan is wrong so the planner declares it with its consumer tasks."})
+    return out
+
+
+def cmd_contracts(a, cfg):
+    rs = repos(cfg)
+    cr = contract_repos(cfg)
+    if not cr:
+        print("No repo has [contracts]; nothing to do.")
+        return
+    targets = [a.repo] if a.repo else list(cr)
+    ok = True
+    for rname in targets:
+        c = (cr.get(rname) or {}).get("contracts")
+        if not c:
+            print(f"[{rname}] no [repos.{rname}.contracts] configured")
+            ok = False
+            continue
+        if not c.get("map_cmd"):
+            print(f"[{rname}] no map_cmd configured")
+            continue
+        state, detail = build_contract_map(rname, rs, cfg, a.force)
+        ok = ok and state != "failed"
+        print(f"[{rname}] contract map {state}: {contract_map_path(rname)}" + (f" ({detail})" if detail else ""))
+    sys.exit(0 if ok else 1)
 
 
 # --------------------------------------------------------------------------- gate state (engineer stop hook)
@@ -2461,6 +2715,11 @@ def cmd_diff(a, cfg):
             print(pr.get("stat", "") if a.stat else pr_diff(pr))
         return
     shown = round_diffs(d, run, cfg, a.round) if a.round and not a.stat else {}
+    contracts = contract_snapshot_diffs(d) if not a.stat else {}
+    if contracts:
+        print(f"=== API contract snapshot changes ===\n{CONTRACT_REVIEW_NOTE}\n")
+        for rname, diff in contracts.items():
+            print(f"--- {rname} ---\n{diff}")
     for rname in changed_repos(cfg, run):
         print(f"=== {rname} ({rs[rname]['path']}) ===")
         if a.round and not a.stat:
@@ -2584,6 +2843,10 @@ def build_review_prompt(run: dict, d: Path, cfg: dict, round_n: int) -> tuple[st
         parts.append("# Findings from the previous round (confirmed by a second reviewer)\n"
                      "Check whether each one is now fixed. Repeat only the ones that are not, with status \"unresolved\".\n"
                      + json.dumps(prev.get("findings", []), indent=1) + "\n")
+    contracts = contract_snapshot_diffs(d)
+    if contracts:
+        parts.append(f"# API contract snapshot changes\n{CONTRACT_REVIEW_NOTE}\n"
+                     + "\n".join(f"## Repo: {r}\n```diff\n{diff}\n```\n" for r, diff in contracts.items()))
     diffs = []
     for rname, diff in round_diffs(d, run, cfg, round_n).items():
         diffs.append(f"## Repo: {rname} ({rs[rname].get('description', '')})\n```diff\n{diff}\n```\n")
@@ -2916,6 +3179,13 @@ def cmd_validate(a, cfg):
     errors = (validate_plan(data, cfg) if a.what == "plan" else validate_review(data, rnd) if a.what == "review"
               else validate_fix(data, rnd) if a.what == "fix"
               else validate_verified(data, rnd, read_json(d / f"review-{rnd}.json")))
+    if a.what == "plan" and not errors:
+        plan_md = (d / "plan.md").read_text(encoding="utf-8") if (d / "plan.md").exists() else None
+        contract_errors = validate_contract_plan(plan_md, data, cfg)
+        if contract_errors:
+            print(f"INVALID: plan.md: {'; '.join(contract_errors)}. Ask the planner (SendMessage) to fix plan.md, "
+                  f"then rerun `validate plan`.")
+            sys.exit(2)
     if errors:
         shown = "; ".join(errors[:8]) + (f"; and {len(errors) - 8} more" if len(errors) > 8 else "")
         print(f"INVALID: {fname}: {shown}. Ask the agent that wrote it (SendMessage) to fix these and rewrite the file, "
@@ -3002,6 +3272,14 @@ def cmd_verdict(a, cfg):
                       "detail": t["text"], "verdict": "confirmed" if v.get("verdict") == "tampered" else "uncertain",
                       "verifier_reason": v.get("reason", ""),
                       "suggestion": "Restore the original test or assertion; fix the code instead of the test."})
+    if run.get("mode") != "review":
+        try:
+            undeclared = undeclared_contract_findings(d)
+        except Exception as exc:  # like the tamper scan, never block the loop on the check itself
+            undeclared = []
+            print(f"WARNING: contract snapshot check failed ({exc}); this round was not checked for undeclared changes.")
+        stats["contract_undeclared"] = len(undeclared)
+        final += undeclared
     fix_sev = set(lcfg.get("fix_severities", ["blocking", "should_fix"]))
     to_fix = [f for f in final if f["verdict"] == "confirmed" and f["severity"] in fix_sev]
     # An uncertain blocking finding can't be sent to the engineer (unproven), so a human has to judge it.
@@ -5358,6 +5636,17 @@ def cmd_doctor(a, cfg):
         for g in gates:
             print(f"         gate {g['name']}: {g['cmd']}" + (f"  (cwd {g['cwd']})" if g.get("cwd", ".") != "." else "")
                   + ("  [auto-detected]" if auto else ""))
+        c = r.get("contracts")
+        if c:
+            missing = [k for k in ("map_cmd", "snapshot_cmd") if not c.get(k)]
+            line(not missing, f"{name}: contracts configured" if not missing else
+                 f"{name}: [repos.{name}.contracts] is missing {', '.join(missing)}")
+            for k in ("map_cmd", "snapshot_cmd"):
+                if c.get(k) and "{out}" not in c[k]:
+                    line(False, f"{name}: contracts {k} must write to {{out}} (the harness picks the path)")
+            unknown = [s.partition(":")[0] for s in c.get("covers") or [] if ":" in s and s.partition(":")[0] not in repos(cfg)]
+            if unknown:
+                print(f"  info {name}: contracts covers {', '.join(unknown)} as pathspecs, not repo names")
     print("\nMetrics:")
     all_lost = unattributed_agent_events(read_events())
     legacy = legacy_lost_agent_events(all_lost)
@@ -5448,6 +5737,12 @@ def main(argv=None):
     s.add_argument("--task", help="task id (for metrics)")
     s.add_argument("--attempt", type=int, help="engineer attempt number; 1 = first try after implementing (for metrics)")
     s.set_defaults(fn=cmd_gates)
+
+    s = sub.add_parser("contracts", help="build the API contract map that scouts and the planner read")
+    s.add_argument("action", choices=["map"])
+    s.add_argument("--repo", help="default: every repo with [contracts]")
+    s.add_argument("--force", action="store_true", help="map: rebuild even when the map is current")
+    s.set_defaults(fn=cmd_contracts)
 
     s = sub.add_parser("tamper", help="suspicious edits to pre-existing tests in this run (scan | clear <id>... --reason)")
     s.add_argument("action", choices=["scan", "clear"])

@@ -45,6 +45,9 @@ headless sessions refuse most raw tool commands.
 
 ## Cross-repo touchpoints
 Endpoints, payload fields or exported components that other repos or modules depend on.
+If the delegation message gives a contract map path, Grep it (don't read it whole) for the endpoints the task may
+touch, and list each with its consumers' file paths from the map (every repo, not only yours). Say "None" when the
+task touches no mapped endpoint.
 
 ## Risks and unknowns
 Anything surprising, fragile, or ambiguous the planner should decide on.
