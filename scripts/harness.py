@@ -493,25 +493,45 @@ LABEL_TYPES = [("hotfix", "hotfix"), ("bug", "fix"), ("fix", "fix"), ("ui", "fea
                ("enhancement", "feat"), ("feature", "feat")]
 
 
-def ensure_state_excluded() -> None:
-    """If the project root is itself inside a git repo (single-repo projects), add .harness/ to that
-    repo's local .git/info/exclude so run files never show up as changes. Nothing is committed."""
+def exclude_locally(lines: list[str], comment: str) -> None:
+    """Append lines (patterns relative to the project root) to the local .git/info/exclude of the git repo the
+    project root sits in, once. Nothing is committed. A worktree uses the main repo's exclude file."""
     r = run_cmd(["git", "-C", str(ROOT), "rev-parse", "--show-toplevel", "--git-common-dir"])
     if r.returncode != 0:
         return
     top, gitdir = r.stdout.strip().splitlines()[:2]
-    gitdir = Path(gitdir) if os.path.isabs(gitdir) else Path(top) / gitdir
+    gitdir = Path(gitdir) if os.path.isabs(gitdir) else ROOT / gitdir  # relative to where git ran
     try:
-        rel = (ROOT / ".harness").resolve().relative_to(Path(top).resolve()).as_posix()
+        rel = ROOT.resolve().relative_to(Path(top).resolve()).as_posix()
     except ValueError:
         return
+    prefix = "" if rel == "." else f"/{rel}"
+    want = [(f"!{prefix}/{x[1:]}" if x.startswith("!") else f"{prefix}/{x}") for x in lines]
     excl = gitdir / "info" / "exclude"
-    line = f"/{rel}/"
     current = excl.read_text(encoding="utf-8") if excl.exists() else ""
-    if line not in current.splitlines():
+    if want[0] not in current.splitlines():
         excl.parent.mkdir(parents=True, exist_ok=True)
         with open(excl, "a", encoding="utf-8") as f:
-            f.write(("" if current.endswith("\n") or not current else "\n") + f"# harness run files\n{line}\n")
+            f.write(("" if current.endswith("\n") or not current else "\n") + f"# {comment}\n" + "\n".join(want) + "\n")
+
+
+def ensure_state_excluded() -> None:
+    """If the project root is itself inside a git repo (single-repo projects), keep .harness/ out of its changes."""
+    exclude_locally([".harness/"], "harness run files")
+
+
+FACTORY_EXCLUDED: set[Path] = set()
+
+
+def factory_dir() -> Path:
+    """The project's .factory/ directory, created if needed. Its run files are kept out of git (local exclude),
+    except decisions.md and docs.json, which the owner may want to commit."""
+    d = ROOT / ".factory"
+    d.mkdir(exist_ok=True)
+    if ROOT not in FACTORY_EXCLUDED:
+        FACTORY_EXCLUDED.add(ROOT)
+        exclude_locally([".factory/*", "!.factory/decisions.md", "!.factory/docs.json"], "factory run files")
+    return d
 
 
 def new_run(cfg: dict, task: str, mode: str, force: bool = False, extra: dict | None = None) -> tuple[Path, dict]:
@@ -5138,8 +5158,7 @@ MESSAGED: set = set()  # issues that got a BLOCKER / QUESTION line since they la
 
 def factory_log(event: dict) -> None:
     """Append-only factory log in the target project (section 8), plus a short line in events.log for watchers."""
-    d = ROOT / ".factory"
-    d.mkdir(exist_ok=True)
+    d = factory_dir()
     with open(d / "log.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps({"ts": iso(), **event}, ensure_ascii=False) + "\n")
     k, n = event.get("kind"), event.get("issue")
@@ -5196,8 +5215,7 @@ DECISIONS_HEADER = ("# Decisions\n\nQuestions about the product or its implement
 
 def cmd_factory_decide(a, cfg):
     """Append one settled question to .factory/decisions.md (the user's answer, or a recorded assumption)."""
-    d = ROOT / ".factory"
-    d.mkdir(exist_ok=True)
+    d = factory_dir()
     f = d / "decisions.md"
     one = lambda t: " ".join(t.split())
     entry = (f"\n## {one(a.question)}\n- Kind: {a.kind}\n- Decision: {one(a.answer)}\n- Decided by: {a.by} on {iso()[:10]}\n"
@@ -5356,8 +5374,7 @@ WATCH_PATTERN = re.compile(r"BLOCKER|QUESTION|finished|paused|resumed|unreadable
 def cmd_factory_watch(a, cfg):
     """Print the events.log lines that need the user's attention, as they arrive (what /factory's Monitor runs).
     Only one watcher runs per project: a second one exits at once and prints nothing, so no event is delivered twice."""
-    d = ROOT / ".factory"
-    d.mkdir(exist_ok=True)
+    d = factory_dir()
     lock = d / "watch.json"
     try:
         os.kill(int(json.loads(lock.read_text())["pid"]), 0)
@@ -5460,10 +5477,9 @@ def cmd_factory_block(a, cfg):
 
 def record_pr(n: int, url: str | None) -> None:
     """Remember an issue's PR URL in .factory/prs.json, so the supervisor can wait on and merge it."""
-    f = ROOT / ".factory" / "prs.json"
+    f = factory_dir() / "prs.json"
     prs = read_json(f, {}) or {}
     prs[str(n)] = url
-    f.parent.mkdir(exist_ok=True)
     write_json(f, prs)
 
 
@@ -5523,8 +5539,7 @@ def supervisor_info() -> dict | None:
 def acquire_supervisor(issues: list[int]) -> None:
     if supervisor_info():
         sys.exit("a factory supervisor is already running for this project (see `harness factory status`)")
-    d = ROOT / ".factory"
-    d.mkdir(exist_ok=True)
+    d = factory_dir()
     (d / "stop").unlink(missing_ok=True)
     (d / "supervisor.json").write_text(json.dumps({"pid": os.getpid(), "started": time.time(), "issues": issues}))
     factory_log({"kind": "supervisor_started"})
@@ -5546,8 +5561,7 @@ def cmd_factory_start(a, cfg):
         sys.exit("Engineer sessions cannot prompt, so these commands would be denied and block the first issue: "
                  + ", ".join(missing) + f".\nAdd to .claude/harness.toml under [factory]: allowed_tools = [{rules}]\n"
                  "then run factory start again. See docs/factory-allowlist.md.")
-    d = ROOT / ".factory"
-    d.mkdir(exist_ok=True)
+    d = factory_dir()
     cmd = [sys.executable, str(Path(__file__).resolve()), "--root", str(ROOT), "factory", "run",
            "--max-issues", str(a.max_issues)]
     if a.issues:
@@ -5712,8 +5726,7 @@ def cmd_factory_docs(a, cfg):
     for k, v in paths.items():
         if v and not (ROOT / v).is_file():
             sys.exit(f"{k} document not found: {v}")
-    d = ROOT / ".factory"
-    d.mkdir(exist_ok=True)
+    d = factory_dir()
     docs_file().write_text(json.dumps({k: v for k, v in paths.items() if v}, indent=1) + "\n", encoding="utf-8")
     print(f"recorded in {docs_file()}")
 

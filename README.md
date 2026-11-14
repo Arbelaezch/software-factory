@@ -264,7 +264,7 @@ always checks the project's account. Run `python3 scripts/usage.py` (exit code 0
 - Any section from [`scripts/defaults.toml`](scripts/defaults.toml) can be overridden, such as
   `[reviewer]`, `[models]`, `[loop]` or `[providers.*]`.
 
-Run state and metrics live in `.harness/` in the project, which is excluded from git automatically. `harness report --tools` shows where context goes; see `docs/context-cost.md`.
+Run state and metrics live in `.harness/` in the project, which is excluded from git automatically. The factory's run files in `.factory/` are excluded the same way (in the local `.git/info/exclude`), except `decisions.md` and `docs.json`, which you can commit. `harness report --tools` shows where context goes; see `docs/context-cost.md`.
 </details>
 
 ## Repository layout

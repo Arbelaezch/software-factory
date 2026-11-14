@@ -593,6 +593,65 @@ class ResumeParkedBranchTests(unittest.TestCase):
         self.assertEqual(self.resume(14), [])
 
 
+class FactoryExcludeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name) / "repo"
+        self.repo.mkdir()
+        self.git = lambda *a, cwd=self.repo: subprocess.run(["git", "-C", str(cwd), *a], check=True, capture_output=True,
+                                                             text=True).stdout
+        self.git("init", "-q", "-b", "main")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init")
+        p = mock.patch.object(h, "FACTORY_EXCLUDED", set())
+        p.start()
+        self.addCleanup(p.stop)
+
+    def write_factory_files(self, root):
+        with mock.patch.object(h, "ROOT", root):
+            d = h.factory_dir()
+            for name in ("log.jsonl", "supervisor.json", "decisions.md", "docs.json"):
+                (d / name).write_text("x\n")
+            (d / "sessions").mkdir()
+            (d / "sessions" / "1.jsonl").write_text("x\n")
+
+    def test_only_shared_files_show_as_untracked(self):
+        self.write_factory_files(self.repo)
+        status = self.git("status", "--porcelain", "-uall").splitlines()
+        self.assertEqual(sorted(status), ["?? .factory/decisions.md", "?? .factory/docs.json"])
+
+    def test_the_block_is_added_once(self):
+        with mock.patch.object(h, "ROOT", self.repo):
+            h.factory_dir()
+            h.FACTORY_EXCLUDED.clear()
+            h.factory_dir()
+        excl = (self.repo / ".git" / "info" / "exclude").read_text()
+        self.assertEqual(excl.count("/.factory/*"), 1)
+        self.assertEqual(excl.count("# factory run files"), 1)
+
+    def test_worktree_writes_the_main_repos_exclude(self):
+        wt = Path(self.tmp.name) / "wt"
+        self.git("worktree", "add", "-q", "-b", "side", str(wt))
+        self.assertTrue((wt / ".git").is_file())
+        self.write_factory_files(wt)
+        status = self.git("status", "--porcelain", "-uall", cwd=wt).splitlines()
+        self.assertEqual(sorted(status), ["?? .factory/decisions.md", "?? .factory/docs.json"])
+        self.assertIn("/.factory/*", (self.repo / ".git" / "info" / "exclude").read_text())
+
+    def test_project_in_a_subfolder_gets_anchored_patterns(self):
+        sub = self.repo / "app"
+        sub.mkdir()
+        self.write_factory_files(sub)
+        status = self.git("status", "--porcelain", "-uall").splitlines()
+        self.assertEqual(sorted(status), ["?? app/.factory/decisions.md", "?? app/.factory/docs.json"])
+
+    def test_outside_a_repo_does_nothing(self):
+        plain = Path(self.tmp.name) / "plain"
+        plain.mkdir()
+        with mock.patch.object(h, "ROOT", plain), mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": self.tmp.name}):
+            self.assertTrue(h.factory_dir().is_dir())
+
+
 class TamperScanTests(unittest.TestCase):
     def scan(self, diff):
         return h.scan_diff_for_tampering("app", diff)
