@@ -1922,11 +1922,8 @@ def account_email(d: Path) -> str | None:
 
 def plugin_installed(d: Path, root: Path) -> bool:
     """The harness plugin is installed in config dir d for root (user scope, or project scope for root)."""
-    market, plugin = _marketplace_ids()
-    installed = (read_json(d / "plugins" / "installed_plugins.json", {}) or {}).get("plugins") or {}
-    entries = installed.get(f"{plugin}@{market}") or []
     return any(e.get("scope") == "user" or Path(e.get("projectPath") or "/nonexistent").resolve() == root.resolve()
-               for e in entries)
+               for e in installed_entries(d))
 
 
 def settings_drift(cfg) -> dict[str, list[str]]:
@@ -6140,6 +6137,85 @@ def cmd_accounts(a, cfg):
         print(("  info " if good is None else "  ok   " if good else "  !!   ") + text)
 
 
+# The plugin is installed per project (project scope) in the project's account dir. A new folder gets it from
+# `harness-setup` (scripts/claude-accounts.sh), which runs /harness-init with --plugin-dir and closes after.
+def account_env(d: Path) -> dict:
+    """Environment for a `claude` command on the account in d (no CLAUDE_CONFIG_DIR for the default dir)."""
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
+    if d.resolve() != DEFAULT_CLAUDE_DIR.resolve():
+        env["CLAUDE_CONFIG_DIR"] = str(d)
+    return env
+
+
+def claude_plugin(d: Path, *args: str, cwd: Path | None = None) -> tuple[bool, str]:
+    """Run `claude plugin <args>` on the account in d. Returns (ok, last line of output)."""
+    r = run_cmd(["claude", "plugin", *args], cwd=cwd, env=account_env(d), timeout=300)
+    lines = (r.stdout + r.stderr).strip().splitlines()
+    return r.returncode == 0, lines[-1] if lines else ""
+
+
+def installed_entries(d: Path) -> list[dict]:
+    """The harness plugin's install records in config dir d (one per scope and project)."""
+    market, plugin = _marketplace_ids()
+    installed = (read_json(d / "plugins" / "installed_plugins.json", {}) or {}).get("plugins") or {}
+    return installed.get(f"{plugin}@{market}") or []
+
+
+def cmd_plugin(a, cfg):
+    """Install the plugin for this project's account, update every install of every account, or list them."""
+    market, plugin = _marketplace_ids()
+    pid = f"{plugin}@{market}"
+    if a.action == "install":
+        require_project()
+        d = Path(project_account_dir(cfg))
+        if market not in (read_json(d / "plugins" / "known_marketplaces.json", {}) or {}):
+            ok, msg = claude_plugin(d, "marketplace", "add", str(PLUGIN_DIR))
+            if not ok:
+                sys.exit(f"adding the {market} marketplace in {d} failed: {msg}")
+        ok, msg = claude_plugin(d, "install", pid, "--scope", "project", cwd=ROOT)
+        print(msg)
+        if not ok:
+            sys.exit(1)
+        return
+    dirs = {d.resolve(): d for d in account_dirs(cfg).values()}.values()
+    for d in dirs:
+        entries = installed_entries(d)
+        print(f"{d}:" + ("" if entries else " no installs"))
+        if a.action == "update" and entries:
+            ok, msg = claude_plugin(d, "marketplace", "update", market)
+            if not ok:
+                print(f"  !! marketplace update failed: {msg}")
+                continue
+        for e in entries:
+            where = e.get("projectPath") or "(every folder)"
+            if a.action == "list":
+                print(f"  {e.get('scope'):<8} {e.get('version')}  {where}")
+                continue
+            if e.get("projectPath") and not Path(e["projectPath"]).is_dir():
+                print(f"  skipped {where}: the folder is gone (`claude plugin uninstall {pid} --scope project` there)")
+                continue
+            ok, msg = claude_plugin(d, "update", pid, "--scope", e.get("scope") or "user",
+                                    cwd=Path(e["projectPath"]) if e.get("projectPath") else None)
+            print(f"  {'ok' if ok else '!!'} {where}: {msg}")
+    if a.action == "update":
+        print("Restart open Claude Code sessions to load the new version.")
+
+
+def cmd_setup_close(a, cfg):
+    """Close the `harness-setup` session (its pid is in $HARNESS_SETUP_PID). Does nothing in any other session."""
+    pid = os.environ.get("HARNESS_SETUP_PID", "")
+    if not pid.isdigit():
+        print("not a harness-setup session; nothing to close")
+        return
+    comm = run_cmd(["ps", "-p", pid, "-o", "comm="]).stdout.strip()
+    if "claude" not in Path(comm).name:
+        print(f"process {pid} is not a Claude Code session ({comm or 'not running'}); nothing to close")
+        return
+    print("setup finished; closing this session")
+    sys.stdout.flush()
+    os.kill(int(pid), signal.SIGTERM)
+
+
 def set_toml_key(path: Path, section: str, key: str, value: str) -> None:
     """Minimal in-place edit: set `key = "value"` under [section], creating it if needed."""
     text = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -6511,6 +6587,13 @@ def main(argv=None):
     s.add_argument("action", nargs="?", default="list", choices=["list", "sync"])
     s.set_defaults(fn=cmd_accounts)
 
+    s = sub.add_parser("plugin", help="install the plugin for this project's account, or update/list every install")
+    s.add_argument("action", choices=["install", "update", "list"])
+    s.set_defaults(fn=cmd_plugin)
+
+    s = sub.add_parser("setup-close", help="(used by /harness-init) close the harness-setup session")
+    s.set_defaults(fn=cmd_setup_close)
+
     s = sub.add_parser("notify", help="send the user a standard QUESTION / BLOCKER / DONE message")
     s.add_argument("--kind", required=True, choices=[k.lower() for k in MESSAGE_KINDS] + list(MESSAGE_KINDS))
     s.add_argument("--issue", help="issue number or reference")
@@ -6624,7 +6707,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.cmd == "models" and a.action == "set" and not (a.agent and a.model):
         ap.error("usage: harness models set <agent> <model> [--effort level] [--project]")
-    if a.cmd not in ("hook", "account", "accounts", "init", "doctor", "models", "report", "phone"):
+    if a.cmd not in ("hook", "account", "accounts", "plugin", "setup-close", "init", "doctor", "models", "report", "phone"):
         require_project()
     a.fn(a, load_config())
 
