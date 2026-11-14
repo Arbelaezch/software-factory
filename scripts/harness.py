@@ -978,6 +978,7 @@ def cmd_run_end(a, cfg):
     usage = manager_usage(run, cfg)
     if usage and usage["requests"]:
         log_event({"kind": "agent", "run_id": run["id"], "stage": "manager", **usage})
+    remove_pr_worktrees(run)
     run.update(status=a.status, ended_at=iso(), review_rounds=count_review_rounds(d, run))
     if a.note:
         run["note"] = a.note
@@ -4048,6 +4049,8 @@ def cmd_verdict(a, cfg):
               f"(see {d}/tamper.json). Ask the verifier (SendMessage) to add a \"tamper\" list with "
               f"{{\"id\", \"verdict\": \"justified|tampered\", \"reason\"}} for each, then rerun verdict.")
         sys.exit(2)
+    # A PR review has no fix loop to catch a wrong finding, so "confirmed" there needs a concrete failure scenario.
+    pr_review = run.get("mode") == "review"
     final = []
     stats = {"proposed": len(by_id), "confirmed": 0, "rejected": 0, "uncertain": 0, "unjudged": 0,
              "unresolved_from_previous": 0, "verifier_added": 0, "tamper_open": 0}
@@ -4057,18 +4060,22 @@ def cmd_verdict(a, cfg):
             stats["unjudged"] += 1
             final.append({**f, "verdict": "unjudged"})
             continue
-        verdict = v.get("verdict", "uncertain")
+        verdict, reason = v.get("verdict", "uncertain"), v.get("reason", "")
+        if pr_review and verdict == "confirmed" and not _nonempty_str(v.get("scenario")):
+            verdict, reason = "uncertain", f"(confirmed without a failure scenario) {reason}".strip()
         stats[verdict if verdict in ("confirmed", "rejected", "uncertain") else "uncertain"] += 1
         sev = v.get("severity") if v.get("severity") in SEVERITIES else f["severity"]
-        final.append({**f, "verdict": verdict, "severity": sev, "verifier_reason": v.get("reason", "")})
+        final.append({**f, "verdict": verdict, "severity": sev, "verifier_reason": reason,
+                      **({"scenario": v["scenario"]} if _nonempty_str(v.get("scenario")) else {})})
         if verdict == "confirmed" and f.get("status") == "unresolved":
             stats["unresolved_from_previous"] += 1
     for j, extra in enumerate(verified.get("additional") or [], 1):
         if not (extra.get("file") and extra.get("detail")):
             continue  # an added finding with no location or explanation can't be checked or fixed
         sev = extra.get("severity") if extra.get("severity") in SEVERITIES else "should_fix"
-        final.append({**extra, "id": f"V{a.round}-{j}", "severity": sev, "verdict": "confirmed",
-                      "source": "verifier"})
+        proven = not pr_review or _nonempty_str(extra.get("scenario"))
+        final.append({**extra, "id": f"V{a.round}-{j}", "severity": sev,
+                      "verdict": "confirmed" if proven else "uncertain", "source": "verifier"})
         stats["verifier_added"] += 1
     for t in tamper:
         v = tamper_judged[t["id"]]
@@ -4415,6 +4422,53 @@ def cmd_pr_add(a, cfg):
     print_pr_set(d, run)
 
 
+def pr_worktree_links(repo: Path, names: list[str], depth: int = 4) -> list[Path]:
+    """Untracked dependency folders in the user's checkout (node_modules, a venv) up to `depth` levels down, which a
+    fresh worktree lacks; the worktree gets a symlink to each so tests can run there."""
+    out = []
+    for dirpath, dirnames, _ in os.walk(repo):
+        rel = Path(dirpath).relative_to(repo)
+        for name in [n for n in dirnames if n in names]:
+            out.append(rel / name)
+        dirnames[:] = [n for n in dirnames if n not in names and n != ".git" and len(rel.parts) + 1 < depth]
+    return out
+
+
+def cmd_pr_worktree(a, cfg):
+    d, run = load_run()
+    if run.get("mode") != "review":
+        sys.exit("The active run isn't a PR review.")
+    rname, num = parse_gh_ref(a.ref, cfg)
+    pr = next((p for p in run.get("prs", []) if p["repo"] == rname and p["number"] == num), None)
+    if not pr or not pr.get("merge_base"):
+        sys.exit(f"{rname}#{num} isn't a fetched PR in this review (see `pr show`).")
+    path = d / "worktrees" / f"{rname}-{num}"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        git(Path(pr["path"]), "worktree", "add", "--detach", str(path), pr["ref"])
+        names = (cfg.get("review_pr") or {}).get("worktree_links", ["node_modules", "env", ".venv", "venv"])
+        for rel in pr_worktree_links(Path(pr["path"]), names):
+            if not (path / rel).exists() and (path / rel).parent.is_dir():
+                (path / rel).symlink_to(Path(pr["path"]) / rel)
+        run.setdefault("worktrees", []).append({"repo_path": pr["path"], "path": str(path)})
+        save_run(d, run)
+    print(f"{rname}#{num} at its head (detached; removed at `run end`): {path}")
+    print("Dependency folders (node_modules, venvs) are symlinked from the user's checkout, so they match the base "
+          "branch's lockfiles, not necessarily the PR's. Run tests there; don't edit files outside test runs.")
+
+
+def remove_pr_worktrees(run: dict) -> None:
+    for w in run.get("worktrees") or []:
+        try:
+            git(Path(w["repo_path"]), "worktree", "remove", "--force", w["path"])
+        except Exception:
+            shutil.rmtree(w["path"], ignore_errors=True)
+            try:
+                git(Path(w["repo_path"]), "worktree", "prune")
+            except Exception:
+                pass
+
+
 def cmd_pr_show(a, cfg):
     d, run = load_run()
     print_pr_set(d, run)
@@ -4502,6 +4556,8 @@ def cmd_pr_draft(a, cfg):
                 text = f"**Question:** {f.get('title', '')}\n\n{f.get('detail', '')}".strip()
             else:
                 text = f"**{label}:** {f.get('title', '')}\n\n{f.get('detail', '')}".strip()
+            if f.get("scenario"):
+                text += f"\n\nFailure case: {f['scenario']}"
             if f.get("suggestion"):
                 text += f"\n\nSuggestion: {f['suggestion']}"
             fpath = str(f.get("file") or "").lstrip("./")
@@ -6928,6 +6984,9 @@ def main(argv=None):
     s.set_defaults(fn=cmd_pr_add)
     s = psub.add_parser("show", help="list the PRs under review and how to read their files")
     s.set_defaults(fn=cmd_pr_show)
+    s = psub.add_parser("worktree", help="check out a PR's head in a scratch worktree under the run dir, for running tests")
+    s.add_argument("ref", help="<repo>#<n> of a PR in this review")
+    s.set_defaults(fn=cmd_pr_worktree)
     s = psub.add_parser("draft", help="turn verified findings into review drafts per PR")
     s.set_defaults(fn=cmd_pr_draft)
     s = psub.add_parser("post", help="create PENDING GitHub reviews from the drafts")

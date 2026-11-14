@@ -49,7 +49,8 @@ reason in one line and continue without it.
    - Lenses (a large PR set): spawn one per lens it lists, **in parallel**, each told its lens. When all are done, run
      `H review --round 1 --merge`. If it prints `INVALID`, resume that lens's reviewer once (SendMessage) with the
      message, then rerun the merge.
-2. Spawn the `harness:verifier` subagent for round 1. Tell it this is a **PR review run**: the code is not
+2. Spawn the `harness:verifier` subagent for round 1 (with model: opus when `pr start` printed `profile: legacy`).
+   Tell it this is a **PR review run**: the code is not
    checked out, so it reads files with `git show <ref>:<path>` (`H pr show` prints the exact
    commands) and checks consumers in the other repos with `git grep ... origin/<base>`. Give it the contract map
    paths if any.
@@ -73,7 +74,7 @@ commits, offer to re-run the review. Remind the user to open each PR's "Files ch
 submit their pending review (Approve / Request changes / Comment). The choice of verdict is theirs.
 
 ## 5. Finish
-`H run end --status done`.
+`H run end --status done`. It also removes any scratch worktrees the verifier made.
 
 ## Rules
 - Never post, comment, approve or request changes any other way in this flow, even though the guard would

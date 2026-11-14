@@ -2420,3 +2420,72 @@ class PrReviewLensTests(unittest.TestCase):
     def test_defaults_define_the_reviewer_settings(self):
         defaults = h._read_toml(Path(h.__file__).with_name("defaults.toml"))["review_pr"]
         self.assertEqual((defaults["reviewer"], defaults["lens_min_changed_lines"]), ("auto", 400))
+
+
+class PrReviewVerifierTests(unittest.TestCase):
+    """/review-pr: confirmed findings need a failure scenario, and PR heads can be tested in a scratch worktree."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.d = Path(os.path.realpath(tmp.name))
+
+    def verdict(self, verified, mode="review"):
+        h.write_json(self.d / "review-1.json", FallbackReviewerTests.FALLBACK_REVIEW)
+        h.write_json(self.d / "verified-1.json", verified)
+        with mock.patch.object(h, "load_run", return_value=(self.d, {"id": "r1", "mode": mode})), \
+                mock.patch.object(h, "tamper_scan", return_value=[]), mock.patch.object(h, "log_event"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            h.cmd_verdict(mock.Mock(round=1), {})
+        return {f["id"]: f for f in h.read_json(self.d / "final-1.json")["findings"]}
+
+    def test_pr_review_confirmed_needs_a_scenario(self):
+        extra = {"severity": "blocking", "repo": "app", "file": "b.py", "line": 2, "title": "t", "detail": "d"}
+        final = self.verdict({"findings": [
+            {"id": "R1-1", "verdict": "confirmed", "reason": "seen", "scenario": "empty list -> IndexError"},
+            {"id": "R1-2", "verdict": "confirmed", "reason": "seen"}],
+            "additional": [extra, {**extra, "scenario": "x -> y"}]})
+        self.assertEqual((final["R1-1"]["verdict"], final["R1-1"]["scenario"]), ("confirmed", "empty list -> IndexError"))
+        self.assertEqual(final["R1-2"]["verdict"], "uncertain")
+        self.assertIn("without a failure scenario", final["R1-2"]["verifier_reason"])
+        self.assertEqual((final["V1-1"]["verdict"], final["V1-2"]["verdict"]), ("uncertain", "confirmed"))
+
+    def test_ship_runs_dont_need_a_scenario(self):
+        final = self.verdict({"findings": [{"id": "R1-1", "verdict": "confirmed"}, {"id": "R1-2", "verdict": "rejected"}]},
+                             mode="full")
+        self.assertEqual(final["R1-1"]["verdict"], "confirmed")
+
+    def test_pr_worktree_checks_out_the_head_with_dependency_links_and_run_end_removes_it(self):
+        repo = self.d / "app"
+        git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, text=True).stdout.strip()
+        (repo / "web").mkdir(parents=True)
+        git("init", "-q", "-b", "dev")
+        git("config", "user.email", "t@example.com")
+        git("config", "user.name", "t")
+        (repo / ".gitignore").write_text("node_modules\n")
+        (repo / "web" / "a.js").write_text("1\n")
+        git("add", "-A")
+        git("commit", "-qm", "base")
+        base = git("rev-parse", "HEAD")
+        (repo / "web" / "a.js").write_text("2\n")
+        git("commit", "-qam", "pr")
+        git("update-ref", "refs/harness/pr/3", "HEAD")
+        git("checkout", "-q", base)
+        (repo / "web" / "node_modules" / "lib").mkdir(parents=True)
+        run = {"id": "r1", "mode": "review", "prs": [{"repo": "app", "number": 3, "path": str(repo),
+                                                       "merge_base": base, "ref": "refs/harness/pr/3"}]}
+        d = self.d / "runs" / "r1"
+        d.mkdir(parents=True)
+        out = io.StringIO()
+        with mock.patch.object(h, "load_run", return_value=(d, run)), mock.patch.object(h, "save_run"), \
+                mock.patch.object(h, "parse_gh_ref", return_value=("app", 3)), contextlib.redirect_stdout(out):
+            h.cmd_pr_worktree(mock.Mock(ref="app#3"), {})
+        wt = d / "worktrees" / "app-3"
+        self.assertIn(str(wt), out.getvalue())
+        self.assertEqual((wt / "web" / "a.js").read_text(), "2\n")
+        self.assertTrue((wt / "web" / "node_modules").is_symlink())
+        self.assertEqual((repo / "web" / "a.js").read_text(), "1\n")
+        h.remove_pr_worktrees(run)
+        self.assertFalse(wt.exists())
+        self.assertTrue((repo / "web" / "node_modules" / "lib").is_dir())
+        self.assertNotIn(str(wt), git("worktree", "list"))

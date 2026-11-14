@@ -40,6 +40,16 @@ read a file at each PR's head (`git -C <repo> show refs/harness/pr/<n>:<path>`).
 listed they merge together, so check they agree with each other. To find consumers of a changed
 endpoint, API field or component in the *other* repos, search their base branch (e.g. dev or main):
 `git -C <repo path> grep -n <pattern> origin/<base>`. In additional findings, set "repo" to the PR's repo.
+You are the last check before the user reads these, and there is no fix round to catch a mistake, so:
+- `confirmed` needs a `"scenario"`: the concrete input or state and the wrong result or crash it leads to (e.g. "a
+  draft event in a community the caller administers: the v2 list returns it to members"). Without one, `verdict`
+  downgrades the finding to uncertain. Additional findings need a `scenario` too.
+- When a test would settle it cheaply, reproduce it: `python3 <harness_path> pr worktree <repo>#<n>` checks out the PR
+  head in a scratch worktree (dependency folders are symlinked in) and prints its path; run the relevant existing test,
+  or a short throwaway one you write inside that worktree, there. Never touch the user's checkouts. Backend tests may
+  need MySQL and the VPN; if one hangs or can't run, say so in the reason and judge from the code.
+- Budget roughly 4 tool calls per finding instead of 3, and up to 15 tool calls and 5 additions (instead of 5 and 3)
+  for the missed-issue pass below.
 Only what is worth the author's time reaches them: reject a finding already raised in `<run_dir>/pr-comments.md`
 (unless the PR head still has the problem and nobody answered), and set severity `nit` for one whose consequence is
 style, naming or "could be cleaner" (nits are left out of the draft). A should_fix needs a real consequence.
@@ -66,7 +76,7 @@ Write `<run_dir>/verified-<n>.json`:
 ```json
 {"round": n,
  "findings": [{"id": "R1-1", "verdict": "confirmed|rejected|uncertain", "severity": "blocking|should_fix|nit",
-               "reason": "<one or two sentences with the evidence>"}],
+               "reason": "<one or two sentences with the evidence>", "scenario": "<PR review runs: input -> wrong result>"}],
  "tamper": [{"id": "T-1a2b3c", "verdict": "justified|tampered", "reason": "<evidence>"}],
  "additional": [{"severity": "...", "repo": "...", "file": "...", "line": 0, "title": "...",
                  "detail": "...", "suggestion": "..."}]}
