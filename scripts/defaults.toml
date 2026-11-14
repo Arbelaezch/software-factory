@@ -128,6 +128,7 @@ request_timeout_seconds = 600
 [review_pr]
 report_severities = ["blocking", "should_fix"]   # confirmed findings at these severities
 report_uncertain = ["blocking"]                  # uncertain findings at these severities, posted as questions
+worktree_links = ["node_modules", "env", ".venv", "venv"]   # `pr worktree` symlinks these folders from the checkout (4 levels deep)
 
 [providers.deepseek]
 base_url = "https://api.deepseek.com"

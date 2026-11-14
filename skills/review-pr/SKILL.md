@@ -44,7 +44,8 @@ reason in one line and continue without it.
 1. `H review --round 1`. If it prints `FALLBACK`, spawn the `harness:claude-reviewer` subagent for round 1 and
    tell it this is a **PR review run** (the run directory, the harness path, round 1, and the contract map paths if
    any).
-2. Spawn the `harness:verifier` subagent for round 1. Tell it this is a **PR review run**: the code is not
+2. Spawn the `harness:verifier` subagent for round 1 (with model: opus when `pr start` printed `profile: legacy`).
+   Tell it this is a **PR review run**: the code is not
    checked out, so it reads files with `git show <ref>:<path>` (`H pr show` prints the exact
    commands) and checks consumers in the other repos with `git grep ... origin/<base>`. Give it the contract map
    paths if any.
@@ -68,7 +69,7 @@ commits, offer to re-run the review. Remind the user to open each PR's "Files ch
 submit their pending review (Approve / Request changes / Comment). The choice of verdict is theirs.
 
 ## 5. Finish
-`H run end --status done`.
+`H run end --status done`. It also removes any scratch worktrees the verifier made.
 
 ## Rules
 - Never post, comment, approve or request changes any other way in this flow, even though the guard would
