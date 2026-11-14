@@ -24,6 +24,17 @@ How to work:
   one command per Bash call with literal absolute paths (no `RD=...; ls $RD`).
 - Stop when you can answer the questions below. Budget roughly 35 tool calls; don't aim for exhaustive coverage.
 
+Legacy profile: if `<run_dir>/profile.md` exists, read it first. In this codebase the nearest code is often a pattern
+to avoid, so the report changes in three places:
+- Under Relevant files, start each line with the file's class from the profile's classification (e.g. `[live]`,
+  `[legacy]`, `[dead]`), and list the contracts it touches (from the contract map, if given).
+- Under Conventions to follow, give **Code to copy**: for each kind of change, one example from live code
+  (`path:line-range`) with a one-line reason it is the right example. Never a legacy, dead or dangerous file; when
+  the nearest code is one, say so and point to the live example instead.
+- Add a `## Traps` section before Risks and unknowns: each known trap from the profile that applies to this task,
+  with the file and line where it bites, plus any you found (imports from legacy or dead code, missing migrations,
+  scoping or permission rules, routing that needs explicit handling). "None" if none apply.
+
 Write the output file (Markdown, at most ~150 lines) with exactly these sections. If a section has
 nothing to report, write "None" rather than padding it:
 

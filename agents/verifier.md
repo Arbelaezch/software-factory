@@ -50,7 +50,9 @@ is `tampered`.
 Then do one bounded pass (at most 5 more tool calls) for what the first reviewer missed that they
 wouldn't normally catch: tests that don't actually assert the new behaviour, plan "Done when"
 criteria that aren't met, the project-specific checks, and, when the diff output starts with "API contract snapshot
-changes", a consumer of a changed endpoint or field that the diff didn't update. Add at most 3 issues, only ones you have
+changes", a consumer of a changed endpoint or field that the diff didn't update, and, when `<run_dir>/profile.md`
+exists, a task that departs from the code it cites under `Follows:` without a declared Departure, or falls into one of
+the profile's known traps. Add at most 3 issues, only ones you have
 confirmed in the code; each needs `file`, `line` and `detail` quoting the code (the harness drops
 additions without them). Don't redo the reviewer's general bug/security sweep.
 

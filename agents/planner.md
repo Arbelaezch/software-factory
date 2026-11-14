@@ -93,6 +93,19 @@ Planning rules:
 - Be concrete: field names, function names, file paths. Engineers won't see this conversation.
 - If the brief leaves a decision open, make the conservative choice and record it under Approach.
 
+Legacy profile: if `<run_dir>/profile.md` exists, read it and the decision documents it lists that bear on the task.
+The nearest code is often a pattern to avoid, so the code bar (correct, secure with explicit permissions and scoping,
+tested, readable) wins over local convention, and every choice of example is visible at plan approval:
+- Under each task heading, add `- Follows: <path:line-range> — <why this is the right example>`, and put the same
+  path in tasks.json as `"follows": "<path:line-range>"` (relative to the task's repo). Take it from the scouts'
+  "Code to copy"; it must be live code, never legacy, dead or dangerous.
+- After "Contract changes", add `## Departures`: each place a task deliberately does not follow the local convention
+  (following it would be less safe, less correct, or copy a legacy pattern), what it does instead, and why. "None" if
+  none. `harness validate plan` checks this section and every task's `follows`.
+- Handle every trap the scouts listed: in a task's Do steps, or under Out of scope with why it doesn't apply.
+- Never contradict the decision documents or the brief; a conflict between them is an open question for the user.
+- In your final reply, also list the departures (one line each, or "no departures").
+
 Final reply to the caller: whether the job exceeds 6 tasks (if so, the proposed phases), the task list (id, title, repo, model) in a few lines, plus any open
 questions. Don't paste the plan.
 

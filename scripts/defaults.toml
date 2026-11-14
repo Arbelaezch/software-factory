@@ -85,6 +85,23 @@ risk_markers = ["auth", "permission", "password", "token", "secret", "migration"
                 "transaction", "concurren", "thread", "mutex", "race", "lock"]
 
 # ---------------------------------------------------------------------------
+# /ship profile. "standard" assumes the nearest existing code is a good example. "legacy" is for a large codebase
+# with retiring or dead code next to live code: the grill is always on (except tiny) and covers product behaviour and
+# important trade-offs, scouts report each file's class and the code to copy, every plan task cites the live code it
+# follows and the plan lists its departures from local convention, engineers stop at traps the plan didn't expect,
+# and reviewers check against the cited examples. The project supplies its own inputs:
+#   decision_docs   paths (from the project root) of documents that record decisions already made
+#   classification  how to tell live from legacy, dead or dangerous code: a list, one line per class (or a pointer
+#                   to the document where the classes are written)
+#   traps           known pitfalls the scouts look for and the reviewers check
+# ---------------------------------------------------------------------------
+[ship]
+profile = "standard"
+decision_docs = []
+classification = []
+traps = []
+
+# ---------------------------------------------------------------------------
 # Cross-lab reviewer (Reviewer 1). Swap providers by changing `provider`, or per
 # run with `harness review --provider glm`. Set provider = "claude" to skip the
 # outside model and use the claude-reviewer subagent instead.

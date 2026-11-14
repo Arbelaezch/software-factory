@@ -1605,3 +1605,104 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 1)
         self.assertIn("[api] contracts: FAIL", out.getvalue())
         self.assertIn("declares none", out.getvalue())
+
+
+class LegacyProfileTests(unittest.TestCase):
+    """[ship] profile = "legacy": profile.md, the Follows/Departures plan checks, and the reviewer prompt additions."""
+
+    PLAN = ("# Plan: x\n## Approach\nwhy\n## Contract changes\nNone\n## Departures\nT1 scopes the queryset explicitly; "
+            "the nearby legacy view doesn't\n## Tasks\n### T1: x  (repo: api, model: sonnet)\n"
+            "- Follows: src/views.py:1-3 — live viewset\n- Do: steps\n- Done when: it works\n")
+    SHIP = {"profile": "legacy", "decision_docs": ["docs/RULES.md", "docs/GONE.md"],
+            "classification": ["live: api/ packages", "dead: surveys2"], "traps": ["replica reads need .using(alias)"]}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        (self.root / "api" / "src").mkdir(parents=True)
+        (self.root / "api" / "src" / "views.py").write_text("x = 1\n")
+        (self.root / "docs").mkdir()
+        (self.root / "docs" / "RULES.md").write_text("rules\n")
+        self.cfg = {"repos": {"api": {"path": "api"}}, "ship": dict(self.SHIP)}
+        for p in (mock.patch.object(h, "ROOT", self.root), mock.patch.object(h, "RUNS_DIR", self.root / "runs"),
+                  mock.patch.object(h, "CURRENT_FILE", self.root / "current"), mock.patch.object(h, "log_event"),
+                  mock.patch.object(h, "ensure_state_excluded"), mock.patch.object(h, "current_run_id", lambda: None)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tasks(self, **kw):
+        return {"repos": ["api"], "tasks": [{"id": "T1", "title": "x", "repo": "api", "depends_on": [], "model": "sonnet",
+                                             "files": ["src/views.py"], "acceptance": ["works"], **kw}]}
+
+    def validate(self, run, plan_md, tasks):
+        d = self.root / "runs" / run["id"]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "plan.md").write_text(plan_md)
+        (d / "tasks.json").write_text(json.dumps(tasks))
+        with mock.patch.object(h, "load_run", return_value=(d, run)), contextlib.redirect_stdout(io.StringIO()) as out:
+            try:
+                h.cmd_validate(mock.Mock(what="plan", round=None), self.cfg)
+            except SystemExit:
+                pass
+        return out.getvalue()
+
+    def test_standard_profile_is_unchanged(self):
+        for n, ship in enumerate(({}, {"profile": "standard", "traps": ["t"]})):
+            self.cfg["ship"] = ship
+            d, run = h.new_run(self.cfg, f"task {n}", "full")
+            self.assertNotIn("profile", run)
+            self.assertFalse((d / "profile.md").exists())
+            self.assertEqual(h.review_system_prompt(run, self.cfg), h.review_system_prompt(run, {"repos": self.cfg["repos"]}))
+            self.assertIn("OK: tasks.json", self.validate(run, "# Plan: x\n## Tasks\n", self.tasks()))
+
+    def test_unknown_profile_stops_the_run(self):
+        self.cfg["ship"] = {"profile": "Legacy"}
+        with self.assertRaises(SystemExit) as cm:
+            h.new_run(self.cfg, "task", "full")
+        self.assertIn("must be one of standard, legacy", str(cm.exception))
+
+    def test_legacy_run_writes_profile_md(self):
+        d, run = h.new_run(self.cfg, "task", "full")
+        self.assertEqual(run["profile"], "legacy")
+        self.assertEqual(h.read_json(d / "run.json")["profile"], "legacy")
+        text = (d / "profile.md").read_text()
+        self.assertIn("- `docs/RULES.md`\n", text)
+        self.assertIn("- `docs/GONE.md` (not found; tell the user)", text)
+        self.assertIn("- dead: surveys2", text)
+        self.assertIn("- replica reads need .using(alias)", text)
+        self.cfg["ship"] = {"profile": "legacy", "classification": "See CLAUDE.md, Live vs legacy."}
+        d, _ = h.new_run(self.cfg, "task 2", "full", force=True)
+        text = (d / "profile.md").read_text()
+        self.assertIn("See CLAUDE.md, Live vs legacy.", text)
+        self.assertIn("## Decision documents\nProduct", text)
+        self.assertIn("## Known traps\nNone configured.", text)
+
+    def test_legacy_plan_cites_examples_and_lists_departures(self):
+        run = {"id": "r1", "profile": "legacy"}
+        self.assertIn("OK: tasks.json", self.validate(run, self.PLAN, self.tasks(follows="src/views.py:1-3")))
+        self.assertIn("OK: tasks.json", self.validate(run, self.PLAN, self.tasks(follows="api/src/views.py")))
+        out = self.validate(run, self.PLAN, self.tasks())
+        self.assertIn("INVALID: plan.md", out)
+        self.assertIn("\"follows\" must name the live code", out)
+        self.assertIn("follows 'src/nope.py', which does not exist", self.validate(run, self.PLAN, self.tasks(follows="src/nope.py:4")))
+        no_departures = self.PLAN.replace("## Departures", "## Notes")
+        self.assertIn("\"## Departures\" section", self.validate(run, no_departures, self.tasks(follows="src/views.py")))
+        self.assertIn("OK: tasks.json", self.validate(run, self.PLAN.replace("T1 scopes", "None\nT1 scopes"),
+                                                      self.tasks(follows="src/views.py")))
+
+    def test_legacy_review_prompts(self):
+        ship = h.review_system_prompt({"mode": "full", "profile": "legacy"}, self.cfg)
+        self.assertIn("\"Follows:\"", ship)
+        self.assertIn("- replica reads need .using(alias)", ship)
+        self.assertLess(ship.index("Known traps"), ship.index("Look for, in priority order"))
+        pr = h.review_system_prompt({"mode": "review", "profile": "legacy"}, self.cfg)
+        self.assertNotIn("\"Follows:\"", pr)
+        self.assertIn("- replica reads need .using(alias)", pr)
+        self.assertNotIn("Known traps", h.review_system_prompt({"mode": "full"}, self.cfg))
+
+    def test_plan_digest_keeps_examples_and_departures(self):
+        out = h.plan_digest(self.PLAN)
+        self.assertIn("- Follows: src/views.py:1-3", out)
+        self.assertIn("Departures:\nT1 scopes the queryset", out)
+        self.assertNotIn("- Do: steps", out)
