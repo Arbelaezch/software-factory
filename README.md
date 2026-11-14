@@ -100,7 +100,9 @@ which keeps its context small over long runs.
   and real spend for outside providers.
 - **Multi-repo PR review.** `/review-pr` finds linked PRs across repos, including dependency
   branches referenced in `package.json`. It reviews them together for contract mismatches and posts
-  line-anchored *pending* GitHub reviews.
+  line-anchored *pending* GitHub reviews. In a legacy-profile project the Claude reviewer reviews (it can read
+  models, contracts and consumers), a large PR set is split into parallel lenses (correctness, contracts, data,
+  access), and only findings above the `[review_pr]` report bar reach the draft.
 - **Multi-account aware.** A small shell wrapper plus a `SessionStart` hook make sure each project runs
   under the right Claude account and GitHub identity.
 
