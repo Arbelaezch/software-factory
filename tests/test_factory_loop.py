@@ -443,7 +443,7 @@ echo "args: $@"
             def set_state(slug, n, st):
                 issues[n] = (issues[n] - set(fl.STATE_LABELS)) | {st}
 
-            usage = types.SimpleNamespace(check=lambda limits: {"decision": "go"})
+            usage = types.SimpleNamespace(check=lambda limits, **kw: {"decision": "go"})
             a = mock.Mock(merge="auto", issues=None, dry_run=False, max_issues=5, repo=None, auto_queue=True, until_limit=False)
             env = {"HARNESS_CLAUDE": str(fake), "SOFTWARE_FACTORY_HOME": tmp}
             with mock.patch.dict("os.environ", env), mock.patch.object(h, "ROOT", root), \
@@ -594,7 +594,7 @@ class HarnessWiringTests(unittest.TestCase):
             def set_state(slug, n, st):
                 labels[n] = (labels[n] - set(fl.STATE_LABELS)) | {st}
 
-            usage = types.SimpleNamespace(check=lambda limits: {"decision": "go"})
+            usage = types.SimpleNamespace(check=lambda limits, **kw: {"decision": "go"})
             a = mock.Mock(merge="manual", issues=None, dry_run=False, max_issues=5, repo=None, auto_queue=False, until_limit=False)
             env = {"HARNESS_CLAUDE": str(fake), "SOFTWARE_FACTORY_HOME": tmp}
             with mock.patch.dict("os.environ", env), mock.patch.object(h, "ROOT", root), \
@@ -754,7 +754,8 @@ class FrontDoorTests(unittest.TestCase):
         (sessions / "issue-2-1.log").write_text("line one\nline two\n")
         issues = [issue(2, labels=("in-progress",), title="Build it"), issue(3, labels=("blocked",), title="Stuck one"),
                   issue(4, labels=("awaiting-merge",)), issue(5, labels=("todo",)), issue(6, labels=("todo",), body="Depends on #5")]
-        usage = types_ns(decide=lambda r, l: {"decision": "go", "reasons": []}, read_snapshot=lambda max_age=0: None)
+        usage = types_ns(decide=lambda r, l: {"decision": "go", "reasons": []}, read_snapshot=lambda path=None, max_age=0: None,
+                         snapshot_path=lambda d=None: None)
         with mock.patch.object(h, "factory_modules", lambda: (fl, usage)), \
                 mock.patch.object(h, "factory_repo", lambda a, c: "o/r"), mock.patch.object(h, "gh_json", lambda *a: issues), \
                 mock.patch.object(h, "current_run_id", lambda: None), contextlib.redirect_stdout(io.StringIO()) as out:

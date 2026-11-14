@@ -78,5 +78,22 @@ class UsageTests(unittest.TestCase):
             self.assertIsNone(u.read_snapshot(p, 300, mtime + 1))
 
 
+    def test_each_account_has_its_own_snapshot_and_probe(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/acc/work"}):
+            self.assertEqual(u.snapshot_path(), Path("/acc/work/statusline-latest.json"))
+            self.assertEqual(u.snapshot_path("/acc/p"), Path("/acc/p/statusline-latest.json"))
+            self.assertEqual(u.probe_env("/acc/p")["CLAUDE_CONFIG_DIR"], "/acc/p")
+            self.assertNotIn("CLAUDE_CONFIG_DIR", u.probe_env(str(Path.home() / ".claude")))
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(u, "run_probe", return_value=None) as probe:
+            Path(d, "statusline-latest.json").write_text(json.dumps({"rate_limits": {
+                "five_hour": {"used_percentage": 95, "resets_at": 9e12}, "seven_day": {"used_percentage": 1, "resets_at": 9e12}}}))
+            self.assertEqual(u.check(LIMITS, config_dir=d)["decision"], "pause")
+            probe.assert_not_called()
+            other = os.path.join(d, "other")
+            self.assertEqual(u.check(LIMITS, config_dir=other)["decision"], "unknown")
+            self.assertEqual(probe.call_args.kwargs["d"], other)
+
+
 if __name__ == "__main__":
     unittest.main()

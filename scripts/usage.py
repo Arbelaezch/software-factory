@@ -2,13 +2,15 @@
 """Plan-usage check: how much of the 5-hour and weekly windows is used, and whether to keep going.
 
 Two sources, both normalized to percent used (0-100) per window:
-  snapshot  ~/.claude/statusline-latest.json, written by statusline_capture.py while a session is open
+  snapshot  <config dir>/statusline-latest.json, written by statusline_capture.py while a session is open
   probe     a one-turn headless `claude -p` run; its stream-json carries a rate_limit_event
+
+Both are per Claude account: the config dir is --config-dir, else $CLAUDE_CONFIG_DIR, else ~/.claude.
 
 Fails closed: if no fresh data is available the decision is "unknown", never "go".
 Standard library only.
 
-Usage: python3 usage.py [--probe] [--max-five-hour 85] [--max-weekly 90] [--max-age 300] [--json]
+Usage: python3 usage.py [--probe] [--config-dir DIR] [--max-five-hour 85] [--max-weekly 90] [--max-age 300] [--json]
 Exit codes: 0 go, 10 pause, 2 unknown.
 """
 from __future__ import annotations
@@ -16,12 +18,13 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-SNAPSHOT = Path.home() / ".claude" / "statusline-latest.json"
+SNAPSHOT_NAME = "statusline-latest.json"
 WINDOWS = ("five_hour", "seven_day")
 EXIT = {"go": 0, "pause": 10, "unknown": 2}
 
@@ -53,9 +56,19 @@ def from_stream(text: str) -> dict:
     return {"windows": out, "using_overage": bool((last or {}).get("isUsingOverage"))}
 
 
-def read_snapshot(path: Path = SNAPSHOT, max_age: float = 300, now: float | None = None) -> dict | None:
+def config_dir(d: str | None = None) -> Path:
+    """The Claude account's config dir: d, else $CLAUDE_CONFIG_DIR, else ~/.claude."""
+    return Path(d or os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+
+
+def snapshot_path(d: str | None = None) -> Path:
+    return config_dir(d) / SNAPSHOT_NAME
+
+
+def read_snapshot(path: Path | None = None, max_age: float = 300, now: float | None = None) -> dict | None:
     """The snapshot as a reading, or None when it is missing, unreadable or older than max_age seconds."""
     now = time.time() if now is None else now
+    path = path or snapshot_path()
     try:
         if now - path.stat().st_mtime > max_age:
             return None
@@ -65,12 +78,22 @@ def read_snapshot(path: Path = SNAPSHOT, max_age: float = 300, now: float | None
     return {**reading, "source": "snapshot"} if reading["windows"] else None
 
 
-def run_probe(model: str = "haiku", timeout: int = 90) -> dict | None:
-    """One cheap headless turn. None if claude is missing, fails, or emits no rate-limit event."""
+def probe_env(d: str | None) -> dict:
+    """Environment for the probe: the account's config dir, or none for the default ~/.claude."""
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
+    if d and config_dir(d) != Path.home() / ".claude":
+        env["CLAUDE_CONFIG_DIR"] = str(config_dir(d))
+    return env
+
+
+def run_probe(model: str = "haiku", timeout: int = 90, d: str | None = None) -> dict | None:
+    """One cheap headless turn on the account in d (None: this process's). None if claude is missing, fails,
+    or emits no rate-limit event."""
     try:
         p = subprocess.run(
             ["claude", "-p", "Reply with the single word ok", "--output-format", "stream-json", "--verbose", "--model", model],
-            capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+            capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+            env=probe_env(d) if d else None)
     except (OSError, subprocess.TimeoutExpired):
         return None
     reading = from_stream(p.stdout)
@@ -107,11 +130,13 @@ def decide(reading: dict | None, limits: dict, now: float | None = None) -> dict
     return {"decision": "pause", "reasons": reasons, "resume_at": max(known) if known else None}
 
 
-def check(limits: dict, max_age: float = 300, probe: bool = False, probe_model: str = "haiku") -> dict:
-    """Snapshot first; probe when asked or when the snapshot is unusable."""
-    reading = read_snapshot(max_age=max_age)
+def check(limits: dict, max_age: float = 300, probe: bool = False, probe_model: str = "haiku",
+          config_dir: str | None = None) -> dict:
+    """Snapshot first; probe when asked or when the snapshot is unusable. config_dir picks the account
+    (None: $CLAUDE_CONFIG_DIR, else ~/.claude)."""
+    reading = read_snapshot(snapshot_path(config_dir), max_age=max_age)
     if probe or decide(reading, limits)["decision"] == "unknown":
-        reading = run_probe(probe_model) or reading
+        reading = run_probe(probe_model, d=config_dir) or reading
     result = decide(reading, limits)
     result["source"] = (reading or {}).get("source")
     result["usage"] = {w: {"used_pct": round(i["used_pct"], 1), "resets_at": i["resets_at"]}
@@ -130,9 +155,10 @@ def main(argv=None) -> int:
     ap.add_argument("--max-age", type=float, default=300, help="seconds before the snapshot counts as stale")
     ap.add_argument("--probe", action="store_true", help="always take a fresh headless reading")
     ap.add_argument("--probe-model", default="haiku")
+    ap.add_argument("--config-dir", help="the Claude account's config dir (default $CLAUDE_CONFIG_DIR, else ~/.claude)")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
-    r = check({"five_hour": a.max_five_hour, "seven_day": a.max_weekly}, a.max_age, a.probe, a.probe_model)
+    r = check({"five_hour": a.max_five_hour, "seven_day": a.max_weekly}, a.max_age, a.probe, a.probe_model, a.config_dir)
     if a.json:
         print(json.dumps(r, indent=2))
     else:

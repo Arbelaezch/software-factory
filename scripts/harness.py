@@ -1903,6 +1903,67 @@ def account_dir(cfg: dict, name: str | None) -> str | None:
     return str(Path(d).expanduser()) if d else None
 
 
+DEFAULT_CLAUDE_DIR = Path.home() / ".claude"
+
+
+def account_dirs(cfg) -> dict[str, Path]:
+    """Every named Claude account -> its config dir (the default ~/.claude for "")."""
+    return {k: Path(v).expanduser() if v else DEFAULT_CLAUDE_DIR
+            for k, v in ((cfg.get("accounts") or {}).get("dirs") or {}).items()}
+
+
+def account_email(d: Path) -> str | None:
+    """The email a config dir is signed in to. Claude Code keeps the login's account info in
+    <dir>/.claude.json, or ~/.claude.json for the default dir."""
+    default = d.resolve() == DEFAULT_CLAUDE_DIR.resolve()
+    path = DEFAULT_CLAUDE_DIR.parent / ".claude.json" if default else d / ".claude.json"
+    return ((read_json(path, {}) or {}).get("oauthAccount") or {}).get("emailAddress")
+
+
+def plugin_installed(d: Path, root: Path) -> bool:
+    """The harness plugin is installed in config dir d for root (user scope, or project scope for root)."""
+    market, plugin = _marketplace_ids()
+    installed = (read_json(d / "plugins" / "installed_plugins.json", {}) or {}).get("plugins") or {}
+    entries = installed.get(f"{plugin}@{market}") or []
+    return any(e.get("scope") == "user" or Path(e.get("projectPath") or "/nonexistent").resolve() == root.resolve()
+               for e in entries)
+
+
+def settings_drift(cfg) -> dict[str, list[str]]:
+    """Account -> the shared settings keys whose value differs from ~/.claude/settings.json."""
+    keys = (cfg.get("accounts") or {}).get("shared_settings") or []
+    source = read_json(DEFAULT_CLAUDE_DIR / "settings.json", {}) or {}
+    out = {}
+    for name, d in account_dirs(cfg).items():
+        if d.resolve() == DEFAULT_CLAUDE_DIR.resolve():
+            continue
+        have = read_json(d / "settings.json", {}) or {}
+        diff = [k for k in keys if have.get(k) != source.get(k)]
+        if diff:
+            out[name] = diff
+    return out
+
+
+def sync_account_settings(cfg) -> dict[str, list[str]]:
+    """Copy the shared settings keys from ~/.claude/settings.json to every other account dir (creating it).
+    A key missing from the source is removed. Returns account -> keys changed."""
+    keys = (cfg.get("accounts") or {}).get("shared_settings") or []
+    source = read_json(DEFAULT_CLAUDE_DIR / "settings.json", {}) or {}
+    drift = settings_drift(cfg)
+    for name in drift:
+        d = account_dirs(cfg)[name]
+        d.mkdir(parents=True, exist_ok=True)
+        os.chmod(d, 0o700)
+        data = read_json(d / "settings.json", {}) or {}
+        for k in keys:
+            if k in source:
+                data[k] = source[k]
+            else:
+                data.pop(k, None)
+        write_json(d / "settings.json", data)
+    return drift
+
+
 def hook_session_start(cfg):
     sys.stdin.read()
     want = (cfg.get("accounts") or {}).get("claude")
@@ -5305,6 +5366,14 @@ def project_claude_dir(cfg) -> str | None:
     return account_dir(cfg, name) if name else os.environ.get("CLAUDE_CONFIG_DIR")
 
 
+def project_account_dir(cfg) -> str:
+    """This project's Claude config dir as a path (never None): the pinned account's, else this process's,
+    else ~/.claude. Usage checks read that account's snapshot."""
+    name = (cfg.get("accounts") or {}).get("claude")
+    d = account_dir(cfg, name) if name else os.environ.get("CLAUDE_CONFIG_DIR")
+    return str(Path(d).expanduser()) if d else str(Path.home() / ".claude")
+
+
 def phone_start(cfg) -> None:
     """Give the project its topic and make sure the bridge runs, so `status` from the phone works during a run."""
     try:
@@ -5531,7 +5600,7 @@ def cmd_factory_status(a, cfg):
     else:
         print("supervisor: not running")
     fc = cfg.get("factory") or {}
-    u = usage.decide(usage.read_snapshot(max_age=900),
+    u = usage.decide(usage.read_snapshot(usage.snapshot_path(project_account_dir(cfg)), max_age=900),
                      {"five_hour": float(fc.get("max_five_hour", 85)), "seven_day": float(fc.get("max_weekly", 90))})
     print(f"usage: {u['decision']}" + (f" ({'; '.join(u['reasons'])})" if u["reasons"] else ""))
 
@@ -6001,7 +6070,7 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
     summary = fl.run_loop(
         after_issue=cleanup, park=park, refill=refill,
         land_pr=make_lander() if a.merge == "auto" else None,
-        gate=lambda: fl.usage_gate(lambda: usage.check(limits), log=factory_log,
+        gate=lambda: fl.usage_gate(lambda: usage.check(limits, config_dir=project_account_dir(cfg)), log=factory_log,
                                    max_unknown=int(fc.get("unknown_limit", 3))),
         fetch_issues=fetch, select=lambda pool: fl.choose(pool, ask_selector),
         set_state=lambda n, st: set_issue_state(slug, n, st), run_issue=run_issue,
@@ -6031,6 +6100,44 @@ def cmd_account(a, cfg):
     name = (cfg.get("accounts") or {}).get("claude")
     if name:
         print(f"{name}|{account_dir(cfg, name) or ''}")
+
+
+def account_lines(cfg, root: Path | None = None) -> list[tuple[bool | None, str]]:
+    """One (good, text) per Claude account for `accounts` and `doctor`: dir, signed-in email, plugin install and
+    settings drift. good is None for plain info. root marks the project's account and checks its plugin install."""
+    want = (cfg.get("accounts") or {}).get("claude")
+    dirs, drift = account_dirs(cfg), settings_drift(cfg)
+    emails = {name: account_email(d) for name, d in dirs.items()}
+    out = []
+    for name, d in dirs.items():
+        mine = root is not None and name == want
+        email = emails[name]
+        shared = [k for k, e in emails.items() if k != name and e and e == email]
+        text = f"{name}{' (this project)' if mine else ''}: {d} - " + (f"signed in as {email}" if email else "not signed in")
+        if shared:
+            text += f", the same login as {', '.join(shared)}; sign one of them in to its own account (/login in a session there)"
+        elif not email:
+            text += f" (run `claude-{name}` or `claude-as {name}` and /login)"
+        out.append((not shared and bool(email) if mine or shared else None, text))
+        if name in drift:
+            out.append((False, f"{name}: settings differ from ~/.claude/settings.json ({', '.join(drift[name])}); "
+                               "run `harness accounts sync`"))
+        if mine and not plugin_installed(d, root):
+            out.append((False, f"{name}: the harness plugin is not installed for this project in {d} "
+                               f"(CLAUDE_CONFIG_DIR={d} claude plugin install ...; see the README)"))
+    return out
+
+
+def cmd_accounts(a, cfg):
+    """List the Claude accounts (dir, signed-in email, settings drift), or sync the shared settings."""
+    if a.action == "sync":
+        changed = sync_account_settings(cfg)
+        for name, keys in changed.items():
+            print(f"{name}: updated {', '.join(keys)} in {account_dirs(cfg)[name] / 'settings.json'}")
+        print("all account directories already match ~/.claude/settings.json" if not changed else "done")
+        return
+    for good, text in account_lines(cfg, ROOT if CONFIGURED else None):
+        print(("  info " if good is None else "  ok   " if good else "  !!   ") + text)
 
 
 def set_toml_key(path: Path, section: str, key: str, value: str) -> None:
@@ -6128,6 +6235,11 @@ def cmd_doctor(a, cfg):
               f"CLAUDE_CONFIG_DIR={have or '(unset)'}{'' if same else ' - the claude shell function switches it on launch'}")
     else:
         print("  info Claude account: not set (uses whatever `claude` is logged in as)")
+    for good, text in account_lines(cfg, ROOT):
+        if good is None:
+            print(f"  info {text}")
+        else:
+            line(good, text)
     if acc.get("github"):
         try:
             gh_env()
@@ -6395,6 +6507,10 @@ def main(argv=None):
     s.add_argument("--dir-for", help="print the config dir for a named account")
     s.set_defaults(fn=cmd_account)
 
+    s = sub.add_parser("accounts", help="list the Claude accounts (dir, login, settings drift) or sync shared settings")
+    s.add_argument("action", nargs="?", default="list", choices=["list", "sync"])
+    s.set_defaults(fn=cmd_accounts)
+
     s = sub.add_parser("notify", help="send the user a standard QUESTION / BLOCKER / DONE message")
     s.add_argument("--kind", required=True, choices=[k.lower() for k in MESSAGE_KINDS] + list(MESSAGE_KINDS))
     s.add_argument("--issue", help="issue number or reference")
@@ -6508,7 +6624,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.cmd == "models" and a.action == "set" and not (a.agent and a.model):
         ap.error("usage: harness models set <agent> <model> [--effort level] [--project]")
-    if a.cmd not in ("hook", "account", "init", "doctor", "models", "report", "phone"):
+    if a.cmd not in ("hook", "account", "accounts", "init", "doctor", "models", "report", "phone"):
         require_project()
     a.fn(a, load_config())
 

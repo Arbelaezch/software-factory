@@ -861,6 +861,68 @@ class SessionStartTests(unittest.TestCase):
         self.assertIsNone(h.session_start([{"type": "attachment", "attachment": {"type": "date"}}]))
 
 
+class ClaudeAccountTests(unittest.TestCase):
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.home)
+        p = mock.patch.object(h, "DEFAULT_CLAUDE_DIR", self.home / ".claude")
+        p.start()
+        self.addCleanup(p.stop)
+        self.cfg = {"accounts": {"claude": "work", "shared_settings": ["hooks", "theme"],
+                                 "dirs": {"personal": "", "work": str(self.home / ".claude-work")}}}
+        (self.home / ".claude").mkdir()
+        h.write_json(self.home / ".claude" / "settings.json", {"hooks": {"PreToolUse": []}, "model": "opus"})
+
+    def login(self, path, email):
+        h.write_json(path, {"oauthAccount": {"emailAddress": email}})
+
+    def test_email_comes_from_home_for_the_default_dir_and_from_the_dir_otherwise(self):
+        self.login(self.home / ".claude.json", "me@personal")
+        self.login(self.home / ".claude-work" / ".claude.json", "me@work")
+        dirs = h.account_dirs(self.cfg)
+        self.assertEqual(dirs["personal"], self.home / ".claude")
+        self.assertEqual(h.account_email(dirs["personal"]), "me@personal")
+        self.assertEqual(h.account_email(dirs["work"]), "me@work")
+
+    def test_sync_copies_shared_keys_only_and_drops_ones_the_source_lacks(self):
+        work = self.home / ".claude-work"
+        self.assertEqual(h.settings_drift(self.cfg), {"work": ["hooks"]})
+        self.assertEqual(h.sync_account_settings(self.cfg), {"work": ["hooks"]})
+        self.assertEqual(h.read_json(work / "settings.json"), {"hooks": {"PreToolUse": []}})
+        h.write_json(work / "settings.json", {"hooks": {"PreToolUse": []}, "theme": "light", "model": "sonnet"})
+        h.sync_account_settings(self.cfg)
+        self.assertEqual(h.read_json(work / "settings.json"), {"hooks": {"PreToolUse": []}, "model": "sonnet"})
+        self.assertEqual(h.settings_drift(self.cfg), {})
+
+    def test_lines_flag_a_shared_login_drift_and_a_missing_plugin(self):
+        self.login(self.home / ".claude.json", "me@personal")
+        self.login(self.home / ".claude-work" / ".claude.json", "me@personal")
+        lines = h.account_lines(self.cfg, self.home / "proj")
+        bad = [t for good, t in lines if good is False]
+        self.assertTrue(any("the same login as personal" in t for t in bad))
+        self.assertTrue(any("settings differ" in t for t in bad))
+        self.assertTrue(any("plugin is not installed" in t for t in bad))
+
+    def test_the_project_account_is_ok_when_signed_in_alone_synced_and_installed(self):
+        work = self.home / ".claude-work"
+        self.login(self.home / ".claude.json", "me@personal")
+        self.login(work / ".claude.json", "me@work")
+        h.sync_account_settings(self.cfg)
+        market, plugin = h._marketplace_ids()
+        h.write_json(work / "plugins" / "installed_plugins.json", {"plugins": {f"{plugin}@{market}": [
+            {"scope": "project", "projectPath": str(self.home / "proj")}]}})
+        lines = h.account_lines(self.cfg, self.home / "proj")
+        self.assertEqual([g for g, _ in lines], [None, True])
+        self.assertIn("work (this project)", lines[1][1])
+
+    def test_project_account_dir_is_never_none(self):
+        with mock.patch.dict(h.os.environ, {"CLAUDE_CONFIG_DIR": "/acc/other"}):
+            self.assertEqual(h.project_account_dir({**self.cfg, "accounts": {**self.cfg["accounts"], "claude": "personal"}}),
+                             str(h.Path.home() / ".claude"))
+            self.assertEqual(h.project_account_dir({}), "/acc/other")
+        self.assertEqual(h.project_account_dir(self.cfg), str(self.home / ".claude-work"))
+
+
 class SessionUsageTests(unittest.TestCase):
     """log_session_usage: supervisor-launched `claude -p` sessions are metered from their transcript."""
 

@@ -5,11 +5,20 @@
 # ---------------------------------------------------------------------------
 # Claude accounts. A project picks one with `[accounts] claude = "<name>"`; the claude shell function
 # (scripts/claude-accounts.sh) then starts Claude Code with that account's config directory.
-# "" means the default ~/.claude. Each directory keeps its own login (incl. macOS Keychain entry).
+# "" means the default ~/.claude, which is also what the desktop app, IDE extensions and folders without a
+# harness config use, so keep the personal account there. Each directory keeps its own login (incl. macOS
+# Keychain entry), so /login in one never changes the other.
 # ---------------------------------------------------------------------------
+[accounts]
+# User-level settings.json keys that every account directory shares. ~/.claude/settings.json is the source:
+# `harness accounts sync` copies these keys to the other directories and `harness doctor` reports drift.
+# Keys not listed (e.g. model) stay per account.
+shared_settings = ["hooks", "statusLine", "permissions", "theme", "preferredNotifChannel",
+                   "inputNeededNotifEnabled", "agentPushNotifEnabled", "extraKnownMarketplaces"]
+
 [accounts.dirs]
-work = ""
-personal = "~/.claude-personal"
+personal = ""
+work = "~/.claude-work"
 
 # `kind` on a gate (jest | django | pytest | tsc | eslint) makes it baseline-aware: `harness baseline`
 # records failures that exist before any edits, and the gate then fails only on NEW failures.
