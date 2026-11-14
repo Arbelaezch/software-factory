@@ -32,6 +32,9 @@ detail/suggestion as review comments to a colleague, and add a top-level "questi
 Look for, in order: bugs; security (missing auth/permission checks, data exposure); contract mismatches
 between an API and its consumers or between repos; missing or unsafe migrations; missing or weak
 tests; plan requirements not met; the project-specific checks; platform pitfalls. Skip style. Budget roughly 40 tool calls.
+When the diff output starts with "API contract snapshot changes", check each changed endpoint, field or status code
+against its consumers in every repo (`git grep` the URL or field name) and against "Contract changes" in plan.md;
+a consumer that wasn't updated is blocking.
 
 Severity: blocking (real bug, security issue, broken contract, data risk, unmet requirement),
 should_fix (likely problem or real test gap), nit (optional). Max 15 findings, most severe first.

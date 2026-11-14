@@ -66,8 +66,12 @@ without a grill, if the user gave details beyond the one-line task, record them 
 Using the workspace CLAUDE.md and the repos in `.claude/harness.toml`, decide which repos the task likely
 touches (in a single-repo project, just that one). Spawn one
 `harness:scout` subagent per relevant repo **in parallel**, each told to write `<run_dir>/context-<repo>.md`.
-When unsure whether a repo is involved, include it; scouts are cheap. **Tiny tier: skip this step** (the
+When unsure whether a repo is involved, include it; scouts are cheap. **Tiny tier: skip the scouts** (the
 planner reads the files itself).
+
+API contracts (every tier): first run `H contracts map`. If it prints "No repo has [contracts]", skip this. Otherwise it
+rebuilds a stale contract map and prints each map's path: give those paths to every scout and to the planner. If a map
+`failed`, relay the reason to the user and continue without it (the snapshot gate still runs).
 
 ## 3. Plan
 Spawn the `harness:planner` subagent with the run directory. It writes `plan.md` and `tasks.json`.
@@ -99,7 +103,7 @@ it; the only allowed types are `feat`, `fix`, `chore`, `hotfix`). The user's own
 
 Then, **before any engineer edits anything**, run `H baseline --repos <same repos>`. It records the
 failures that already exist (some suites aren't green today), so gates later fail only on new
-failures. It can take a few minutes; tell the user it's running. Run it in the background if your
+failures, and takes the pre-edit API contract snapshot for repos with `[contracts]`. It can take a few minutes; tell the user it's running. Run it in the background if your
 tools allow, but wait for it to finish before step 6.
 
 ## 6. Implement

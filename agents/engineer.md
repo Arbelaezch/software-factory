@@ -61,6 +61,10 @@ to fix pre-existing failures unless your task is about them. A gate that fails w
 failures (a crash or config error) is still GATES FAIL: if you believe it's unrelated to your change,
 reply GATES FAIL with that explanation rather than chasing it or calling it a pass.
 
+A `contracts` gate compares the API contract (fields and status codes per endpoint) with a snapshot taken before
+any edits. It fails when the contract changed and "Contract changes" in plan.md declares none: you changed a
+contract the plan didn't ask for. Undo it, or report that the plan is wrong if the task can't be done without it.
+
 Fix rounds: for each finding in the fix file, either fix it or explain in one line why it's not a
 real issue. Don't refactor beyond the findings.
 
