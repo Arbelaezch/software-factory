@@ -40,7 +40,8 @@ Work folder: `${CLAUDE_PROJECT_DIR}/.factory/plans/<YYYYMMDD-HHMM>/` (create it)
    `--by assumed` and the reviewer's reasoning. Never answer a product question for the user.
 4. **Say whether the documents are ready.** One or two lines: what's settled, what's still open and which issues
    it will touch. Ask whether to continue to planning or to stop here and let the user update the documents.
-5. **Plan and create.** Spawn `factory-planner` with the document paths, `.factory/decisions.md`, the work folder's
+5. **Plan and create.** Spawn `factory-planner` with the document paths, `.factory/decisions.md` (and
+   `.factory/decisions.pending.md` if it exists: answers not committed yet), the work folder's
    `issues.json` path and the harness command. Then run `H factory issues-create <issues.json>`: it checks the list,
    creates the factory labels if missing, creates the issues dependencies first with `Depends on #N` lines,
    and skips titles that already exist. If it reports problems, send them back to the planner once; if they
@@ -48,5 +49,6 @@ Work folder: `${CLAUDE_PROJECT_DIR}/.factory/plans/<YYYYMMDD-HHMM>/` (create it)
    documents with `H factory docs <mvp path> [--vision <path>]`, so a later `--auto-queue` run knows what the
    project is meant to contain.
 6. **Report.** The created issue numbers with titles and dependencies as a compact list, the planner's open notes,
-   and the paths of `.factory/decisions.md` and `.factory/log.jsonl`. Nothing runs automatically: the user tells
+   and the paths of `.factory/decisions.md` (or `.factory/decisions.pending.md`, where `factory decide` says it
+   recorded the answers; the next `factory start` commits those into `decisions.md`) and `.factory/log.jsonl`. Nothing runs automatically: the user tells
    the manager which issues to work on, or asks it to run the whole plan on its own (`/factory` with auto-queue).

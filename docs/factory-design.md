@@ -87,7 +87,14 @@ answer, whether the question is product or implementation, and whether it cascad
 understanding, then answer the gaps in batches (product questions and cascading ones first; I can accept low-impact
 proposals in bulk, recorded as assumed). Every answer is appended to `.factory/decisions.md` with
 `harness factory decide`; `question-resolver` and the planners treat that file as a source document, so the same
-question is never asked twice. Only then does `factory-planner` draft the issues and `harness factory
+question is never asked twice. Inside a git repo `factory decide` never touches `decisions.md` (unless the project
+gitignores it): the entry goes to `.factory/decisions.pending.md`, which git never sees and which every reader reads alongside it, so an answer recorded
+while some issue's branch is checked out is visible at once, never rides along in that issue's PR and never leaves
+the base branch dirty. The supervisor moves pending entries into `decisions.md` at quiet points (when it starts and
+after each issue, on a clean base branch that matches origin) as one commit, the file's first commit included: pushed directly when the base branch is unprotected, as a
+pull request when it is protected or the push is refused (squash-merged under merge policy auto; otherwise, or if
+the merge is refused, left open with one `decisions PR needs your merge` line). Until that lands the pending file
+stays. Branch creation ignores uncommitted changes to `.factory/decisions.md`. Only then does `factory-planner` draft the issues and `harness factory
 issues-create` make them, with no approval gate, dependencies first, `Depends on #N` lines, existing titles
 skipped, each logged to `.factory/log.jsonl`. The checks on the draft (unique keys and titles, known dependencies,
 no cycles) run inside `issues-create`; `--dry-run` is the planner's self-check. Issues never get `todo`: I tell

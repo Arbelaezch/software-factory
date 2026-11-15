@@ -30,11 +30,14 @@ Read `${CLAUDE_PLUGIN_ROOT}/skills/ship/SKILL.md` and follow it for issue `#N`, 
 changes where humans were involved.
 
 1. **No grill, no plan checkpoint.** Skip steps 1 and 4 of /ship: the documents were reviewed and answers recorded
-   in `.factory/decisions.md` before the issue existed. Treat the plan as approved. Read that decisions file (if it exists; a project
-   with no recorded decisions has none) and the issue's linked documents before planning; pass the relevant decisions to the planner and engineers.
+   in `.factory/decisions.md` before the issue existed. Treat the plan as approved. Read that decisions file and
+   `.factory/decisions.pending.md` (answers not committed yet, often the answer to this very issue's blocker; either
+   file may be missing) and the issue's linked documents before planning; pass the relevant decisions to the planner
+   and engineers. Never edit, stage or commit either decisions file: the supervisor commits them on the base branch.
 2. **Nobody to ask.** Never use AskUserQuestion. Where /ship says to ask the user or relay `NEEDS USER`, send the
    question to the `question-resolver` agent first (give it the question, issue #N, what was being done and the
-   paths of `.factory/decisions.md` and the issue's linked documents). It ends with one outcome line:
+   paths of `.factory/decisions.md`, `.factory/decisions.pending.md` and the issue's linked documents). It ends with
+   one outcome line:
    - `ANSWERED: ... | SOURCE: ...`: use the answer and quote the source line where you act on it. Continue.
    - `ASSUMED: ... | WHY: ...`: record it with `H factory decide --question "<q>" --answer "<a>" --by assumed
      --kind implementation --why "<why>"`, give the answer to whoever asked, and add an `## Assumptions` section

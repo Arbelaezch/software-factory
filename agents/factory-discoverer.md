@@ -12,8 +12,8 @@ itself busy without being told which issues to run. Your job is to find work the
 nobody has filed yet. An empty answer is normal and correct: it is how the factory knows it is finished.
 
 The prompt gives you the document paths, a maximum number of issues and the output path. Read, in this order:
-- the MVP document, the vision document (if any), and `.factory/decisions.md` (settled questions: as binding as the
-  documents)
+- the MVP document, the vision document (if any), and `.factory/decisions.md` plus `.factory/decisions.pending.md`
+  if it exists (settled questions, the pending ones not committed yet: all as binding as the documents)
 - the workspace `CLAUDE.md` and `[project]` in `.claude/harness.toml`
 - every existing issue, open and closed: `gh issue list --state all --limit 300 --json number,title,state,labels`.
   Open issues in any state (`blocked`, `awaiting-merge`, `backlog`, `todo`) count as already covered. Read the bodies

@@ -619,6 +619,250 @@ class IssuePlanTests(unittest.TestCase):
             self.assertIn("cycle", str(cm.exception))
             gh.assert_not_called()
 
+    def decisions_project(self, tmp, origin=True, committed=True):
+        """A git project (decisions.md committed on main unless committed=False) with a bare origin; returns (root, git)."""
+        root = Path(tmp) / "proj"
+        root.mkdir()
+        git = lambda *a, cwd=root: subprocess.run(["git", "-C", str(cwd), *a], check=True, capture_output=True, text=True).stdout
+        git("init", "-q", "-b", "main")
+        git("config", "user.name", "t")
+        git("config", "user.email", "t@t")
+        if committed:
+            (root / ".factory").mkdir()
+            (root / ".factory" / "decisions.md").write_text(h.DECISIONS_HEADER)
+        (root / "app.py").write_text("x = 1\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "init")
+        if origin:
+            subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(Path(tmp) / "origin.git")], check=True)
+            git("remote", "add", "origin", str(Path(tmp) / "origin.git"))
+            git("push", "-q", "-u", "origin", "main")
+        return root, git
+
+    DECISIONS_CFG = {"repos": {"app": {"path": ".", "base_branch": "main"}}}
+
+    def decide(self, question="Who can delete a resume?"):
+        with contextlib.redirect_stdout(io.StringIO()):
+            h.cmd_factory_decide(mock.Mock(question=question, answer="Only the owner.", by="user", kind="product",
+                                           why=None, source=None), self.DECISIONS_CFG)
+
+    def decisions_env(self, root, **gh):
+        """ROOT at the project, the project's one repo resolved, and GitHub never called for real."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(h, "ROOT", root))
+        stack.enter_context(mock.patch.object(h, "FACTORY_EXCLUDED", set()))
+        stack.enter_context(mock.patch.object(h, "repos", lambda cfg: {"app": {"abs": root, "base_branch": "main", "github": "o/r"}}))
+        for name in ("gh", "gh_json", "branch_protected"):
+            stack.enter_context(mock.patch.object(h, name, gh.get(name) or mock.Mock(side_effect=AssertionError(f"{name} called"))))
+        return stack
+
+    def test_decide_on_another_issues_branch_leaves_that_branch_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git = self.decisions_project(tmp)
+            git("switch", "-q", "-c", "feature/34-glossary")
+            with self.decisions_env(root):
+                self.decide()
+                self.assertEqual(h.flush_decisions(self.DECISIONS_CFG), "skipped")  # not the base branch: nothing moves
+            self.assertEqual(git("status", "--porcelain"), "")  # nothing for #34's PR to pick up
+            self.assertEqual((root / ".factory" / "decisions.md").read_text(), h.DECISIONS_HEADER)
+            self.assertIn("## Who can delete a resume?", (root / ".factory" / "decisions.pending.md").read_text())
+
+    def test_pending_decisions_are_committed_and_pushed_on_a_clean_unprotected_base(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git = self.decisions_project(tmp)
+            with self.decisions_env(root, branch_protected=lambda slug, b: False):
+                self.decide()
+                self.decide("Max upload size?")
+                self.assertEqual(git("status", "--porcelain"), "")  # decide left the base branch clean
+                self.assertEqual(h.flush_decisions(self.DECISIONS_CFG), "committed")
+                self.assertEqual(h.flush_decisions(self.DECISIONS_CFG), "nothing")
+            self.assertEqual(git("status", "--porcelain"), "")
+            self.assertFalse((root / ".factory" / "decisions.pending.md").exists())
+            self.assertEqual(git("log", "-1", "--format=%s").strip(), "Record 2 factory decisions")
+            self.assertEqual(git("rev-parse", "HEAD"), git("rev-parse", "origin/main"))
+            self.assertEqual(git("show", "--stat", "--format=", "HEAD").split("|")[0].strip(), ".factory/decisions.md")
+            text = git("show", "origin/main:.factory/decisions.md")
+            self.assertLess(text.index("Who can delete"), text.index("Max upload size"))
+
+    def test_entries_left_uncommitted_in_the_tracked_file_are_flushed_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git = self.decisions_project(tmp)
+            f = root / ".factory" / "decisions.md"
+            f.write_text(f.read_text() + "\n## Old answer\n- Decision: yes\n")  # what older versions left on main
+            with self.decisions_env(root, branch_protected=lambda slug, b: False):
+                self.assertEqual(h.tracked_dirt(root), "")  # and it never stops the next branch
+                self.assertEqual(h.flush_decisions(self.DECISIONS_CFG), "committed")
+            self.assertEqual(git("status", "--porcelain"), "")
+            self.assertIn("## Old answer", git("show", "origin/main:.factory/decisions.md"))
+            (root / "app.py").write_text("x = 2\n")
+            self.assertIn("app.py", h.tracked_dirt(root))  # other tracked changes still stop it
+
+    def test_a_dirty_tree_or_hand_edits_postpone_the_flush(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git = self.decisions_project(tmp)
+            with self.decisions_env(root):
+                self.decide()
+                (root / "app.py").write_text("x = 2\n")
+                self.assertEqual(h.flush_decisions(self.DECISIONS_CFG), "skipped")
+                git("checkout", "--", "app.py")
+                (root / ".factory" / "decisions.md").write_text("# Rewritten by hand\n")
+                self.assertEqual(h.flush_decisions(self.DECISIONS_CFG), "skipped")
+            self.assertTrue((root / ".factory" / "decisions.pending.md").exists())
+            self.assertEqual(git("rev-list", "--count", "HEAD").strip(), "1")
+
+    def test_a_protected_base_gets_a_pull_request_and_keeps_the_answers_until_it_merges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git = self.decisions_project(tmp)
+            calls = []
+
+            def gh(*args, **kw):
+                calls.append(args[:2])
+                if args[:2] == ("pr", "merge"):
+                    raise RuntimeError("review required")
+                return "https://github.com/o/r/pull/5\n"
+
+            with self.decisions_env(root, gh=gh, branch_protected=lambda slug, b: True,
+                                    gh_json=lambda *a: {"state": "OPEN"}):
+                self.decide()
+                self.assertEqual(h.flush_decisions(self.DECISIONS_CFG, "auto"), "pr-open")
+                self.decide("Max upload size?")
+                self.assertEqual(h.flush_decisions(self.DECISIONS_CFG, "auto"), "pr-open")  # no second pull request
+                self.assertEqual(h.flush_decisions(self.DECISIONS_CFG, "manual"), "pr-open")  # and manual never merges
+                events = [json.loads(x) for x in (root / ".factory" / "log.jsonl").read_text().splitlines()]
+            self.assertEqual(calls, [("pr", "create"), ("pr", "merge"), ("pr", "merge")])
+            self.assertEqual([e["kind"] for e in events if e["kind"].startswith("decisions_")],
+                             ["decisions_pr_opened", "decisions_pr_waiting"])  # told once
+            self.assertEqual((git("branch", "--show-current").strip(), git("status", "--porcelain")), ("main", ""))
+            self.assertEqual(git("rev-parse", "HEAD"), git("rev-parse", "origin/main"))  # main itself untouched
+            branch = json.loads((root / ".factory" / "decisions-pr.json").read_text())["branch"]
+            self.assertIn("Who can delete", git("show", f"origin/{branch}:.factory/decisions.md"))
+            self.assertEqual((root / ".factory" / "decisions.pending.md").read_text().count("\n## "), 2)
+
+    def test_a_merged_decisions_pull_request_clears_what_it_carried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git = self.decisions_project(tmp)
+            def gh(*args, **kw):
+                if args[:2] == ("pr", "merge"):  # what GitHub's squash merge does to origin
+                    branch = json.loads((root / ".factory" / "decisions-pr.json").read_text())["branch"]
+                    git("push", "-q", "origin", f"{branch}:main")
+                return "https://github.com/o/r/pull/5\n"
+
+            with self.decisions_env(root, gh=gh, branch_protected=lambda slug, b: True,
+                                    gh_json=lambda *a: {"state": "OPEN"}):
+                self.decide()
+                self.assertEqual(h.flush_decisions(self.DECISIONS_CFG, "manual"), "pr-open")
+                self.decide("Max upload size?")  # recorded while the pull request was open
+                # auto: the open pull request merges, then the later answer goes out in its own, which merges too
+                self.assertEqual(h.flush_decisions(self.DECISIONS_CFG, "auto"), "committed")
+            text = git("show", "origin/main:.factory/decisions.md")
+            self.assertEqual((text.count("Who can delete"), text.count("Max upload size")), (1, 1))  # nothing twice
+            self.assertEqual(git("rev-parse", "HEAD"), git("rev-parse", "origin/main"))
+            self.assertFalse((root / ".factory" / "decisions.pending.md").exists())
+            self.assertFalse((root / ".factory" / "decisions-pr.json").exists())
+            self.assertEqual(git("status", "--porcelain"), "")
+
+    def test_a_refused_push_falls_back_to_a_pull_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git = self.decisions_project(tmp)
+            hook = Path(tmp) / "origin.git" / "hooks" / "pre-receive"
+            hook.write_text('#!/bin/sh\nwhile read old new ref; do [ "$ref" = refs/heads/main ] && exit 1; done; exit 0\n')
+            hook.chmod(0o755)
+            with self.decisions_env(root, gh=lambda *a, **k: "https://github.com/o/r/pull/6\n",
+                                    branch_protected=lambda slug, b: False):
+                self.decide()
+                self.assertEqual(h.flush_decisions(self.DECISIONS_CFG, "manual"), "pr-open")
+            self.assertEqual((git("rev-list", "--count", "main").strip(), git("status", "--porcelain")), ("1", ""))
+            self.assertTrue((root / ".factory" / "decisions.pending.md").exists())
+
+    def test_unpushed_local_commits_are_never_pushed_along_with_the_decisions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git = self.decisions_project(tmp)
+            (root / "app.py").write_text("x = 2\n")
+            git("commit", "-q", "-am", "the user's own unpushed work")
+            with self.decisions_env(root):
+                self.decide()
+                self.assertEqual(h.flush_decisions(self.DECISIONS_CFG), "skipped")
+            self.assertEqual(git("rev-list", "--count", "origin/main").strip(), "1")
+            self.assertTrue((root / ".factory" / "decisions.pending.md").exists())
+
+    def test_a_commit_that_fails_leaves_the_tree_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git = self.decisions_project(tmp)
+            hook = root / ".git" / "hooks" / "pre-commit"
+            hook.write_text("#!/bin/sh\nexit 1\n")
+            hook.chmod(0o755)
+            for protected in (False, True):
+                with self.decisions_env(root, branch_protected=lambda slug, b: protected):
+                    self.decide()
+                    self.assertEqual(h.flush_decisions(self.DECISIONS_CFG), "skipped")
+                self.assertEqual((git("status", "--porcelain"), git("branch", "--show-current").strip()), ("", "main"))
+                self.assertEqual(git("branch", "--list", "factory/*"), "")
+
+    def test_a_project_that_never_committed_decisions_gets_them_committed_by_the_factory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git = self.decisions_project(tmp, committed=False)
+            with self.decisions_env(root, branch_protected=lambda slug, b: False):
+                f = h.factory_dir() / "decisions.md"
+                f.write_text(h.DECISIONS_HEADER + "\n## Old answer\n- Decision: yes\n")  # written by an older version
+                git("switch", "-q", "-c", "feature/1-x")
+                self.decide()
+                self.assertNotIn("Who can delete", f.read_text())  # nothing new for `git add -A` on this branch
+                git("switch", "-q", "main")
+                self.assertEqual(h.flush_decisions(self.DECISIONS_CFG), "committed")
+            text = git("show", "origin/main:.factory/decisions.md")
+            self.assertEqual((text.count("# Decisions"), text.count("## Old answer"), text.count("## Who can delete")), (1, 1, 1))
+            self.assertEqual(git("status", "--porcelain"), "")
+            self.assertFalse((root / ".factory" / "decisions.pending.md").exists())
+
+    def test_a_failed_first_commit_leaves_no_decisions_file_behind(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git = self.decisions_project(tmp, committed=False)
+            hook = root / ".git" / "hooks" / "pre-commit"
+            hook.write_text("#!/bin/sh\nexit 1\n")
+            hook.chmod(0o755)
+            for protected in (False, True):
+                with self.decisions_env(root, branch_protected=lambda slug, b: protected):
+                    self.decide()
+                    self.assertEqual(h.flush_decisions(self.DECISIONS_CFG), "skipped")
+                self.assertEqual((git("status", "--porcelain"), git("branch", "--show-current").strip()), ("", "main"))
+                self.assertFalse((root / ".factory" / "decisions.md").exists())
+            self.assertEqual((root / ".factory" / "decisions.pending.md").read_text().count("\n## "), 2)
+
+    def test_a_project_that_gitignores_decisions_keeps_them_out_of_git(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git = self.decisions_project(tmp, committed=False)
+            (root / ".gitignore").write_text(".factory/\n")
+            git("add", ".gitignore")
+            git("commit", "-q", "-m", "ignore")
+            with self.decisions_env(root):
+                self.decide()
+                self.assertEqual(h.flush_decisions(self.DECISIONS_CFG), "nothing")
+            self.assertIn("## Who can delete", (root / ".factory" / "decisions.md").read_text())
+            self.assertEqual(git("status", "--porcelain"), "")
+
+    def test_unreadable_protection_postpones_the_flush(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git = self.decisions_project(tmp)
+            with self.decisions_env(root, branch_protected=lambda slug, b: None):
+                self.decide()
+                self.assertEqual(h.flush_decisions(self.DECISIONS_CFG), "skipped")
+            self.assertEqual(git("rev-list", "--count", "HEAD").strip(), "1")
+
+    def test_branch_protection_is_read_from_classic_rules_and_rulesets(self):
+        def api(found, rules):
+            def gh(*args, **kw):
+                if args[1].endswith("/protection"):
+                    if found:
+                        return "{}"
+                    raise RuntimeError("gh api repos/o/r failed: gh: Branch not protected (HTTP 404)")
+                return json.dumps(rules)
+            return gh
+        for found, rules, want in ((True, [], True), (False, [{"type": "pull_request"}], True), (False, [], False)):
+            with mock.patch.object(h, "gh", api(found, rules)):
+                self.assertIs(h.branch_protected("o/r", "main"), want)
+        with mock.patch.object(h, "gh", mock.Mock(side_effect=RuntimeError("gh api failed: timeout"))):
+            self.assertIsNone(h.branch_protected("o/r", "main"))
+
     def test_decide_appends_to_the_decisions_file(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(h, "ROOT", Path(tmp)), \
                 contextlib.redirect_stdout(io.StringIO()):

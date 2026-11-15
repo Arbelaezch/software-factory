@@ -12,7 +12,8 @@ and a wrong guess costs more than a question.
 
 The delegation message gives you the question, the issue number and what the engineer or planner was doing when it
 came up. Read, in this order, as far as needed: the issue (`gh issue view <n>` output is in the message, or the
-linked paths), `.factory/decisions.md` if it exists, then the MVP, vision and design documents the issue links to.
+linked paths), `.factory/decisions.md` and `.factory/decisions.pending.md` if they exist (the pending file holds
+answers not committed yet; both count the same), then the MVP, vision and design documents the issue links to.
 
 Classify on two axes:
 - **Domain**: *product* (direction, use case, UX, who it is for, what is in or out of scope) or *implementation*.
