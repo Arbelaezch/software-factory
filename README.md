@@ -199,9 +199,16 @@ every project and every Claude or GitHub account shares the one bot.
 2. Send your new bot any message.
 3. Run `python3 ~/code/software-factory/scripts/harness.py phone setup --token <token>`, then `phone test` in a project.
 
-Each option arrives as a button. Tap one, or reply to the message ("2, but keep the old endpoint", or a question
-like "why did CI fail?"). A short Sonnet session in that project records the answer and resumes the issue, or answers
-the question. Send `status` in a project's topic for that project, or outside the topics for all of them.
+A message leads with a plain-language summary; each option arrives as a button with a short label, and **Details**
+shows the full message with its file paths and logs. Tap an option, or reply to the message ("2, but keep the old
+endpoint", or a question like "why did CI fail?"). A short Sonnet session in that project records the answer and
+resumes the issue, or answers the question; the message is then edited to show your choice, the time and whether the
+issue runs again. Send `status` in a project's topic for that project, or outside the topics for all of them.
+
+You are asked about the product, and about implementation or process only when it matters: minor questions of those
+two kinds are settled by the factory with its recommended option and arrive as a silent one-line note you can reply
+to and overrule (`[factory] auto_accept`, `[]` to be asked everything). A blocker with nothing to decide (the
+factory's own tooling is in the way) arrives as a report, not a question.
 `harness phone status` shows the bridge and what is waiting; `[factory] phone = false` turns it off for a project.
 See section 7 of [`docs/factory-design.md`](docs/factory-design.md).
 </details>

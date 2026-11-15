@@ -230,3 +230,7 @@ max_runs_per_issue = 3    # most sessions one issue gets per run; it is picked a
 auto_queue_rounds = 3     # with --auto-queue: discovery rounds per run (a round that finds nothing ends auto-queue)
 auto_queue_per_round = 5  # with --auto-queue: most issues one discovery round may file
 phone = true              # send QUESTION / BLOCKER messages to the phone once `harness phone setup` is done (one bot for every project)
+# Which escalated questions the factory settles itself when they are minor: it takes the recommended option, records it
+# as an assumption and tells you in one line that you can overrule. Values: "implementation", "process". Product
+# questions and anything marked significant always come to you. [] = every escalated question comes to you.
+auto_accept = ["implementation", "process"]

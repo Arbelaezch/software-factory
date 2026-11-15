@@ -5350,6 +5350,22 @@ def cmd_factory(a, cfg):
 # Talking to the user (docs/factory-design.md section 7). Every message from the factory has one shape; delivery goes
 # through notify(), with channels behind it. Adding a channel means adding one class and registering it.
 MESSAGE_KINDS = ("QUESTION", "BLOCKER", "DONE")
+SUMMARY_MAX = 280  # characters in the plain-language summary
+LABEL_MAX = 35     # characters in an option's short label: with its number and the star it fits a 40-character button
+# What a summary or a label must not carry (it is read on a phone, by someone who can't open the repo): code
+# formatting, file names and paths, line references, acceptance-criterion numbers. Those belong in the detail.
+ENGINEER_TEXT = re.compile(
+    r"`|\bAC[- ]?\d+\b"
+    r"|\b(?!(?:Node|Next|Vue|Nuxt|Three|Express|D3)\.js\b)"  # product names, not files
+    r"[\w-]+\.(?:md|py|ts|tsx|js|jsx|json|toml|ya?ml|sh|txt|css|html|sql|go|rs|rb|java|kt|swift|log|lock|cfg|ini)\b"
+    r"|(?:^|\s)(?:[.~][\w.-]*)?/[\w.-]+|\b[\w.-]+/[\w.-]+/[\w./-]+")
+
+
+def plain_problem(name: str, text: str) -> str | None:
+    """Why `text` is not plain language (None when it is)."""
+    m = ENGINEER_TEXT.search(text)
+    return (f"{name} must be plain language: no code formatting, file names, paths or AC numbers (found "
+            f"'{m.group(0).strip()}'); put those in the situation or the detail") if m else None
 
 
 def count_sentences(text: str) -> int:
@@ -5357,11 +5373,30 @@ def count_sentences(text: str) -> int:
 
 
 def format_message(kind: str, project: str, issue: str | int, situation: str, need: str = "",
-                   options: list[str] | None = None, recommended: int | None = None, detail: str = "") -> str:
-    """The standard message. `recommended` is the 1-based option to mark. Raises ValueError on a message that
-    breaks the format (so a vague or oversized message fails loudly instead of reaching the user)."""
+                   options: list[str] | None = None, recommended: int | None = None, detail: str = "",
+                   summary: str = "", labels: list[str] | None = None) -> str:
+    """The standard message. `recommended` is the 1-based option to mark. `summary` is the plain-language lead
+    (what the phone shows first) and `labels` the short name of each option (its button). Raises ValueError on a
+    message that breaks the format (so a vague or oversized message fails loudly instead of reaching the user)."""
     kind = kind.upper()
     options = [o.strip() for o in (options or []) if o.strip()]
+    summary = " ".join((summary or "").split())
+    labels = [" ".join(x.split()) for x in (labels or [])]
+    if summary:
+        if count_sentences(summary) > 2 or len(summary) > SUMMARY_MAX:
+            raise ValueError(f"the summary must be 1 or 2 sentences, at most {SUMMARY_MAX} characters")
+        if plain_problem("the summary", summary):
+            raise ValueError(plain_problem("the summary", summary))
+    if labels:
+        if len(labels) != len(options):
+            raise ValueError("give one label per option, in the same order")
+        for x in labels:
+            if not x or len(x) > LABEL_MAX:
+                raise ValueError(f"an option label must be 1 to {LABEL_MAX} characters ('{x}' is {len(x)})")
+            if plain_problem("an option label", x):
+                raise ValueError(plain_problem("an option label", x))
+        if len(set(x.lower() for x in labels)) != len(labels):
+            raise ValueError("option labels must differ from each other")
     if kind not in MESSAGE_KINDS:
         raise ValueError(f"kind must be one of {', '.join(MESSAGE_KINDS)}")
     if not situation.strip() or count_sentences(situation) > 3:
@@ -5380,12 +5415,15 @@ def format_message(kind: str, project: str, issue: str | int, situation: str, ne
     elif recommended is not None:
         raise ValueError("--recommend needs options")
     ref = str(issue).lstrip("#")
-    lines = [f"[{kind}]  {project} #{ref}" if ref else f"[{kind}]  {project}",
-             f"What is going on:   {' '.join(situation.split())}",
-             f"What I need:        {' '.join(need.split()) or 'Nothing, for your information.'}"]
+    lines = [f"[{kind}]  {project} #{ref}" if ref else f"[{kind}]  {project}"]
+    if summary:
+        lines.append(f"In short:           {summary}")
+    lines += [f"What is going on:   {' '.join(situation.split())}",
+              f"What I need:        {' '.join(need.split()) or 'Nothing, for your information.'}"]
     if options:
         lines.append("Options:")
-        lines += [f"  {i}. {o}{'  (recommended)' if i == recommended else ''}" for i, o in enumerate(options, 1)]
+        lines += [f"  {i}. {labels[i - 1] + ': ' if labels else ''}{o}{'  (recommended)' if i == recommended else ''}"
+                  for i, o in enumerate(options, 1)]
     if detail.strip():
         lines.append(f"Detail:             {detail.strip()}")
     return "\n".join(lines)
@@ -5436,7 +5474,8 @@ def notify(text: str, channels: tuple[str, ...] = ("terminal",)) -> None:
 def cmd_notify(a, cfg):
     project = a.project or (cfg.get("project") or {}).get("name") or ROOT.name
     try:
-        text = format_message(a.kind, project, a.issue or "", a.situation, a.need or "", a.option, a.recommend, a.detail or "")
+        text = format_message(a.kind, project, a.issue or "", a.situation, a.need or "", a.option, a.recommend, a.detail or "",
+                              a.summary or "", a.label)
     except ValueError as exc:
         sys.exit(f"notify: {exc}")
     notify(text, tuple(a.channel or ["terminal"]))
@@ -5576,6 +5615,7 @@ def event_line(e: dict) -> str | None:
         "harness_started": lambda: f"started #{n}",
         "harness_finished": lambda: f"#{n} finished: {e.get('outcome')}",
         "message": lambda: f"{e.get('message_kind')} #{n}: {e.get('text', '')}".rstrip(": "),
+        "auto_accepted": lambda: f"#{n} decided for you ({e.get('category')}): {e.get('question', '')} -> {e.get('label', '')}",
         "usage_pause": lambda: "paused for plan usage" + (
             f" until {dt.datetime.fromtimestamp(e['resume_at']).strftime('%H:%M')}" if e.get("resume_at") else ""),
         "usage_resume": lambda: "settings changed, re-checking usage" if e.get("why") else "usage back, resuming" + (
@@ -5704,12 +5744,16 @@ def decisions_repo(cfg: dict) -> tuple[Path, str, str, str] | None:
 
 
 def cmd_factory_decide(a, cfg):
+    print(f"recorded in {record_decision(cfg, a.question, a.answer, a.by, a.kind, a.why or '', a.source or '')}")
+
+
+def record_decision(cfg: dict, question: str, answer: str, by: str, kind: str, why: str = "", source: str = "") -> Path:
     """Record one settled question (the user's answer, or a recorded assumption): in decisions.pending.md inside a
-    git repo, else straight in .factory/decisions.md (see DECISIONS_PENDING)."""
+    git repo, else straight in .factory/decisions.md (see DECISIONS_PENDING). Returns the file written."""
     d = factory_dir()
     one = lambda t: " ".join(t.split())
-    entry = (f"\n## {one(a.question)}\n- Kind: {a.kind}\n- Decision: {one(a.answer)}\n- Decided by: {a.by} on {iso()[:10]}\n"
-             + (f"- Why: {one(a.why)}\n" if a.why else "") + (f"- Source: {one(a.source)}\n" if a.source else ""))
+    entry = (f"\n## {one(question)}\n- Kind: {kind}\n- Decision: {one(answer)}\n- Decided by: {by} on {iso()[:10]}\n"
+             + (f"- Why: {one(why)}\n" if why else "") + (f"- Source: {one(source)}\n" if source else ""))
     if decisions_repo(cfg):
         f = d / DECISIONS_PENDING
         with decisions_lock(), open(f, "a", encoding="utf-8") as out:
@@ -5717,8 +5761,8 @@ def cmd_factory_decide(a, cfg):
     else:
         f = d / "decisions.md"
         f.write_text((f.read_text(encoding="utf-8") if f.exists() else DECISIONS_HEADER) + entry, encoding="utf-8")
-    factory_log({"kind": "decision", "question": one(a.question)[:200], "by": a.by, "decision_kind": a.kind})
-    print(f"recorded in {f}")
+    factory_log({"kind": "decision", "question": one(question)[:200], "by": by, "decision_kind": kind})
+    return f
 
 
 def branch_protected(slug: str, branch: str) -> bool | None:
@@ -6033,7 +6077,7 @@ def cmd_factory_queue(a, cfg):
         print(f"#{n} is in the pool")
 
 
-WATCH_PATTERN = re.compile(r"BLOCKER|QUESTION|finished|paused|resumed|unreadable|stopped|orphaned|needs your")
+WATCH_PATTERN = re.compile(r"BLOCKER|QUESTION|finished|paused|resumed|unreadable|stopped|orphaned|needs your|decided for you")
 
 
 def cmd_factory_watch(a, cfg):
@@ -6102,42 +6146,118 @@ def phone_start(cfg) -> None:
         print(f"[phone] {exc}", file=sys.stderr)
 
 
-def phone_blocker(cfg, project, kind, issue, text, need, options, recommended) -> None:
-    """Send a QUESTION or BLOCKER to the phone with answer buttons. Never fails the caller: the terminal and the
-    issue comment already have the message."""
+def issue_title(slug: str, n) -> str:
+    """The issue's title, or "" when it can't be read (it only names the issue in a message)."""
+    if not slug or n is None:
+        return ""
+    try:
+        return str((gh_json("issue", "view", str(n), "--repo", slug, "--json", "title") or {}).get("title") or "")
+    except (RuntimeError, ValueError):
+        return ""
+
+
+def phone_blocker(cfg, project, kind, issue, text, need, options, recommended, slug="", **extra) -> None:
+    """Send a QUESTION or BLOCKER to the phone with answer buttons. `extra` is what the phone leads with (summary,
+    labels, category, situation; `decided` for a question the factory answered itself); the issue's title is read
+    from `slug`. Never fails the caller: the terminal and the issue comment already have the message."""
     try:
         if kind == "DONE" or not phone_enabled(cfg):
             return
         ph = phone_module()
-        ph.send_blocker(str(ROOT), project, issue, kind, text, need, options, recommended, project_claude_dir(cfg))
+        ph.send_blocker(str(ROOT), project, issue, kind, text, need, options, recommended, project_claude_dir(cfg),
+                        title=issue_title(slug, issue), **extra)
         ph.ensure_bridge()
     except Exception as exc:
         print(f"[phone] {exc}", file=sys.stderr)
         factory_log({"kind": "phone_failed", "issue": issue, "error": str(exc)[:200]})
 
 
-def factory_raise_blocker(cfg, slug, kind, issue, situation, need, options=None, recommended=None, detail=""):
+# Who settles a blocker (docs/factory-design.md section 6). The session that raises it declares both fields.
+#   product         what the product does, looks or feels like, who it is for, what is in scope: always the user's.
+#   implementation  how it is built.
+#   process         how the factory handles this issue (another review round, what counts as evidence, housekeeping).
+#   infrastructure  the factory's own tooling is in the way (dirty tree, refused command, CI, usage): nothing to
+#                   choose, so it is reported with the action it needs and never asked as a question.
+# An implementation or process question is `minor` or `significant`. Significant ones go to the user; minor ones in
+# a category listed in [factory] auto_accept are settled with the recommended option and reported in one line.
+BLOCK_CATEGORIES = ("product", "implementation", "process", "infrastructure")
+AUTO_ACCEPTABLE = ("implementation", "process")
+
+
+def auto_accepts(cfg: dict, category: str, impact: str | None, options: list[str] | None, recommended: int | None) -> bool:
+    allowed = (cfg.get("factory") or {}).get("auto_accept", list(AUTO_ACCEPTABLE))
+    return (category in AUTO_ACCEPTABLE and category in allowed and impact == "minor"
+            and bool(options) and recommended is not None)
+
+
+def factory_raise_blocker(cfg, slug, kind, issue, situation, need, options=None, recommended=None, detail="",
+                          summary="", labels=None, category="infrastructure"):
+    """Tell the user: terminal, phone, issue comment, log. The supervisor's own blockers are infrastructure."""
     project = (cfg.get("project") or {}).get("name") or ROOT.name
-    text = format_message(kind, project, issue if issue is not None else "", situation, need, options, recommended, detail)
+    text = format_message(kind, project, issue if issue is not None else "", situation, need, options, recommended, detail,
+                          summary, labels)
     notify(text)
-    phone_blocker(cfg, project, kind, issue, text, need, options, recommended)
+    phone_blocker(cfg, project, kind, issue, text, need, options, recommended, slug, summary=summary,
+                  labels=labels or [], category=category, situation=" ".join(situation.split()))
     if issue is not None and slug:
         factory_comment(slug, issue, f"```\n{text}\n```")
-    factory_log({"kind": "message", "message_kind": kind, "issue": issue, "text": " ".join(situation.split())[:140]})
+    factory_log({"kind": "message", "message_kind": kind, "issue": issue,
+                 "text": " ".join((summary or situation).split())[:140]})
+
+
+def factory_auto_accept(cfg, slug, a) -> None:
+    """A minor question in a category the project lets the factory settle: take the recommended option, record it as
+    an assumption and tell the user in one line. The issue is not blocked and the session goes on."""
+    project = (cfg.get("project") or {}).get("name") or ROOT.name
+    k = a.recommend
+    label, option = " ".join(a.label[k - 1].split()), " ".join(a.option[k - 1].split())
+    text = format_message("QUESTION", project, a.issue, a.situation, a.need, a.option, k, a.detail or "", a.summary, a.label)
+    record_decision(cfg, a.need, f"{label}: {option}", "assumed", a.category,
+                    f"A minor {a.category} question: the factory took its recommended option ([factory] auto_accept).")
+    note = f"Decided by the factory: option {k} ({label}). To overrule it, tell /factory or reply on the phone."
+    notify(f"{text}\n{note}")
+    phone_blocker(cfg, project, "QUESTION", a.issue, text, a.need, a.option, k, slug, summary=a.summary, labels=a.label,
+                  category=a.category, situation=" ".join(a.situation.split()), decided=True)
+    if slug:
+        try:
+            factory_comment(slug, a.issue, f"```\n{text}\n```\n{note}")
+        except RuntimeError as exc:  # the decision is recorded and the session goes on; the comment is a courtesy
+            print(f"[auto-accept] issue comment failed: {exc}", file=sys.stderr)
+    factory_log({"kind": "auto_accepted", "issue": a.issue, "category": a.category,
+                 "question": " ".join(a.need.split())[:140], "label": label})
+    print(f"AUTO-ACCEPTED: option {k} ({label}): {option}\nIssue #{a.issue} is not blocked. Go on with this answer, as "
+          "for an ASSUMED outcome: give it to whoever asked and list it under `## Assumptions` in the PR draft. It is "
+          "already recorded; don't run `factory decide` for it.")
 
 
 def cmd_factory_block(a, cfg):
-    """Called by a factory session that can't continue: label the issue blocked and tell the user."""
+    """Called by a factory session that can't continue: label the issue blocked and tell the user. A minor
+    implementation or process question the project lets the factory settle is answered instead (factory_auto_accept)."""
     slug = factory_repo(a, cfg)
     try:
-        format_message(a.kind, "x", a.issue, a.situation, a.need or "", a.option, a.recommend, a.detail or "")
+        format_message(a.kind, "x", a.issue, a.situation, a.need or "", a.option, a.recommend, a.detail or "",
+                       a.summary, a.label)
+        if not (a.summary or "").strip():
+            raise ValueError("--summary is required: 1 or 2 plain sentences the user can answer from a phone")
+        if a.option and not a.label:
+            raise ValueError(f"give a --label for each option (at most {LABEL_MAX} characters, readable on its own)")
+        if a.category == "infrastructure" and a.option:
+            raise ValueError("an infrastructure blocker has nothing to choose: put the action in --need and drop the "
+                             "options, or pick the category the decision belongs to")
+        if a.category in AUTO_ACCEPTABLE and a.impact not in ("minor", "significant"):
+            raise ValueError(f"--impact minor|significant is required for {a.category}")
     except ValueError as exc:
         sys.exit(f"block: {exc}")
     problems = blocker_rule_problems(a.situation, a.need or "", *(a.option or []), a.detail or "")
     if problems:
         sys.exit("block: " + "; ".join(problems))
+    if auto_accepts(cfg, a.category, a.impact, a.option, a.recommend):
+        factory_auto_accept(cfg, slug, a)
+        return
     set_issue_state(slug, a.issue, "blocked")
-    factory_raise_blocker(cfg, slug, a.kind, a.issue, a.situation, a.need or "", a.option, a.recommend, a.detail or "")
+    kind = "BLOCKER" if a.category == "infrastructure" else a.kind
+    factory_raise_blocker(cfg, slug, kind, a.issue, a.situation, a.need or "", a.option, a.recommend, a.detail or "",
+                          a.summary, a.label, a.category)
 
 
 def record_pr(n: int, url: str | None) -> None:
@@ -7470,9 +7590,11 @@ def main(argv=None):
     s.add_argument("--kind", required=True, choices=[k.lower() for k in MESSAGE_KINDS] + list(MESSAGE_KINDS))
     s.add_argument("--issue", help="issue number or reference")
     s.add_argument("--project", help="default: [project].name")
+    s.add_argument("--summary", help="plain-language lead, 1-2 sentences: what it means for the product, no file names or code")
     s.add_argument("--situation", required=True, help="what is going on, at most 3 sentences")
     s.add_argument("--need", help="the one decision or action needed (required unless DONE)")
     s.add_argument("--option", action="append", help="repeat 2-3 times, or not at all")
+    s.add_argument("--label", action="append", help=f"short name of an option, at most {LABEL_MAX} characters; one per --option, same order")
     s.add_argument("--recommend", type=int, help="1-based number of the recommended option")
     s.add_argument("--detail", help="link to the raw CI log, agent output or issue comment")
     s.add_argument("--channel", action="append", choices=sorted(CHANNELS), help="default: terminal")
@@ -7544,9 +7666,15 @@ def main(argv=None):
     f = fsub.add_parser("block", help="(used by factory sessions) label an issue blocked and tell the user")
     f.add_argument("issue", type=int)
     f.add_argument("--kind", choices=["BLOCKER", "QUESTION"], default="BLOCKER", type=str.upper)
+    f.add_argument("--category", required=True, choices=BLOCK_CATEGORIES,
+                   help="who settles it: product (always the user), implementation, process, or infrastructure (nothing to choose)")
+    f.add_argument("--impact", choices=["minor", "significant"],
+                   help="for implementation and process: significant goes to the user, minor may be settled per [factory] auto_accept")
+    f.add_argument("--summary", required=True, help="plain-language lead, 1-2 sentences: what it means for the product, no file names or code")
     f.add_argument("--situation", required=True)
     f.add_argument("--need", required=True)
     f.add_argument("--option", action="append")
+    f.add_argument("--label", action="append", help=f"short name of an option, at most {LABEL_MAX} characters; one per --option, same order")
     f.add_argument("--recommend", type=int)
     f.add_argument("--detail")
     f.add_argument("--repo")
@@ -7561,7 +7689,7 @@ def main(argv=None):
     f.add_argument("--question", required=True)
     f.add_argument("--answer", required=True)
     f.add_argument("--by", choices=["user", "assumed"], required=True)
-    f.add_argument("--kind", choices=["product", "implementation"], required=True)
+    f.add_argument("--kind", choices=["product", "implementation", "process"], required=True)
     f.add_argument("--why", help="the reasoning, especially for an assumption")
     f.add_argument("--source", help="doc line it comes from, if any")
     f.set_defaults(fn=cmd_factory_decide)

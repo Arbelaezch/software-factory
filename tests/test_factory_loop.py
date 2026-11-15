@@ -723,7 +723,8 @@ class HarnessWiringTests(unittest.TestCase):
 
     def test_block_requires_a_valid_message_and_labels_the_issue(self):
         a = mock.Mock(issue=7, kind="BLOCKER", situation="Gates keep failing.", need="Decide whether to skip.",
-                      option=None, recommend=None, detail="/x/log", repo=None)
+                      option=None, recommend=None, detail="/x/log", repo=None, summary="The checks keep failing.",
+                      label=None, category="infrastructure", impact=None)
         states, comments = [], []
         with mock.patch.object(h, "factory_repo", lambda a, c: "o/r"), \
                 mock.patch.object(h, "set_issue_state", lambda s, n, st: states.append((n, st))), \
@@ -736,11 +737,89 @@ class HarnessWiringTests(unittest.TestCase):
         with mock.patch.object(h, "factory_repo", lambda a, c: "o/r"), self.assertRaises(SystemExit):
             h.cmd_factory_block(a, {})
 
+    def question(self, **kw):
+        return mock.Mock(**{**dict(issue=64, kind="QUESTION", situation="Reviewer and verifier disagree on one finding.",
+                                   need="Fix the naming finding now, or ship without it?",
+                                   option=["Open the PR as it is", "Run one more review round"], recommend=1,
+                                   label=["Ship it", "One more round"], detail="/x/run", repo=None, category="process",
+                                   impact="minor", summary="The reviewers disagree on one small naming point."), **kw})
+
+    def run_block(self, a, cfg):
+        """cmd_factory_block with GitHub, the log and the phone replaced. Returns what it did and printed."""
+        did = {"states": [], "comments": [], "log": [], "decisions": [], "phone": []}
+        out = io.StringIO()
+        with mock.patch.object(h, "factory_repo", lambda a, c: "o/r"), \
+                mock.patch.object(h, "set_issue_state", lambda s, n, st: did["states"].append((n, st))), \
+                mock.patch.object(h, "factory_comment", lambda s, n, t: did["comments"].append(t)), \
+                mock.patch.object(h, "factory_log", did["log"].append), \
+                mock.patch.object(h, "record_decision", lambda cfg, *args: did["decisions"].append(args)), \
+                mock.patch.object(h, "phone_blocker", lambda *args, **kw: did["phone"].append((args, kw))), \
+                contextlib.redirect_stdout(out):
+            h.cmd_factory_block(a, cfg)
+        return did, out.getvalue()
+
+    def test_a_minor_process_question_is_decided_and_the_issue_goes_on(self):
+        # court-vision #64: a review-round decision most owners would delegate.
+        did, out = self.run_block(self.question(), {"project": {"name": "App"}})
+        self.assertEqual(did["states"], [])  # not blocked
+        self.assertEqual(did["decisions"][0][:4], ("Fix the naming finding now, or ship without it?",
+                                                   "Ship it: Open the PR as it is", "assumed", "process"))
+        self.assertEqual([e["kind"] for e in did["log"]], ["auto_accepted"])
+        self.assertEqual(h.event_line(did["log"][0]),
+                         "#64 decided for you (process): Fix the naming finding now, or ship without it? -> Ship it")
+        self.assertTrue(h.WATCH_PATTERN.search(h.event_line(did["log"][0])))
+        self.assertIn("Decided by the factory: option 1 (Ship it)", did["comments"][0])
+        self.assertTrue(did["phone"][0][1]["decided"])
+        self.assertIn("AUTO-ACCEPTED: option 1 (Ship it): Open the PR as it is", out)
+        self.assertIn("not blocked", out)
+
+    def test_a_failed_comment_does_not_undo_an_automatic_decision(self):
+        err = io.StringIO()
+        with mock.patch.object(h, "factory_comment", side_effect=RuntimeError("gh issue comment failed")) as comment, \
+                mock.patch.object(h, "factory_repo", lambda a, c: "o/r"), mock.patch.object(h, "factory_log"), \
+                mock.patch.object(h, "record_decision"), mock.patch.object(h, "phone_blocker"), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(err):
+            h.cmd_factory_block(self.question(), {})
+        comment.assert_called_once()
+        self.assertIn("AUTO-ACCEPTED", out.getvalue())
+        self.assertIn("issue comment failed", err.getvalue())
+
+    def test_what_is_never_decided_for_the_user(self):
+        on = {"factory": {"auto_accept": ["product", "implementation", "process", "infrastructure"]}}
+        for a, cfg in ((self.question(impact="significant"), on), (self.question(category="product", impact=None), on),
+                       (self.question(category="product", impact="minor"), on),
+                       (self.question(category="implementation"), {"factory": {"auto_accept": ["process"]}}),
+                       (self.question(), {"factory": {"auto_accept": []}}),
+                       (self.question(option=None, label=None, recommend=None), on)):
+            did, out = self.run_block(a, cfg)
+            self.assertEqual((did["states"], did["decisions"]), ([(64, "blocked")], []), a)
+            self.assertNotIn("AUTO-ACCEPTED", out)
+            self.assertFalse(did["phone"][0][1].get("decided"))
+        self.assertTrue(h.auto_accepts({}, "implementation", "minor", ["a", "b"], 1))  # the built-in default
+
+    def test_block_needs_the_fields_that_say_who_decides(self):
+        for kw, why in (({"summary": " "}, "--summary is required"), ({"label": None}, "--label for each option"),
+                        ({"impact": None}, "--impact minor|significant is required for process"),
+                        ({"category": "infrastructure"}, "nothing to choose"),
+                        ({"summary": "See DESIGN_DOC.md:297."}, "plain language"),
+                        ({"label": ["Ship it", "x" * 36]}, "1 to 35 characters")):
+            with self.assertRaises(SystemExit, msg=kw) as cm:
+                self.run_block(self.question(**kw), {})
+            self.assertIn(why, str(cm.exception))
+
+    def test_an_infrastructure_blocker_is_never_a_question(self):
+        a = self.question(category="infrastructure", option=None, label=None, recommend=None, impact=None)
+        did, _ = self.run_block(a, {"project": {"name": "App"}})
+        (args, kw), = did["phone"]
+        self.assertEqual((args[2], kw["category"]), ("BLOCKER", "infrastructure"))
+        self.assertIn("[BLOCKER]  App #64", did["comments"][0])
+
     def test_block_refuses_a_rule_the_factory_would_reject(self):
         # court-vision #62: the blocker suggested `Bash(npx prettier *)` in .claude/settings.json.
         a = mock.Mock(issue=62, kind="BLOCKER", situation="`npx prettier --check .` was refused.",
                       need="Add Bash(npx prettier *) to .claude/settings.json.", option=None, recommend=None,
-                      detail="", repo=None)
+                      detail="", repo=None, summary="A formatting check could not run.", label=None,
+                      category="infrastructure", impact=None)
         states = []
         with mock.patch.object(h, "factory_repo", lambda a, c: "o/r"), \
                 mock.patch.object(h, "set_issue_state", lambda s, n, st: states.append(st)), \
