@@ -59,11 +59,12 @@ def auto_queue_candidates(issues: list[dict], created: set[int] | frozenset[int]
 
 
 def make_refill(fetch_issues: Callable[[], list[dict]], created: Callable[[], set[int]],
-                promote: Callable[[int], None], discover: Callable[[], list[int]],
+                promote: Callable[[int], None], discover: Callable[[], list[int] | None],
                 log: Callable[[dict], None], max_rounds: int = 3) -> Callable[[], bool]:
     """The auto-queue step the loop calls when the pool is empty. Returns True when it made work runnable.
     Order: planned issues, then cleanup backlog, then one discovery round (at most `max_rounds` per run; a round
-    that finds nothing ends auto-queue for the run, since the documents have nothing left to build)."""
+    that finds nothing ends auto-queue for the run, since the documents have nothing left to build). `discover`
+    returns None when its round failed (an invalid draft): that also ends auto-queue, but is logged as a failure."""
     state = {"rounds": 0, "done": False}
 
     def refill() -> bool:
@@ -83,7 +84,8 @@ def make_refill(fetch_issues: Callable[[], list[dict]], created: Callable[[], se
         made = discover()
         if not made:
             state["done"] = True
-            log({"kind": "auto_queue_exhausted", "why": "discovery found nothing left to build"})
+            log({"kind": "auto_queue_exhausted", "why": "discovery found nothing left to build" if made is not None
+                 else "discovery failed (invalid issue list), so there may be work left"})
             return False
         log({"kind": "auto_queued", "source": "discovered", "issues": made, "round": state["rounds"]})
         return True
@@ -280,11 +282,15 @@ def run_loop(*, gate: Callable[[], str], fetch_issues: Callable[[], list[dict]],
              after_issue: Callable[[int], None] | None = None,
              park: Callable[[int], None] | None = None,
              refill: Callable[[], bool] | None = None,
-             usage_hit: Callable[[], bool] | None = None) -> dict:
-    """Work the pool one issue at a time until it is empty (or, with `refill`, until it cannot be refilled). Returns {"results": [...], "stopped": reason|None}.
+             usage_hit: Callable[[], bool] | None = None, max_runs: int = 3) -> dict:
+    """Work the pool one issue at a time until it is empty (or, with `refill`, until it cannot be refilled). Returns
+    {"results": [...], "stopped": reason|None, "skipped": [...]}.
+    An issue that is `todo` again after its session (answered and re-queued, from the phone or by hand) is picked
+    again, at most `max_runs` times per run; `skipped` lists the runnable issues left behind by that cap. While any
+    are left the queue is not refilled: discovery would build on work that is not finished.
     `usage_hit` says whether plan usage is over the cap right now: a session that ended without an outcome then
     most likely ran into the limit, so the issue goes back to `todo` (once per run) instead of blocking."""
-    results, attempted, requeued, stopped = [], set(), set(), None
+    results, runs, requeued, stopped, skipped = [], {}, set(), None, []
     for i in fetch_issues():  # a crashed earlier run leaves issues in-progress; never guess, hand them back
         if "in-progress" in label_names(i) and str(i.get("state", "")).upper() == "OPEN":
             set_state(i["number"], "blocked")
@@ -301,17 +307,21 @@ def run_loop(*, gate: Callable[[], str], fetch_issues: Callable[[], list[dict]],
                           "Check the statusline capture or run `usage.py --probe`, then start the factory again.")
             stopped = "usage unknown"
             break
-        pool = [p for p in compute_pool(fetch_issues()) if p["number"] not in attempted]
-        if not pool and refill:
+        runnable = compute_pool(fetch_issues())
+        pool = [p for p in runnable if runs.get(p["number"], 0) < max_runs]
+        if not runnable and refill:
             try:
                 if refill():
-                    pool = [p for p in compute_pool(fetch_issues()) if p["number"] not in attempted]
+                    pool = [p for p in compute_pool(fetch_issues()) if runs.get(p["number"], 0) < max_runs]
             except Exception as e:  # auto-queue is a bonus; a failure ends the run cleanly instead of crashing it
                 log({"kind": "auto_queue_failed", "error": str(e)[:200]})
         if not pool:
+            skipped = [p["number"] for p in runnable]
+            if skipped:
+                log({"kind": "issues_skipped", "issues": skipped, "max_runs": max_runs})
             break
         n, reason = select(pool)
-        attempted.add(n)
+        runs[n] = runs.get(n, 0) + 1
         log({"kind": "issue_picked", "issue": n, "reason": reason, "pool": [p["number"] for p in pool]})
         set_state(n, "in-progress")
         log({"kind": "harness_started", "issue": n})
@@ -319,7 +329,7 @@ def run_loop(*, gate: Callable[[], str], fetch_issues: Callable[[], list[dict]],
         labels = fetch_labels(n)
         if "in-progress" in labels and n not in requeued and usage_hit and _safe(usage_hit):
             requeued.add(n)
-            attempted.discard(n)  # the gate pauses until the window resets, then the issue may run again
+            runs[n] -= 1  # the gate pauses until the window resets, then the issue may run again
             set_state(n, "todo")
             log({"kind": "usage_requeued", "issue": n, "exit": code})
             outcome = "requeued"
@@ -346,4 +356,4 @@ def run_loop(*, gate: Callable[[], str], fetch_issues: Callable[[], list[dict]],
             except Exception as e:
                 log({"kind": "park_failed", "issue": n, "error": str(e)[:200]})
         results.append({"issue": n, "outcome": outcome})
-    return {"results": results, "stopped": stopped}
+    return {"results": results, "stopped": stopped, "skipped": skipped}

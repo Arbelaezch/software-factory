@@ -5476,6 +5476,14 @@ def validate_issue_plan(plan) -> list[str]:
             v = it.get(field, [])
             if not isinstance(v, list) or not all(isinstance(x, str) and x.strip() for x in v):
                 errors.append(f"{who}: {field} must be a list of strings")
+        for field in ISSUE_REF_FIELDS:
+            v = it.get(field, [])
+            if not isinstance(v, list) or not all(type(x) is int and x > 0 for x in v):
+                errors.append(f"{who}: {field} must be a list of issue numbers")
+                it = {**it, field: []}
+        both = sorted(set(it.get("depends_on_issues", [])) & set(it.get("related_issues", [])))
+        if both:
+            errors.append(f"{who}: {', '.join(f'#{x}' for x in both)} is in both depends_on_issues and related_issues")
     titles = [i["title"].strip().lower() for i in keys.values() if isinstance(i.get("title"), str)]
     if len(titles) != len(set(titles)):
         errors.append("two issues share a title")
@@ -5504,11 +5512,49 @@ def issue_order(plan: dict) -> list[str]:
     return order
 
 
+# How a draft points at issues that already exist: `depends_on_issues` (it waits until they are closed; becomes
+# "Depends on #N" lines) and `related_issues` (context only; becomes "Related to #N" lines). Prose decides nothing.
+ISSUE_REF_FIELDS = ("depends_on_issues", "related_issues")
+ISSUE_REF_RE = re.compile(r"(?<![\w/&])#(\d+)\b")
+
+
+def issue_mentions(it: dict) -> set[int]:
+    """The issue numbers a draft names as `#N` in its body or acceptance criteria."""
+    return {int(n) for n in ISSUE_REF_RE.findall("\n".join([it["body"], *it["acceptance"]]))}
+
+
+def reference_problems(who: str, it: dict, mentions: set[int], issues: list[dict]) -> list[str]:
+    """Problems with how one draft points at existing issues: a listed number must be a real issue (a dependency
+    on nothing never closes), and every open issue the text names (`mentions`) must be listed in one of the two
+    fields, so whether the new issue waits for it is stated, never guessed."""
+    known = {i["number"] for i in issues}
+    is_open = {i["number"] for i in issues if str(i.get("state", "")).upper() == "OPEN"}
+    listed = {n for f in ISSUE_REF_FIELDS for n in it.get(f) or []}
+    return ([f"{who}: {f} names #{n}, which is not an issue in this repo"
+             for f in ISSUE_REF_FIELDS for n in it.get(f) or [] if n not in known]
+            + [f"{who}: the text names open issue #{n}; add {n} to depends_on_issues (this issue cannot be built "
+               f"until #{n} is merged) or to related_issues (context only)" for n in sorted((mentions & is_open) - listed)])
+
+
+def issue_reference_problems(plan: dict, issues: list[dict]) -> list[str]:
+    """reference_problems for every issue of a validated draft list."""
+    return [e for it in plan["issues"] for e in reference_problems(f"issue {it['key']!r}", it, issue_mentions(it), issues)]
+
+
+def reference_lines(it: dict) -> list[str]:
+    """The `Depends on #N` and `Related to #N` blocks for a draft's existing-issue fields."""
+    return ["\n".join(f"{words} #{n}" for n in sorted(set(it.get(f) or [])))
+            for f, words in zip(ISSUE_REF_FIELDS, ("Depends on", "Related to")) if it.get(f)]
+
+
 def render_issue_body(it: dict, numbers: dict[str, int]) -> str:
     parts = [it["body"].strip(), "## Acceptance criteria\n" + "\n".join(f"- [ ] {x.strip()}" for x in it["acceptance"])]
-    deps = [f"Depends on #{numbers[d]}" for d in it.get("depends_on") or []]
+    deps = [f"Depends on #{n}" for n in sorted({*(numbers[d] for d in it.get("depends_on") or []),
+                                                *(it.get("depends_on_issues") or [])})]
     if deps:
         parts.append("\n".join(deps))
+    if it.get("related_issues"):
+        parts.append("\n".join(f"Related to #{n}" for n in sorted(set(it["related_issues"]))))
     return "\n\n".join(parts) + "\n"
 
 
@@ -5539,8 +5585,11 @@ def event_line(e: dict) -> str | None:
         "auto_queue_exhausted": lambda: f"auto-queue done: {e.get('why')}",
         "auto_queue_failed": lambda: f"auto-queue failed: {e.get('error')}",
         "discover_skipped": lambda: f"auto-queue could not discover work: {e.get('why')}",
-        "discover_failed": lambda: "auto-queue discovery gave an invalid issue list; nothing was filed",
+        "discover_failed": lambda: "auto-queue discovery gave an invalid issue list; " + (
+            "asking once more" if e.get("retrying") else "nothing was filed"),
         "supervisor_started": lambda: "supervisor started",
+        "issues_skipped": lambda: "not picked again (already run {} times this run): ".format(e.get("max_runs")) + ", ".join(
+            f"#{x}" for x in e.get("issues") or []),
         "supervisor_stopped": lambda: f"supervisor stopped ({e.get('why')})",
     }.get(k, lambda: None)()
 
@@ -5619,6 +5668,11 @@ def cmd_factory_decide(a, cfg):
 
 def cmd_factory_issues_create(a, cfg):
     plan = load_issue_plan(a.file)  # exits with every problem before anything is created
+    if any(issue_mentions(it) or any(it.get(f) for f in ISSUE_REF_FIELDS) for it in plan["issues"]):
+        errors = issue_reference_problems(plan, gh_json("issue", "list", "--repo", factory_repo(a, cfg), "--state", "all",
+                                                        "--limit", "500", "--json", "number,state") or [])
+        if errors:
+            sys.exit("issue list problems:\n" + "\n".join(f"  - {e}" for e in errors))
     order = issue_order(plan)
     by = {i["key"]: i for i in plan["issues"]}
     if a.dry_run:
@@ -6161,6 +6215,10 @@ DISCOVER_ALLOWED = ["--allowedTools", "Bash(gh issue list *)", "Bash(gh issue vi
 DISCOVER_PROMPT = """The factory's queue is empty and auto-queue is on. Follow your agent instructions: compare the project \
 documents ({docs}) with what exists, and write at most {limit} new issues to {out} (`{{"issues": []}}` when the documents \
 have nothing left to build)."""
+DISCOVER_RETRY = """
+
+Your previous draft at that path was rejected. Fix exactly these problems, keep the rest, and write the file again:
+{errors}"""
 
 
 def docs_file() -> Path:
@@ -6198,6 +6256,10 @@ CLEANUP_AGENT = "harness:harness-cleanup"
 CLEANUP_ALLOWED = ["--allowedTools", "Bash(gh issue list *)", "Bash(gh issue view *)", "Bash(git log *)", "Bash(git diff *)"]
 CLEANUP_PROMPT = """Issue #{issue} is finished. Its out-of-scope concerns are in {run_dir}/concerns.jsonl. Follow your agent \
 instructions and write the survivors to {out} (a JSON list, `[]` when none survive)."""
+CLEANUP_RETRY = """
+
+Your previous list at that path was rejected. Fix exactly these problems, keep the rest, and write the file again:
+{errors}"""
 
 
 def resume_parked_branch(cfg: dict, n: int) -> list[str]:
@@ -6219,6 +6281,23 @@ def resume_parked_branch(cfg: dict, n: int) -> list[str]:
     return done
 
 
+def backlog_item_problems(item, n: int, issues: list[dict]) -> list[str]:
+    """Problems with how one cleanup draft points at existing issues (same two fields and rule as issue plans).
+    The issue it was raised on (#n) needs no listing: the supervisor links it."""
+    if not isinstance(item, dict):
+        return []  # file_backlog drops non-objects
+    who = f"item {' '.join(str(item.get('title', '')).split())[:60]!r}"
+    errors = [f"{who}: {f} must be a list of issue numbers" for f in ISSUE_REF_FIELDS
+              if not isinstance(item.get(f, []), list) or not all(type(x) is int and x > 0 for x in item.get(f, []))]
+    if errors:
+        return errors
+    both = sorted(set(item.get("depends_on_issues", [])) & set(item.get("related_issues", [])))
+    if both:
+        return [f"{who}: {', '.join(f'#{x}' for x in both)} is in both depends_on_issues and related_issues"]
+    mentions = {int(x) for x in ISSUE_REF_RE.findall(str(item.get("body", "")))} - {n}
+    return reference_problems(who, item, mentions, issues)
+
+
 def file_backlog(slug: str, n: int, items: list, pr_url: str | None) -> int:
     """Create a `backlog` issue for each {title, body} item, skipping titles that already exist. Returns how many."""
     items = [i for i in items if isinstance(i, dict) and str(i.get("title", "")).strip()][:10]
@@ -6232,7 +6311,8 @@ def file_backlog(slug: str, n: int, items: list, pr_url: str | None) -> int:
         title = " ".join(str(i["title"]).split())[:120]
         if title.lower() in existing:
             continue
-        body = (str(i.get("body", "")).strip() + f"\n\n---\nRaised while working on #{n}" + (f" ({pr_url})" if pr_url else "")
+        body = ("\n\n".join([str(i.get("body", "")).strip(), *reference_lines(i)])
+                + f"\n\n---\nRaised while working on #{n}" + (f" ({pr_url})" if pr_url else "")
                 + ". Labelled `backlog`: the factory will not work on it until you relabel it `todo`.")
         gh("issue", "create", "--repo", slug, "--title", title, "--body", body, "--label", "backlog")
         existing.add(title.lower())
@@ -6275,7 +6355,8 @@ def cmd_factory_run(a, cfg):
         for n in a.issues or []:
             queue_issue(slug, n)
         summary = run_factory_loop(a, cfg, fl, usage, fc, slug, fetch)
-        why = summary["stopped"] or "pool empty"
+        why = summary["stopped"] or "pool empty" + (
+            "; skipped this run: " + ", ".join(f"#{n}" for n in summary["skipped"]) if summary.get("skipped") else "")
     finally:
         release_supervisor()
         factory_log({"kind": "supervisor_stopped", "why": why})
@@ -6526,12 +6607,28 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
         out_file = d / "backlog.json"
         out_file.unlink(missing_ok=True)
         prompt = CLEANUP_PROMPT.format(run_dir=d, issue=n, out=out_file)
-        with open(sessions / f"cleanup-{n}-{int(time.time())}.log", "w", encoding="utf-8") as out:
-            command, sid = metered_command("-p", prompt, "--agent", CLEANUP_AGENT, *claude_args, *CLEANUP_ALLOWED)
-            run_factory(str(ROOT), "manager", {}, command, out)
-        log_session_usage(CLEANUP_AGENT.split(":")[-1], sid, cfg, n)
+        for attempt in (1, 2):  # a list with unlisted issue references goes back once; then the bad items are dropped
+            with open(sessions / f"cleanup-{n}-{int(time.time() * 1000)}.log", "w", encoding="utf-8") as out:
+                command, sid = metered_command("-p", prompt, "--agent", CLEANUP_AGENT, *claude_args, *CLEANUP_ALLOWED)
+                run_factory(str(ROOT), "manager", {}, command, out)
+            log_session_usage(CLEANUP_AGENT.split(":")[-1], sid, cfg, n)
+            items = read_json(out_file, []) or []
+            items = items if isinstance(items, list) else []
+            try:
+                issues = fetch() if items else []
+            except RuntimeError as e:
+                factory_log({"kind": "cleanup_failed", "issue": n, "error": str(e)[:200]})
+                return
+            problems = [backlog_item_problems(i, n, issues) for i in items]
+            errors = [e for p in problems for e in p]
+            if not errors:
+                break
+            factory_log({"kind": "cleanup_rejected", "issue": n, "errors": errors[:5], "retrying": attempt == 1})
+            if attempt == 2:
+                items = [i for i, p in zip(items, problems) if not p]
+            prompt += CLEANUP_RETRY.format(errors="\n".join(f"- {e}" for e in errors[:10]))
         try:
-            filed = file_backlog(slug, n, read_json(out_file, []) or [], (read_json(ROOT / ".factory" / "prs.json", {}) or {}).get(str(n)))
+            filed = file_backlog(slug, n, items, (read_json(ROOT / ".factory" / "prs.json", {}) or {}).get(str(n)))
         except (RuntimeError, OSError) as e:
             factory_log({"kind": "cleanup_failed", "issue": n, "error": str(e)[:200]})
             return
@@ -6539,7 +6636,8 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
 
     def discover():
         """One auto-queue discovery round: a read-only session compares the project documents with what exists and
-        drafts the missing issues; the supervisor validates, trims and files them as `todo`. Returns the new numbers."""
+        drafts the missing issues; the supervisor validates, trims and files them as `todo`. Returns the new numbers,
+        or None when the draft was still invalid after one retry."""
         docs = read_json(docs_file(), {}) or {}
         paths = [docs[k] for k in ("mvp", "vision") if docs.get(k)]
         if not paths:
@@ -6549,17 +6647,21 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
         out_file = ROOT / ".factory" / "discovered.json"
         out_file.unlink(missing_ok=True)
         prompt = DISCOVER_PROMPT.format(docs=", ".join(paths), limit=limit, out=out_file)
-        with open(sessions / f"discover-{int(time.time() * 1000)}.log", "w", encoding="utf-8") as out:
-            command, sid = metered_command("-p", prompt, "--agent", DISCOVER_AGENT, *claude_args, *DISCOVER_ALLOWED)
-            run_factory(str(ROOT), "manager", {}, command, out)
-        log_session_usage(DISCOVER_AGENT.split(":")[-1], sid, cfg)
-        plan = read_json(out_file, None)
-        if not isinstance(plan, dict) or not plan.get("issues"):
-            return []
-        errors = validate_issue_plan(plan)
-        if errors:
-            factory_log({"kind": "discover_failed", "errors": errors[:5]})
-            return []
+        for attempt in (1, 2):  # an invalid draft goes back to the discoverer once, with the problems
+            with open(sessions / f"discover-{int(time.time() * 1000)}.log", "w", encoding="utf-8") as out:
+                command, sid = metered_command("-p", prompt, "--agent", DISCOVER_AGENT, *claude_args, *DISCOVER_ALLOWED)
+                run_factory(str(ROOT), "manager", {}, command, out)
+            log_session_usage(DISCOVER_AGENT.split(":")[-1], sid, cfg)
+            plan = read_json(out_file, None)
+            if not isinstance(plan, dict) or not plan.get("issues"):
+                return []
+            errors = validate_issue_plan(plan) or issue_reference_problems(plan, fetch())
+            if not errors:
+                break
+            factory_log({"kind": "discover_failed", "errors": errors[:5], "retrying": attempt == 1})
+            if attempt == 2:
+                return None
+            prompt += DISCOVER_RETRY.format(errors="\n".join(f"- {e}" for e in errors[:10]))
         plan = trim_plan(plan, limit)
         made = create_plan_issues(slug, plan, issue_order(plan), extra_labels=("todo",))
         factory_log({"kind": "discovered", "issues": made, "notes": [str(x)[:200] for x in (plan.get("notes") or [])[:5]]})
@@ -6591,7 +6693,7 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
         set_state=lambda n, st: set_issue_state(slug, n, st), run_issue=run_issue,
         fetch_labels=lambda n: issue_labels(slug, n),
         raise_blocker=lambda text, issue, need: factory_raise_blocker(cfg, slug, "BLOCKER", issue, text, need),
-        log=factory_log, max_issues=a.max_issues, should_stop=lambda: (ROOT / ".factory" / "stop").exists())
+        log=factory_log, max_issues=a.max_issues, max_runs=int(fc.get("max_runs_per_issue", 3)), should_stop=lambda: (ROOT / ".factory" / "stop").exists())
     for r in summary["results"]:
         print(f"#{r['issue']}: {r['outcome']}")
     print(f"{len(summary['results'])} issue(s) run" + (f"; stopped: {summary['stopped']}" if summary["stopped"] else ""))

@@ -36,8 +36,14 @@ missing. Draft issues only for what is **missing**:
   in an issue body, and don't file the issue that depends on it.
 - Same shape rules as the planner: one concern each and one /ship run each, 2 to 5 observable acceptance criteria,
   vertical slices over layers, commands named as the repo's scripts (`npm run format:check`, not
-  `npx prettier --check .`), dependencies only between issues in this draft (by key), labels `enhancement` or
+  `npx prettier --check .`), `depends_on` only between issues in this draft (by key), labels `enhancement` or
   `bug`. Never add `todo` or `backlog`: the supervisor labels what you draft.
+- **Existing issues go in one of two fields, by number.** `depends_on_issues`: this issue cannot be built or tested
+  until that one is merged (it becomes a `Depends on #N` line and the factory won't start the issue before then).
+  `related_issues`: context only (it becomes a `Related to #N` line; nothing waits). Prose decides nothing:
+  "builds on #36" in the body does not make the issue wait. Every open issue you name as `#N` in a body or
+  criterion must be in exactly one of the two fields, or the draft is rejected and you are asked to fix it. When
+  unsure whether it is a dependency, depend.
 - At most the number of issues the prompt allows, the most valuable first. If more are missing, file the first ones
   now; the next round will find the rest.
 
@@ -53,6 +59,8 @@ Write the output path as JSON, the same format `/factory-plan` uses:
       "body": "Why this exists, the document sentence it comes from, what is in scope and what is not, 2 to 6 sentences.",
       "acceptance": ["Observable criterion"],
       "depends_on": [],
+      "depends_on_issues": [],
+      "related_issues": [],
       "labels": ["enhancement"]
     }
   ]

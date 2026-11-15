@@ -265,6 +265,26 @@ class CleanupTests(unittest.TestCase):
         self.assertIn("backlog", args)
         self.assertIn("Raised while working on #17 (https://x/pull/9)", args[args.index("--body") + 1])
 
+    def test_backlog_items_list_the_open_issues_they_name(self):
+        existing = [issue(12, state="CLOSED"), issue(17), issue(33), issue(36)]
+        item = {"title": "Add backoff", "body": "Needs #36; see #33, #12 and this run's #17.", "depends_on_issues": [36]}
+        errors = h.backlog_item_problems(item, 17, existing)
+        self.assertEqual(len(errors), 1)  # closed #12 and the issue the run worked on need no listing
+        self.assertIn("open issue #33", errors[0])
+        ok = {**item, "related_issues": [33]}
+        self.assertEqual(h.backlog_item_problems(ok, 17, existing), [])
+        self.assertEqual(h.backlog_item_problems({"title": "Plain", "body": "No references."}, 17, existing), [])
+        self.assertIn("both", h.backlog_item_problems({**ok, "related_issues": [36]}, 17, existing)[0])
+        self.assertIn("list of issue numbers", h.backlog_item_problems({**ok, "related_issues": "33"}, 17, existing)[0])
+        self.assertIn("not an issue", h.backlog_item_problems({**ok, "depends_on_issues": [36, 99]}, 17, existing)[0])
+        made = []
+        with mock.patch.object(h, "ensure_labels"), mock.patch.object(h, "gh_json", lambda *a: []), \
+                mock.patch.object(h, "gh", lambda *a, **k: made.append(a) or ""):
+            h.file_backlog("o/r", 17, [ok], None)
+        body = made[0][made[0].index("--body") + 1]
+        self.assertIn("\n\nDepends on #36\n\nRelated to #33\n\n---\nRaised while working on #17", body)
+        self.assertEqual(fl.parse_depends(body), [36])
+
     def test_nothing_is_filed_without_survivors(self):
         with mock.patch.object(h, "gh", side_effect=AssertionError("must not call gh")):
             self.assertEqual(h.file_backlog("o/r", 1, [], None), 0)
@@ -333,9 +353,39 @@ class LoopTests(unittest.TestCase):
         self.assertIn("blocked", labels[1])
         self.assertEqual(len(calls["blockers"]), 1)
 
-    def test_an_issue_is_not_retried_in_the_same_run(self):
+    def test_an_issue_left_todo_is_retried_up_to_the_cap_then_reported_as_skipped(self):
         result, calls, labels = self.make([issue(1)], {1: "todo"})
+        self.assertEqual((calls["ran"], result["skipped"]), ([1, 1, 1], [1]))
+        self.assertEqual([e["issues"] for e in calls["log"] if e["kind"] == "issues_skipped"], [[1]])
+        result, calls, labels = self.make([issue(1)], {1: "todo"}, max_runs=1)
         self.assertEqual(calls["ran"], [1])
+
+    def test_an_issue_requeued_mid_run_is_picked_again_before_any_refill(self):
+        issues = [issue(1), issue(2)]
+        labels = {1: {"todo"}, 2: {"todo"}}
+        ran, refills = [], []
+
+        def run_issue(n):
+            ran.append(n)
+            if n == 2:
+                labels[1] = {"todo"}  # the blocker on #1 was answered and `factory queue 1` ran meanwhile
+            labels[n] = {"blocked"} if ran.count(n) == 1 and n == 1 else {"awaiting-merge"}
+            return 0
+
+        result = fl.run_loop(
+            gate=lambda: "go", fetch_issues=lambda: [{**i, "labels": [{"name": x} for x in labels[i["number"]]]} for i in issues],
+            select=lambda pool: (pool[0]["number"], "x"), set_state=lambda n, st: labels.update({n: {st}}),
+            run_issue=run_issue, fetch_labels=lambda n: labels[n], raise_blocker=lambda *a: None, log=lambda e: None,
+            refill=lambda: refills.append(list(ran)) or False)
+        self.assertEqual(ran, [1, 2, 1])
+        self.assertEqual([r["outcome"] for r in result["results"]], ["blocked", "awaiting-merge", "awaiting-merge"])
+        self.assertEqual((refills, result["skipped"]), ([[1, 2, 1]], []))  # refill only once nothing was queued
+
+    def test_issues_over_the_cap_hold_back_refill(self):
+        refill = mock.Mock(return_value=False)
+        result, calls, _ = self.make([issue(1)], {1: "todo"}, max_runs=2, refill=refill)
+        self.assertEqual((calls["ran"], result["skipped"]), ([1, 1], [1]))
+        refill.assert_not_called()
 
     def test_dependencies_unlock_during_the_run(self):
         issues = [issue(1), issue(2, body="Depends on #1")]
@@ -418,6 +468,14 @@ class AutoQueueTests(unittest.TestCase):
         self.assertEqual(discover.call_count, 1)
         self.assertIn("nothing left", log[-1]["why"])
 
+    def test_a_failed_discovery_round_ends_auto_queue_without_claiming_nothing_is_left(self):
+        log = []
+        refill = fl.make_refill(lambda: [], set, lambda n: None, lambda: None, log.append)
+        self.assertFalse(refill())
+        self.assertIn("discovery failed", log[-1]["why"])
+        self.assertFalse(refill())  # and stays off for the run
+        self.assertEqual(len(log), 1)
+
     def test_loop_keeps_working_as_the_queue_refills_and_never_without_refill(self):
         labels = {1: {"todo"}}
         issues = [{"number": n, "title": f"I{n}", "body": "", "state": "OPEN"} for n in (1, 2)]
@@ -451,7 +509,7 @@ class AutoQueueTests(unittest.TestCase):
         log = []
         result = fl.run_loop(gate=lambda: "go", fetch_issues=lambda: [], select=None, set_state=None, run_issue=None,
                              fetch_labels=None, raise_blocker=None, log=log.append, refill=mock.Mock(side_effect=OSError("boom")))
-        self.assertEqual(result, {"results": [], "stopped": None})
+        self.assertEqual(result, {"results": [], "stopped": None, "skipped": []})
         self.assertEqual(log[-1]["kind"], "auto_queue_failed")
 
 
@@ -460,6 +518,33 @@ class AutoQueueWiringTests(unittest.TestCase):
         plan = {"issues": [{"key": "c", "depends_on": ["a"]}, {"key": "a"}, {"key": "b", "depends_on": ["c"]}, {"key": "d"}]}
         self.assertEqual([i["key"] for i in h.trim_plan(plan, 2)["issues"]], ["a", "d"])
         self.assertEqual([i["key"] for i in h.trim_plan(plan, 3)["issues"]], ["a", "d", "c"])
+
+    def test_a_draft_waits_for_the_existing_issues_it_lists_and_only_those(self):
+        a = {"key": "a", "title": "Add A", "body": "Builds on #36; mentions #12.", "acceptance": ["x"], "depends_on_issues": [36]}
+        b = {"key": "b", "title": "Add B", "body": "Standalone.", "acceptance": ["x"], "depends_on": ["a"]}
+        plan = {"issues": [a, b]}
+        self.assertEqual(h.validate_issue_plan(plan), [])
+        self.assertEqual(fl.parse_depends(h.render_issue_body(a, {})), [36])  # #12 is only mentioned
+        self.assertEqual(fl.parse_depends(h.render_issue_body(b, {"a": 50})), [50])
+        self.assertNotIn("Depends on", h.render_issue_body({"body": "x", "acceptance": ["y"]}, {}))
+        for bad in ("36", ["#36"], [0], [True]):
+            for field in h.ISSUE_REF_FIELDS:
+                self.assertIn(field, h.validate_issue_plan({"issues": [{**a, field: bad}]})[0])
+        self.assertIn("both", h.validate_issue_plan({"issues": [{**a, "related_issues": [36]}]})[0])
+
+    def test_every_open_issue_a_draft_names_must_be_listed_as_dependency_or_related(self):
+        a = {"key": "a", "title": "Add A", "body": "Builds on #36; like #12 and o/r#40.", "acceptance": ["Fits #33"],
+             "depends_on_issues": [36]}
+        existing = [issue(12, state="CLOSED"), issue(33), issue(36), issue(40)]
+        errors = h.issue_reference_problems({"issues": [a]}, existing)
+        self.assertEqual(len(errors), 1)  # closed #12 and the cross-repo reference need no listing
+        self.assertIn("open issue #33", errors[0])
+        ok = {**a, "related_issues": [33]}
+        self.assertEqual(h.issue_reference_problems({"issues": [ok]}, existing), [])
+        body = h.render_issue_body(ok, {})
+        self.assertTrue(body.endswith("Depends on #36\n\nRelated to #33\n"))
+        self.assertEqual(fl.parse_depends(body), [36])
+        self.assertIn("not an issue", h.issue_reference_problems({"issues": [{**ok, "related_issues": [33, 99]}]}, existing)[0])
 
     def test_planned_numbers_come_from_the_log(self):
         import tempfile
@@ -478,7 +563,7 @@ class AutoQueueWiringTests(unittest.TestCase):
             h.cmd_factory_run(a, {})
         self.assertIn("--merge auto", str(cm.exception))
 
-    def discovery_run(self, auto_queue=True, on_check=None):
+    def discovery_run(self, auto_queue=True, on_check=None, body="From the MVP.", existing=None):
         """A full `factory run` against a fake claude and gh. `on_check(root, n)` runs at each usage reading."""
         import tempfile
         import types
@@ -488,7 +573,7 @@ class AutoQueueWiringTests(unittest.TestCase):
             (root / ".factory").mkdir(parents=True)
             (root / ".factory" / "docs.json").write_text('{"mvp": "mvp.md"}')
             fake = Path(tmp) / "fake-claude.sh"
-            plan = '{"notes": ["n1"], "issues": [{"key": "a", "title": "Add the court", "body": "From the MVP.", "acceptance": ["It renders"]}]}'
+            plan = '{"notes": ["n1"], "issues": [{"key": "a", "title": "Add the court", "body": "%s", "acceptance": ["It renders"]}]}' % body
             fake.write_text(f"""#!/bin/sh
 case "$*" in
   *factory-discoverer*)
@@ -498,7 +583,7 @@ esac
 echo "args: $@"
 """)
             fake.chmod(0o755)
-            issues, created = {}, []
+            issues, created = dict(existing or {}), []
 
             def fake_json(*args):
                 if args[:2] == ("issue", "list"):
@@ -555,6 +640,13 @@ echo "args: $@"
         self.assertEqual([e["source"] for e in events if e["kind"] == "auto_queued"], ["discovered"])
         self.assertIn("auto_queue_exhausted", kinds)
         self.assertEqual(kinds.count("harness_started"), 1)
+
+    def test_a_draft_naming_an_unlisted_open_issue_goes_back_to_the_discoverer_once(self):
+        events, created, discovers, _, _, _ = self.discovery_run(body="Builds on #3.", existing={3: {"blocked"}})
+        self.assertEqual(created, [])  # the second draft (the fake's empty list) files nothing
+        self.assertEqual([e["retrying"] for e in events if e["kind"] == "discover_failed"], [True])
+        self.assertEqual(len(discovers), 2)
+        self.assertEqual(sum("rejected" in d and "open issue #3" in d for d in discovers), 1)  # the retry carried the problem
 
     def test_auto_queue_off_ends_the_run_when_the_queue_is_empty(self):
         events, created, discovers, issue_runs, _, _ = self.discovery_run(auto_queue=False)
@@ -752,7 +844,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_tree_is_parked_after_every_issue_even_a_blocked_one(self):
         parked = []
-        result = fl.run_loop(gate=lambda: "go", fetch_issues=lambda: [issue(1), issue(2)],
+        result = fl.run_loop(gate=lambda: "go", fetch_issues=lambda: [issue(1), issue(2)], max_runs=1,
                              select=lambda pool: (pool[0]["number"], "x"), set_state=lambda n, s: None,
                              run_issue=lambda n: 0, fetch_labels=lambda n: {"blocked"},
                              raise_blocker=lambda *a: None, log=lambda e: None, park=parked.append)
@@ -762,7 +854,7 @@ class FrontDoorTests(unittest.TestCase):
         def boom(n):
             raise RuntimeError("nope")
         events = []
-        result = fl.run_loop(gate=lambda: "go", fetch_issues=lambda: [issue(1), issue(2)],
+        result = fl.run_loop(gate=lambda: "go", fetch_issues=lambda: [issue(1), issue(2)], max_runs=1,
                              select=lambda pool: (pool[0]["number"], "x"), set_state=lambda n, s: None,
                              run_issue=lambda n: 0, fetch_labels=lambda n: {"blocked"},
                              raise_blocker=lambda *a: None, log=events.append, park=boom)
