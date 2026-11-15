@@ -69,6 +69,34 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(fl.choose(pool, lambda p: "garbage")[0], 3)
         self.assertEqual(fl.choose(pool, lambda p: 1 / 0)[0], 3)
         self.assertEqual(fl.choose(pool, lambda p: "PICK: 99 | x")[0], 3)
+        self.assertTrue(fl.is_fallback(fl.choose(pool, lambda p: "garbage")[1]))
+        self.assertTrue(fl.is_fallback("Fallback: gh was refused"))
+        self.assertFalse(fl.is_fallback("unblocks two; no fallback needed"))
+
+    def test_the_selector_brief_carries_bodies_dependents_and_awaiting_merge(self):
+        issues = [issue(3, body="Small."), issue(8, body="x" * 2000), issue(9, body="Depends on #3\nDepends on #8", labels=()),
+                  issue(10, body="Depends on #3", labels=("blocked",)), issue(11, body="Depends on #3", state="CLOSED"),
+                  issue(12, labels=("awaiting-merge",), title="Open PR"), issue(13, labels=("awaiting-merge",), state="CLOSED")]
+        brief = fl.selector_brief(fl.compute_pool(issues), issues)
+        self.assertEqual([(c["number"], c["unblocks"]) for c in brief["candidates"]], [(3, [9, 10]), (8, [9])])
+        self.assertEqual(brief["candidates"][0]["body"], "Small.")
+        self.assertTrue(brief["candidates"][1]["body"].endswith("[cut]"))
+        self.assertEqual(brief["awaiting_merge"], [{"number": 12, "title": "Open PR"}])
+
+    def test_the_selector_prompt_adds_pull_request_files_and_survives_a_failed_lookup(self):
+        issues = [issue(3), issue(8), issue(12, labels=("awaiting-merge",)), issue(14, labels=("awaiting-merge",)),
+                  issue(15, labels=("awaiting-merge",))]
+
+        def files(n):
+            if n == 14:
+                raise RuntimeError("gh failed")
+            return ["src/court.ts"] if n == 12 else None
+        prompt = h.selector_prompt(fl, fl.compute_pool(issues), issues, files)
+        brief = json.loads(prompt[prompt.index("{"):])
+        self.assertEqual([i.get("files") for i in brief["awaiting_merge"]], [["src/court.ts"], None, None])
+        self.assertEqual([c["number"] for c in brief["candidates"]], [3, 8])
+        self.assertIn("Bash(git grep *)", h.SELECTOR_ALLOWED)
+        self.assertFalse([r for r in h.SELECTOR_ALLOWED if "push" in r or "commit" in r or r.startswith("Bash(gh pr merge")])
 
 
 class GateTests(unittest.TestCase):
@@ -346,6 +374,14 @@ class LoopTests(unittest.TestCase):
     def test_manual_policy_never_lands(self):
         result, _, _ = self.make([issue(1)], {1: "awaiting-merge"})
         self.assertEqual(result["results"], [{"issue": 1, "outcome": "awaiting-merge"}])
+
+    def test_a_fallback_pick_is_marked_in_the_log(self):
+        picks = iter([(1, "fallback: gh was refused"), (2, "unblocks two")])
+        result, calls, _ = self.make([issue(1), issue(2)], {1: "awaiting-merge", 2: "awaiting-merge"},
+                                     select=lambda pool: next(picks))
+        self.assertEqual([e.get("fallback") for e in calls["log"] if e["kind"] == "issue_picked"], [True, None])
+        self.assertEqual(h.event_line({"kind": "issue_picked", "issue": 1, "reason": "fallback: x", "fallback": True}),
+                         "picked #1 (fallback): x")
 
     def test_session_that_records_nothing_becomes_blocked(self):
         result, calls, labels = self.make([issue(1)])
@@ -988,6 +1024,10 @@ class FrontDoorTests(unittest.TestCase):
     def test_status_summarises_supervisor_queue_blocked_and_events(self):
         h.acquire_supervisor([])
         h.factory_log({"kind": "harness_started", "issue": 2})
+        h.factory_log({"kind": "issue_picked", "issue": 9, "reason": "fallback: old run", "fallback": True, "pool": [8, 9]})
+        h.factory_log({"kind": "supervisor_started"})
+        h.factory_log({"kind": "issue_picked", "issue": 6, "reason": "fallback: gh refused", "fallback": True, "pool": [2, 6]})
+        h.factory_log({"kind": "issue_picked", "issue": 7, "reason": "unblocks two", "pool": [2, 7]})
         h.factory_log({"kind": "issue_picked", "issue": 2, "reason": "only candidate"})
         sessions = self.root / ".factory" / "sessions"
         sessions.mkdir()
@@ -1011,6 +1051,7 @@ class FrontDoorTests(unittest.TestCase):
         self.assertIn("awaiting merge: #4", text)
         self.assertIn("could run now: #5", text)
         self.assertIn("picked #2: only candidate", text)
+        self.assertIn("selector: 1 of 2 picks this run fell back", text)  # the earlier run and the lone candidate don't count
 
 
 def types_ns(**kw):

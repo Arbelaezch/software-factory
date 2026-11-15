@@ -5571,7 +5571,8 @@ def event_line(e: dict) -> str | None:
     """One short human line for the events that matter to someone watching (None = not shown)."""
     k, n = e.get("kind"), e.get("issue")
     return {
-        "issue_picked": lambda: f"picked #{n}: {e.get('reason')}",
+        "issue_picked": lambda: (f"picked #{n} (fallback): " + re.sub(r"(?i)^\s*fallback:\s*", "", str(e.get("reason")))
+                                 if e.get("fallback") else f"picked #{n}: {e.get('reason')}"),
         "harness_started": lambda: f"started #{n}",
         "harness_finished": lambda: f"#{n} finished: {e.get('outcome')}",
         "message": lambda: f"{e.get('message_kind')} #{n}: {e.get('text', '')}".rstrip(": "),
@@ -5923,6 +5924,27 @@ def trim_plan(plan: dict, limit: int) -> dict:
 # Factory run loop wiring (engine in scripts/factory_loop.py; design section 9).
 ISSUE_PROMPT = "/factory-issue {n}"
 SELECTOR_AGENT = "harness:issue-selector"
+# The selector gets the issue data in its prompt; these let it look at the code. Without them every Bash call in a
+# headless session is refused and it can only guess.
+SELECTOR_ALLOWED = ["--allowedTools", "Read", "Grep", "Glob", "Bash(git ls-files *)", "Bash(git grep *)",
+                    "Bash(gh issue view *)", "Bash(gh issue list *)", "Bash(gh pr list *)"]
+SELECTOR_PROMPT = """Pick the next issue. Everything you need about the issues is here; don't fetch it again.
+
+{brief}"""
+
+
+def selector_prompt(fl, pool: list[dict], issues: list[dict], pr_files) -> str:
+    """The selector's prompt: the candidates with bodies and what each unblocks, and the issues awaiting merge with
+    the files their pull requests change (`pr_files(n)`; None when unknown)."""
+    brief = fl.selector_brief(pool, issues)
+    for i in brief["awaiting_merge"]:
+        try:
+            files = pr_files(i["number"])
+        except Exception:  # a failed lookup must not cost the pick
+            files = None
+        if files is not None:
+            i["files"] = files[:60]
+    return SELECTOR_PROMPT.format(brief=json.dumps(brief, indent=1, ensure_ascii=False))
 
 
 def factory_modules():
@@ -6381,6 +6403,14 @@ def cmd_factory_status(a, cfg):
     pool = fl.compute_pool(issues)
     if pool:
         print("could run now: " + ", ".join(f"#{p['number']}" for p in pool))
+    picks = []  # this run's picks that needed a judgement (more than one candidate)
+    for e in read_json_lines(d / "log.jsonl"):
+        if e.get("kind") == "supervisor_started":
+            picks = []
+        elif e.get("kind") == "issue_picked" and len(e.get("pool") or []) > 1:
+            picks.append(bool(e.get("fallback")))
+    if any(picks):
+        print(f"selector: {sum(picks)} of {len(picks)} picks this run fell back to the lowest number (see the picked lines)")
     events = last_lines(d / "events.log", a.events)
     if events:
         print("recent events:")
@@ -6674,9 +6704,13 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
             return float(fc.get("nighttime_unknown_hours", 6)) * 60
         return float(fc.get("unknown_minutes", 30))
 
+    def pr_files(n):
+        url = (read_json(ROOT / ".factory" / "prs.json", {}) or {}).get(str(n))
+        return [f["path"] for f in (gh_json("pr", "view", url, "--json", "files") or {}).get("files") or []] if url else None
+
     def ask_selector(pool):
-        command, sid = metered_command("-p", "Pick the next issue. Candidates:\n" + json.dumps(pool, indent=1),
-                                       "--agent", SELECTOR_AGENT, *claude_args)
+        command, sid = metered_command("-p", selector_prompt(fl, pool, fetch(), pr_files),
+                                       "--agent", SELECTOR_AGENT, *claude_args, *SELECTOR_ALLOWED)
         r = run_cmd(command, cwd=str(ROOT), timeout=300)
         log_session_usage(SELECTOR_AGENT.split(":")[-1], sid, cfg)
         return r.stdout

@@ -351,9 +351,12 @@ Usage gate
   resumes when the machine wakes. A supervisor lock whose pid is dead, or was reused by a process started
   after the lock was written (a reboot), is cleared on the next start.
 
-Selector. `issue-selector` reads the `todo` pool, dependencies and the files each issue is likely to touch,
-and picks the next issue with a one-line reason logged. It is advisory about order only. It cannot pick
-an issue with an unmerged dependency.
+Selector. `issue-selector` gets the `todo` pool in its prompt (each candidate's body and the open issues it
+unblocks, plus the issues awaiting merge with the files their pull requests change), may look at the code with
+read-only tools, and picks the next issue with a one-line reason logged. It is advisory about order only. It
+cannot pick an issue with an unmerged dependency. A pick that was not a judgement (no usable answer, or the
+selector says it lacked data) has a reason starting with `fallback:`, is logged with `fallback: true`, shows as
+`picked #N (fallback)` in the events, and is counted in `factory status`.
 
 ## 10. Out-of-scope work
 
