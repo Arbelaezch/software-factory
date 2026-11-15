@@ -50,6 +50,15 @@ Event stream: `${CLAUDE_PROJECT_DIR}/.factory/events.log`
   that it works unattended until then and that `H factory stop` ends it. It needs `--merge auto` (the default) and
   the documents recorded by `/factory-plan` (`H factory docs`); without them it still runs planned and backlog
   issues but cannot discover. It applies to that start only, and can be combined with `--until-limit`.
+- **"run overnight" / "nighttime mode" / "I'm going to bed"** (only when the user says so): add `--nighttime` to
+  `H factory start`. It keeps going through hours of unreadable plan usage (`[factory] nighttime_unknown_hours`,
+  default 6) instead of stopping after 30 minutes; pauses, re-queues and blockers work as usual. Suggest combining it
+  with `--auto-queue` and `--until-limit` only if they asked for those too.
+- **Switching a setting while it runs** ("turn on auto-queue", "go until the limit", "switch to nighttime", or the
+  same with off): if the supervisor is running, `H factory set <nighttime|auto-queue|until-limit> <on|off>` instead
+  of stopping and restarting. It applies before the next issue, and a usage pause wakes to re-check with the new
+  setting. Auto-queue can't be switched on in a run that merges manually; the command says so. Not running: use the
+  start flags above.
 - **"stop" / "pause"**: `H factory stop` (after the current issue). Use `--now` only if they say now or it is
   clearly stuck; warn that the in-progress issue will be marked blocked at the next start.
 - **"continue" / "next batch"**: `H factory start`, with `--issues` if they name more.

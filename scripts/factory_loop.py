@@ -111,20 +111,38 @@ def choose(pool: list[dict], ask: Callable[[list[dict]], str | None]) -> tuple[i
 
 
 def sleep_until(deadline: float, sleep: Callable[[float], None] = time.sleep, now: Callable[[], float] = time.time,
-                step: float = 300) -> None:
+                step: float = 300, wake: Callable[[], bool] = lambda: False) -> float | None:
     """Sleep until wall-clock `deadline` in short steps. One long time.sleep does not count the time a Mac spends
-    asleep, so a pause across a closed lid would end hours late (court-vision 2026/11/12 and 11/13)."""
+    asleep, so a pause across a closed lid would end hours late (court-vision 2026/11/12 and 11/13).
+    Returns how many seconds past the deadline it woke, or None when `wake()` cut the sleep short."""
     while (left := deadline - now()) > 0:
+        if wake():
+            return None
         sleep(min(step, left))
+    return now() - deadline
+
+
+def changed(read: Callable[[], object]) -> Callable[[], bool]:
+    """A `wake` for usage_gate: True once each time `read()` differs from what it returned last."""
+    seen = [read()]
+
+    def check() -> bool:
+        cur = read()
+        if cur == seen[0]:
+            return False
+        seen[0] = cur
+        return True
+    return check
 
 
 def usage_gate(check: Callable[[], dict], sleep: Callable[[float], None] = time.sleep,
                now: Callable[[], float] = time.time, log: Callable[[dict], None] = lambda e: None,
-               unknown_minutes: float = 30, retry_wait: float = 60, max_retry_wait: float = 900,
-               resume_buffer: float = 60, step: float = 300) -> str:
+               unknown_minutes: float | Callable[[], float] = 30, retry_wait: float = 60, max_retry_wait: float = 900,
+               resume_buffer: float = 60, step: float = 300, wake: Callable[[], bool] = lambda: False) -> str:
     """Block until plan usage allows work. Returns "go", or "stop" once usage has been unreadable for
     `unknown_minutes` (the caller raises a blocker); unknown readings retry with a growing wait. A pause sleeps
-    until the blocking window resets and continues silently."""
+    until the blocking window resets and continues silently. `wake()` (the run's settings changed) ends a wait
+    early, so the next reading uses the new settings."""
     unknown, first_unknown = 0, None
     while True:
         r = check()
@@ -136,15 +154,21 @@ def usage_gate(check: Callable[[], dict], sleep: Callable[[float], None] = time.
             resume_at = r.get("resume_at")
             deadline = max(resume_at + resume_buffer, now() + retry_wait) if resume_at else now() + retry_wait
             log({"kind": "usage_pause", "reasons": r.get("reasons"), "resume_at": resume_at})
-            sleep_until(deadline, sleep, now, step)
-            log({"kind": "usage_resume"})
+            late = sleep_until(deadline, sleep, now, step, wake)
+            if late is None:
+                log({"kind": "usage_resume", "why": "settings changed"})
+            elif late >= 600:  # the Mac was asleep past the reset; worth seeing in the morning
+                log({"kind": "usage_resume", "late_min": int(late // 60)})
+            else:
+                log({"kind": "usage_resume"})
             continue
         unknown += 1
         first_unknown = first_unknown if first_unknown is not None else now()
         log({"kind": "usage_unknown", "count": unknown, "reasons": r.get("reasons")})
-        if now() - first_unknown >= unknown_minutes * 60:
+        window = unknown_minutes() if callable(unknown_minutes) else unknown_minutes
+        if now() - first_unknown >= window * 60:
             return "stop"
-        sleep_until(now() + min(retry_wait * 2 ** (unknown - 1), max_retry_wait), sleep, now, step)
+        sleep_until(now() + min(retry_wait * 2 ** (unknown - 1), max_retry_wait), sleep, now, step, wake)
 
 
 FAIL_CONCLUSIONS = {"FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE", "ACTION_REQUIRED", "ERROR"}
@@ -272,7 +296,8 @@ def run_loop(*, gate: Callable[[], str], fetch_issues: Callable[[], list[dict]],
             stopped = "stop requested"
             break
         if gate() == "stop":
-            raise_blocker("Plan usage could not be read for the whole retry window ([factory] unknown_minutes), so the factory stopped.", None,
+            raise_blocker("Plan usage could not be read for the whole retry window ([factory] unknown_minutes, or "
+                          "nighttime_unknown_hours with nighttime on), so the factory stopped.", None,
                           "Check the statusline capture or run `usage.py --probe`, then start the factory again.")
             stopped = "usage unknown"
             break
