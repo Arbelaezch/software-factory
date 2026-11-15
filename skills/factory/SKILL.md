@@ -31,11 +31,13 @@ Event stream: `${CLAUDE_PROJECT_DIR}/.factory/events.log`
   not, the current issue and its stage, what is blocked, what awaits merge. If the supervisor is running and you
   aren't watching yet, start watching.
 - **A blocked issue** (the user asks about it, or an event says so): `H factory status --issue N` prints the
-  message the factory sent. Put it to the user as it is, short, with its options. Never answer a product question
-  for them. Blockers also reach the user's phone (Telegram, `H phone status`); if the issue is no longer `blocked`,
-  it was answered there, so don't ask again.
+  message the factory sent. Put it to the user the way the phone does: the `In short` line, `What I need`, then the
+  numbered options by their short labels with the recommended one marked. Leave `What is going on` and `Detail`
+  (file paths, logs) out unless they ask for details. A blocker with no options is an action for them, not a
+  question: say what it needs. Never answer a product question for them. Blockers also reach the user's phone
+  (Telegram, `H phone status`); if the issue is no longer `blocked`, it was answered there, so don't ask again.
 - **The user answers** (picks an option or says what to do): record it with
-  `H factory decide --question "<the question>" --answer "<their answer>" --by user --kind <product|implementation>
+  `H factory decide --question "<the question>" --answer "<their answer>" --by user --kind <product|implementation|process>
   --why "<their reasoning if given>"`, then re-queue the issue: `H factory queue N`. If the supervisor has stopped
   (pool was empty), run `H factory start --issues N` instead: it queues the issue itself, so don't run both. If the answer is "skip it" or "not now", don't queue it.
 - **"keep going until the limit" / "use all my usage"** (only when the user says so; never by default): add
@@ -87,6 +89,11 @@ one short fact; answer in one or two sentences and never repeat the line back:
 - If you were woken for something you already told the user, reply with nothing at all, not even "already reported".
 - Don't restate recommendations, recaps or "waiting on you" lines after reporting; one message per event.
 - `BLOCKER` / `QUESTION`: tell the user right away, using `H factory status --issue N` for the full message.
+- `decided for you`: a minor implementation or process question the factory settled itself (`[factory]
+  auto_accept`); the issue went on. One line: what was asked and what it took, and that they can overrule it. If
+  they do, record their answer with `H factory decide ... --by user` and, once the issue is no longer being worked
+  on, `H factory queue N` so it runs again with their answer; if it is already merged, say the change needs a
+  follow-up issue.
 - `paused for plan usage`: one line, with the resume time. It continues by itself.
 - `stopped at the plan usage limit: back to todo`: one line. It is retried once after the reset; a second failure blocks.
 - `usage unreadable`: stay quiet. The factory retries with a growing wait and stops only after `[factory]

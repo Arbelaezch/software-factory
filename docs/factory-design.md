@@ -152,11 +152,19 @@ they cannot drift.
 
 ## 6. Questions: ask or decide
 
+The rule: **I decide the product; the factory decides how to build it.** I want every product decision and almost
+no implementation ones.
+
 Every open question goes to `question-resolver` before it can reach me. It classifies on two axes:
 
-- Domain: **product** (direction, use case, UX) or **implementation**.
-- Reversibility: does the answer cascade (data model, public API shape, anything other issues build on)
-  or is it cheap to change later?
+- Category: **product** (what the product does, how it looks, feels or behaves for the people using it, who it is
+  for, what is in scope), **implementation** (how it is built) or **process** (how the factory handles the issue:
+  another review round, what counts as evidence, housekeeping).
+- Impact, for implementation and process: **significant** or **minor**. Significant means any of: it changes what
+  the finished product is or how it feels to use, or commits the project to one final experience; it would be
+  expensive to undo (data model, public API shape, file format, a core dependency or architecture other issues build
+  on); or its options trade off things only I can weigh (cost, scope, security, the quality bar) with no clearly
+  better one. Minor means routine, standard or boilerplate, easy to change later, with a sensible default.
 
 It returns one of three outcomes:
 
@@ -164,10 +172,20 @@ It returns one of three outcomes:
 |---|---|---|
 | answered | The source docs settle it. Quote the line. | On the issue |
 | assumed | Implementation, low impact, reversible, high certainty. Nothing else. | On the issue and in the PR description |
-| escalate | All product questions, anything that cascades, anything it is unsure about | Goes to me via `human-liaison` |
+| escalate | All product questions, anything significant, anything it is unsure about. It names the category and the impact. | Depends on who decides (below) |
 
-The bar for `assumed` is high. When unsure it escalates. Implementation freedom is wide, product freedom
-is narrow: the vision stays mine.
+Who decides an escalated question (issue #116). The session declares the category and impact on `factory block`, and
+the harness applies the rule; nothing is inferred from the wording.
+
+| Question | Who decides |
+|---|---|
+| product | Me, always. |
+| implementation or process, significant | Me. |
+| implementation or process, minor | The factory, when the category is in `[factory] auto_accept` (default: both). It takes the recommended option, records it as `assumed`, lists it in the PR, and tells me in one line that I can overrule. The issue is not blocked. With the category left out of `auto_accept`, me. |
+| infrastructure (the factory's own tooling is in the way: dirty tree, refused command, CI, usage) | Nobody: there is nothing to choose. It is reported with the action it needs, never asked as a question. |
+
+When unsure between assumed and escalate it escalates, and when unsure between minor and significant it says
+significant. Implementation freedom is wide, product freedom is narrow: the vision stays mine.
 
 Each project needs a vision source (a section in the MVP doc or a `VISION.md`). `question-resolver`
 treats it as authoritative for product questions.
@@ -175,7 +193,9 @@ treats it as authoritative for product questions.
 How it is wired (step 7b): `/factory-issue` sends every question that /ship would ask the user to the
 `question-resolver` agent (opus, read-only) first. `answered` continues with the quoted source; `assumed` is recorded
 with `factory decide --by assumed` and listed under `## Assumptions` in the PR description; `escalate` becomes
-`factory block --kind QUESTION` with the resolver's options. A missing or malformed outcome counts as escalate.
+`factory block --kind QUESTION --category ... --impact ...` with the resolver's options, which either blocks the
+issue or prints `AUTO-ACCEPTED` and lets the session go on. A missing or malformed outcome counts as a product
+escalation.
 
 ## 7. Talking to me
 
@@ -185,14 +205,19 @@ problems, completion notices. The goal is one standard shape that is short and d
 Message format
 ```
 [QUESTION | BLOCKER | DONE]  <project> #<issue>
+In short:           1-2 plain sentences: what it means for the product, what the recommendation does
 What is going on:   at most 3 sentences
 What I need:        one specific decision or action
-Options:            2-3 choices, one marked as recommended (when applicable)
+Options:            2-3 choices, each "<short label>: <description>", one marked as recommended (when applicable)
 Detail:             link to the raw CI log, agent output or issue comment
 ```
 
-v1 behaviour is light: restate what the CI or agent reported, in this format. Smarter summarising comes later
-without changing the format.
+`In short` and the option labels are what I read first, on the phone and in `/factory` alike (issue #116). They are
+written for someone who cannot open the repo: no file names, paths, line numbers, AC numbers or code formatting, and
+a label is at most 35 characters and readable alone. `What is going on` and `Detail` carry the engineer's account.
+`factory block` requires both and refuses a message that breaks the rules; `notify` checks them when given. The
+supervisor's own blockers (CI failed twice, a session that ended without an outcome) have fixed plain wording and no
+summary.
 
 Blockers (raised to me, never retried)
 - A question `question-resolver` escalates.
@@ -213,7 +238,7 @@ Delivery goes through one function, `notify(message)`, with channels behind it.
   --recommend N] [--detail ...] [--channel terminal|push]`. It rejects a message that breaks the format (more than
   3 sentences, no decision for a QUESTION or BLOCKER, not 2 or 3 options with exactly one recommended). A failing
   channel never loses the message: the terminal always gets it. The `human-liaison` agent (haiku) builds the
-  message from the raw material and calls this. Batching of questions belongs to the run loop (step 5).
+  message from the raw material and calls this.
 
 Phone access (decided 2026/11/14, issue #9)
 - Claude's own push (Remote Control, `PushNotification`) was dropped: pushes never arrived (tested 2026/11/06), and
@@ -221,6 +246,21 @@ Phone access (decided 2026/11/14, issue #9)
   attach to. Keeping one open per blocker would spend plan usage while waiting.
 - QUESTION and BLOCKER messages go to a Telegram bot (`scripts/phone.py`), on top of the terminal and the issue
   comment. DONE stays on the terminal. Each option is a button, the recommended one starred.
+- What a phone message shows (issue #116): the project, the issue's number and title, the summary, what to decide,
+  then each option's label with its
+  description under the number its button carries. A button is `<n>. <label>` plus the star, 40 characters at most.
+  A `Details` button returns the full standard message without a model. A blocker with no options is headed
+  `stopped`; an infrastructure one says it needs me at the computer and that there is nothing to decide.
+- The last line of a message says what else is going on in the project: how many more wait on me, and how many
+  questions were decided for me and issues merged since I last tapped or wrote there.
+- A question the factory settled itself (section 6) arrives as a silent note with no option buttons, and does not
+  keep the Mac awake. Replying to it overrules it: the answer session records my decision and runs the issue again if
+  it is still open and not being worked on, and otherwise says a follow-up is needed.
+- Messages are sent as they happen, not held back to be grouped: a blocked issue is set aside on its branch and the
+  factory moves to the next one, so the sooner I answer the sooner it can come back to it.
+- When an answer is recorded, the original message is edited: the option buttons go, and it shows the choice, the
+  time, and whether the issue was queued again and when it runs (after the current issue, or when the factory is
+  started if it has stopped). A blocker picked up at the computer is marked the same way.
 - One bot and one bridge serve every factory on the machine, whatever Claude or GitHub account each project uses.
   Setup is once per machine: create a bot with @BotFather, turn on topics for it there, message it, then run
   `harness phone setup --token <token>`. State lives in `~/.config/software-factory/phone`, outside the projects.
@@ -238,11 +278,13 @@ Phone access (decided 2026/11/14, issue #9)
   the blocker. At most 4 replies per blocker; past that I finish at the computer.
 - `status` (or `/status`) in a project's topic returns that project's `harness factory status`; outside the topics
   it covers every project. No model is used.
-- A blocker answered at the computer (the issue is queued or started again) is closed out on the phone.
+- A blocker answered at the computer (the issue is queued or started again) is closed out on the phone, on the
+  message itself.
 - Only my Telegram user, in the chat found at setup, is listened to. `[factory] phone = false` turns it off for a project.
 
 A blocker stops only the blocked issue and anything that depends on it. The factory keeps working other
-independent issues in my directed group. Questions are batched so I am not pinged repeatedly.
+independent issues in my directed group. I am pinged less because fewer questions reach me (section 6), not because
+they are held back.
 
 ## 8. State and labels
 

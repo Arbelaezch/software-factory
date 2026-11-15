@@ -447,6 +447,28 @@ class NotifyTests(unittest.TestCase):
             "Options:", "  1. Retry once more", "  2. Close the PR  (recommended)",
             "Detail:             https://example.test/log"])
 
+    def test_summary_leads_and_labels_name_the_options(self):
+        out = self.msg(summary="The pull request keeps failing its checks. Closing it loses nothing that is merged.",
+                       labels=["Try again", "Close it"])
+        self.assertEqual(out.splitlines()[1],
+                         "In short:           The pull request keeps failing its checks. Closing it loses nothing that is merged.")
+        self.assertIn("  1. Try again: Retry once more", out)
+        self.assertIn("  2. Close it: Close the PR  (recommended)", out)
+
+    def test_summary_and_labels_must_be_short_and_plain(self):
+        for kw in ({"summary": "One. Two. Three."}, {"summary": "x" * (h.SUMMARY_MAX + 1)},
+                   {"summary": "See DESIGN_DOC.md:297 for the grading rule."}, {"summary": "It fails AC3."},
+                   {"summary": "The `aggressiveCloseout` grade is unclear."}, {"summary": "Look in .harness/runs for it."},
+                   {"summary": "It lives in src/core/teams."}, {"labels": ["Only one"]}, {"labels": ["Same", "same"]},
+                   {"labels": ["x" * (h.LABEL_MAX + 1), "Close it"]}, {"labels": ["Edit teams.ts", "Close it"]},
+                   {"labels": ["", "Close it"]}):
+            with self.assertRaises(ValueError, msg=kw):
+                self.msg(**kw)
+        for ok in ("Players can't tell the teams apart, e.g. on a grey court. Pick how they should differ.",
+                   "The site moves from Express.js to Next.js.",
+                   "Version 1.2 of the app and/or the site would change 24/7."):
+            self.assertIsNone(h.plain_problem("the summary", ok), ok)
+
     def test_done_needs_no_decision(self):
         out = self.msg(kind="done", need="", options=None, recommended=None, detail="", issue="#7")
         self.assertIn("[DONE]  Callback #7", out)
@@ -500,15 +522,21 @@ class NotifyTests(unittest.TestCase):
         ph.configured.return_value = True
         cfg = {"project": {"name": "alpha"}, "accounts": {"claude": "personal", "dirs": {"personal": "/acc/p"}}}
         with mock.patch.object(h, "phone_module", return_value=ph), mock.patch.object(h, "factory_comment"), \
+                mock.patch.object(h, "gh_json", return_value={"title": "Add export"}) as gh_json, \
                 mock.patch.object(h, "factory_log"), contextlib.redirect_stdout(io.StringIO()):
-            h.factory_raise_blocker(cfg, "o/r", "QUESTION", 5, "Which one.", "Pick one", ["A", "B"], 2)
+            h.factory_raise_blocker(cfg, "o/r", "QUESTION", 5, "Which one.", "Pick one", ["A", "B"], 2,
+                                    summary="Two ways to do it.", labels=["First", "Second"], category="product")
             h.factory_raise_blocker(cfg, "o/r", "DONE", 5, "The PR is open.", "")
             h.factory_raise_blocker({**cfg, "factory": {"phone": False}}, "o/r", "BLOCKER", 6, "Stuck.", "Help")
         ph.send_blocker.assert_called_once()
         args = ph.send_blocker.call_args.args
         self.assertEqual((args[1], args[2], args[3], args[5], args[6], args[7], args[8]),
                          ("alpha", 5, "QUESTION", "Pick one", ["A", "B"], 2, "/acc/p"))
-        self.assertTrue(args[4].startswith("[QUESTION]  alpha #5"))
+        self.assertTrue(args[4].startswith("[QUESTION]  alpha #5\nIn short:           Two ways to do it."))
+        self.assertEqual(ph.send_blocker.call_args.kwargs, {"summary": "Two ways to do it.", "labels": ["First", "Second"],
+                                                            "category": "product", "situation": "Which one.",
+                                                            "title": "Add export"})
+        gh_json.assert_called_once_with("issue", "view", "5", "--repo", "o/r", "--json", "title")  # only when it is sent
         ph.ensure_bridge.assert_called_once()
 
     def test_a_phone_failure_never_stops_the_factory(self):
@@ -518,8 +546,11 @@ class NotifyTests(unittest.TestCase):
         logged, err = [], io.StringIO()
         with mock.patch.object(h, "phone_module", return_value=ph), mock.patch.object(h, "factory_comment"), \
                 mock.patch.object(h, "factory_log", side_effect=logged.append), \
+                mock.patch.object(h, "gh_json", side_effect=RuntimeError("gh issue view failed")), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
             h.factory_raise_blocker({}, "o/r", "BLOCKER", 6, "Stuck.", "Help")
+        ph.send_blocker.assert_called_once()  # an unreadable title is left out, the message still goes
+        self.assertEqual(ph.send_blocker.call_args.kwargs["title"], "")
         self.assertIn("network down", err.getvalue())
         self.assertEqual(logged[0]["kind"], "phone_failed")
 

@@ -13,7 +13,11 @@ The bridge only makes outgoing HTTPS requests (long polling), so it works from a
 Each project gets its own topic in the chat when the bot has topics turned on; otherwise every message carries the
 project name and replies are matched by the message they reply to. A tap or a reply goes to a short Sonnet session in
 the project (with the project's Claude account), which records the answer and re-queues the issue the way /factory
-does, or answers a follow-up question. `status` is answered without a model.
+does, or answers a follow-up question. `status` and the Details button are answered without a model.
+
+A message leads with the plain-language summary and short option labels the factory session wrote; the full standard
+message is behind Details. A question the factory decided itself arrives as a silent one-line note that a reply
+overrules, and a message that was answered is edited to show the choice, the time and whether the issue runs again.
 Standard library only.
 """
 from __future__ import annotations
@@ -43,7 +47,9 @@ IDLE_EXIT = 30 * 60      # the bridge exits after this long with no supervisor r
 PRUNE_EVERY = 120        # seconds between checks for blockers settled at the computer
 EXPIRE_DAYS = 7
 ANSWER_TIMEOUT = 900
-KIND_MARK = {"QUESTION": "❓", "BLOCKER": "⛔"}
+KIND_MARK = {"QUESTION": "❓", "BLOCKER": "⛔", "DECIDED": "ℹ️"}
+LABEL_MAX = 40           # an option button, number and star included
+TITLE_MAX = 60           # the issue's title next to its number
 STATUS_RE = re.compile(r"^/?(?:factory\s+)?status(?:@\w+)?$", re.I)
 HELP_RE = re.compile(r"^/?(?:help|start)(?:@\w+)?$", re.I)
 
@@ -121,8 +127,10 @@ class Bot:
         self.call = call or (lambda method, http_timeout=30, **p: api(cfg["token"], method, http_timeout, **p))
 
     def send(self, text: str, thread: int | None = None, buttons: list[list[dict]] | None = None,
-             reply_to: int | None = None) -> int:
+             reply_to: int | None = None, silent: bool = False) -> int:
         p = {"chat_id": self.cfg["chat_id"], "text": text[:4000], "link_preview_options": {"is_disabled": True}}
+        if silent:
+            p["disable_notification"] = True
         if thread:
             p["message_thread_id"] = thread
         if buttons:
@@ -130,6 +138,15 @@ class Bot:
         if reply_to:
             p["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
         return self.call("sendMessage", **p)["message_id"]
+
+    def edit(self, message_id: int, text: str, buttons: list[list[dict]] | None = None) -> bool:
+        """Replace a sent message's text and buttons. False when Telegram refuses (too old, deleted)."""
+        try:
+            self.call("editMessageText", chat_id=self.cfg["chat_id"], message_id=message_id, text=text[:4000],
+                      link_preview_options={"is_disabled": True}, reply_markup={"inline_keyboard": buttons or []})
+            return True
+        except TelegramError:
+            return False
 
     def clear_buttons(self, message_id: int) -> None:
         try:
@@ -156,6 +173,7 @@ def register_project(root: str, name: str, config_dir: str | None, bot: Bot | No
         projects = _read("projects.json", {})
         entry = projects.get(root) or {}
         entry.update({"name": name, "config_dir": config_dir or ""})
+        entry.setdefault("seen", iso())
         cfg = _read("config.json", cfg)
         if cfg.get("topics", True) and not entry.get("thread"):
             try:
@@ -169,18 +187,95 @@ def register_project(root: str, name: str, config_dir: str | None, bot: Bot | No
     return entry
 
 
-def blocker_buttons(pid: str, options: list[str], recommended: int | None) -> list[list[dict]]:
+def option_label(p: dict, i: int) -> str:
+    """The short name of option i (1-based): the label the session wrote, else the option itself."""
+    labels = p.get("labels") or []
+    return labels[i - 1] if len(labels) == len(p["options"]) else p["options"][i - 1]
+
+
+def details_button(pid: str) -> list[dict]:
+    return [{"text": "Details", "callback_data": f"d:{pid}"}]
+
+
+def blocker_buttons(pid: str, p: dict) -> list[list[dict]]:
+    """One button per option, each readable on its own, then Details (the full standard message)."""
     rows = []
-    for i, o in enumerate(options, 1):
-        label = f"{'★ ' if i == recommended else ''}{i}. {o}"
-        rows.append([{"text": label if len(label) <= 60 else label[:57] + "...", "callback_data": f"a:{pid}:{i}"}])
-    return rows
+    for i in range(1, len(p["options"]) + 1):
+        star = " ★" if i == p.get("recommended") else ""
+        label, room = f"{i}. {option_label(p, i)}", LABEL_MAX - len(star)
+        rows.append([{"text": (label if len(label) <= room else label[:room - 3] + "...") + star,
+                      "callback_data": f"a:{pid}:{i}"}])
+    return rows + [details_button(pid)]
+
+
+def log_events(root: str) -> list[dict]:
+    """The project's recent factory log events, newest first."""
+    try:
+        lines = (Path(root) / ".factory" / "log.jsonl").read_text(encoding="utf-8").splitlines()[-2000:]
+    except OSError:
+        return []
+    out = []
+    for line in reversed(lines):
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def overview(root: str, pid: str | None = None) -> str:
+    """What else is going on in the project, for the last line of a message: what waits on the user besides this
+    one, and what was decided for them or merged since they last tapped or wrote here. Empty when nothing is."""
+    seen = (_read("projects.json", {}).get(root) or {}).get("seen") or ""
+    recent = [e.get("kind") for e in log_events(root) if str(e.get("ts", "")) > seen]
+    more = len([k for k, v in _read("pending.json", {}).items() if v["root"] == root and v["state"] == "open" and k != pid])
+    since = [f"{n} {what}" for n, what in ((recent.count("auto_accepted"), "decided for you"), (recent.count("merged"), "merged")) if n]
+    parts = ([f"{more} more waiting on you"] if more else []) + ([", ".join(since) + " since you last looked"] if since else [])
+    return ("Also: " + "; ".join(parts) + ".") if parts else ""
+
+
+def blocker_text(p: dict) -> str:
+    """What the phone shows for one pending message: the plain summary, then what to decide and the options under
+    the numbers their buttons carry. File paths and the engineer's account stay behind Details."""
+    ref = f" #{p['issue']}" if p.get("issue") not in (None, "") else ""
+    title = " ".join((p.get("title") or "").split())
+    name = f" · {title if len(title) <= TITLE_MAX else title[:TITLE_MAX - 3].rstrip() + '...'}" if title and ref else ""
+    state = "Decided for you · " if p["kind"] == "DECIDED" else "" if p["options"] else "Stopped · "
+    head = f"{KIND_MARK.get(p['kind'], '')} {state}{p['project']}{ref}{name}".strip()
+    lead = [p.get("summary") or p.get("situation")] if p.get("summary") or p.get("situation") else []
+    if p["kind"] == "DECIDED":
+        k = p["recommended"]
+        took = f"Took {k}. {option_label(p, k)}" + (f": {p['options'][k - 1]}" if p.get("labels") else "")
+        return "\n".join([head, *lead, "", p["need"], took])
+    if not p["options"]:
+        action = "Needs you at the computer" if p.get("category") == "infrastructure" else "What I need"
+        return "\n".join([head, *lead, "", f"{action}: {p['need']}"])
+    lines = [head, *lead, "", p["need"]]
+    for i, o in enumerate(p["options"], 1):
+        star = " ★" if i == p.get("recommended") else ""
+        lines += [f"{i}. {option_label(p, i)}{star}"] + ([f"   {o}"] if p.get("labels") else [])
+    return "\n".join(lines)
+
+
+def footer(p: dict) -> str:
+    if p["kind"] == "DECIDED":
+        return "Reply to this message to overrule it."
+    if p["options"]:
+        return "Tap an option, or reply to this message (\"2, but ...\", or a question)."
+    if p.get("category") == "infrastructure":
+        return "Nothing to decide here. Reply \"retry\" once it is fixed, or ask a question."
+    return "Reply to this message with what to do, or ask a question."
 
 
 def send_blocker(root: str, project: str, issue, kind: str, text: str, need: str, options: list[str] | None,
-                 recommended: int | None, config_dir: str | None, bot: Bot | None = None) -> str:
+                 recommended: int | None, config_dir: str | None, bot: Bot | None = None, *, summary: str = "",
+                 labels: list[str] | None = None, category: str = "", situation: str = "", title: str = "",
+                 decided: bool = False) -> str:
     """Send one QUESTION or BLOCKER with a button per option, and remember it so the answer can find its way back
-    to this project. Returns the pending id."""
+    to this project. `text` is the full standard message (behind Details, and what the answer session reads);
+    `title` is the issue's title, shown next to its number.
+    `decided`: the factory took the recommended option itself; the message is a silent note with no buttons that a
+    reply overrules. Returns the pending id."""
     cfg = load_config()
     if not cfg:
         raise TelegramError("the phone is not set up (run `harness phone setup`)")
@@ -188,17 +283,29 @@ def send_blocker(root: str, project: str, issue, kind: str, text: str, need: str
     entry = register_project(root, project, config_dir, bot)
     pid = secrets.token_hex(4)
     options = [o for o in (options or []) if o.strip()]
-    footer = ("\n\nTap an option, or reply to this message (\"2, but ...\", or a question)."
-              if options else "\n\nReply to this message with what to do, or ask a question.")
-    head = f"{KIND_MARK.get(kind.upper(), '')} ".lstrip()
-    mid = bot.send(head + text + footer, entry.get("thread"), blocker_buttons(pid, options, recommended) if options else None)
+    p = {"root": root, "project": project, "issue": issue, "kind": "DECIDED" if decided else kind.upper(), "text": text,
+         "need": need, "options": options, "recommended": recommended, "labels": list(labels or []),
+         "summary": summary, "situation": situation, "category": category, "title": title, "thread": entry.get("thread"),
+         "ts": iso(), "turns": [], "state": "auto" if decided else "open"}
+    p["shown"] = blocker_text(p)
+    also = overview(root)
+    body = p["shown"] + "\n\n" + (also + "\n" if also else "") + footer(p)
+    p["message_id"] = bot.send(body, p["thread"], [details_button(pid)] if decided or not options else blocker_buttons(pid, p),
+                               silent=decided)
     with locked():
         pending = _read("pending.json", {})
-        pending[pid] = {"root": root, "project": project, "issue": issue, "kind": kind.upper(), "text": text,
-                        "need": need, "options": options, "recommended": recommended, "message_id": mid,
-                        "thread": entry.get("thread"), "ts": iso(), "turns": [], "state": "open"}
+        pending[pid] = p
         _write("pending.json", pending)
     return pid
+
+
+def mark_seen(root: str) -> None:
+    """The user tapped or wrote in this project: the "since you last looked" counts start again from now."""
+    with locked():
+        projects = _read("projects.json", {})
+        if root in projects:
+            projects[root]["seen"] = iso()
+            _write("projects.json", projects)
 
 
 def send_text(text: str, root: str | None = None) -> None:
@@ -236,30 +343,48 @@ def ensure_bridge() -> None:
                          stderr=subprocess.STDOUT, start_new_session=True, cwd=str(HOME), env=env)
 
 
-def supervisor_running(root: str) -> bool:
+def supervisor_info(root: str) -> dict | None:
+    """The project's running supervisor ({pid, started, issues}), or None."""
     try:
         info = json.loads((Path(root) / ".factory" / "supervisor.json").read_text())
     except (OSError, ValueError):
-        return False
-    return pid_alive(info.get("pid"))
+        return None
+    return info if isinstance(info, dict) and pid_alive(info.get("pid")) else None
+
+
+def supervisor_running(root: str) -> bool:
+    return supervisor_info(root) is not None
 
 
 def settled_elsewhere(p: dict) -> bool:
     """The issue was queued or started again after the message went out: answered at the computer."""
-    try:
-        lines = (Path(p["root"]) / ".factory" / "log.jsonl").read_text(encoding="utf-8").splitlines()[-2000:]
-    except OSError:
-        return False
-    for line in reversed(lines):
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if str(e.get("ts", "")) <= p["ts"]:
+    return queued_since(p, p["ts"], strict=True)
+
+
+def queued_since(p: dict, since: str, strict: bool = False) -> bool:
+    """Whether the issue was queued or started again after `since` (`strict`: not in that same second)."""
+    for e in log_events(p["root"]):
+        ts = str(e.get("ts", ""))
+        if ts < since or (strict and ts == since):
             return False
         if e.get("issue") == p.get("issue") and e.get("kind") in ("queued", "harness_started"):
             return True
     return False
+
+
+def outcome_line(p: dict, choice: str, since: str) -> str:
+    """What an answered message shows under its text: the choice, the time, and whether the issue runs again."""
+    # A supervisor the answer just started names the issue before it has logged queueing it.
+    starting = p.get("issue") in ((supervisor_info(p["root"]) or {}).get("issues") or [])
+    if not queued_since(p, since) and not starting:
+        again = "Recorded. Not queued again."
+    elif supervisor_running(p["root"]):
+        again = "Queued again: the factory runs it after the issue it is on."
+    else:
+        again = "Queued again, but the factory is not running: it runs when the factory is started."
+    choice = " ".join(choice.split())
+    return f"✓ {'Overruled' if p['state'] == 'auto' else 'Answered'} {time.strftime('%H:%M')}: " \
+           f"{choice if len(choice) <= 80 else choice[:77] + '...'}\n{again}"
 
 
 # --------------------------------------------------------------------------- the bridge
@@ -281,7 +406,7 @@ ANSWER_PROMPT = """You answer the user's phone replies for the software factory 
 in Telegram to this {kind} about issue #{issue}:
 
 {text}
-
+{note}
 Earlier on the phone about it:
 {history}
 
@@ -291,10 +416,11 @@ The user's new message:
 Decide which it is and act:
 - An answer (an option, an option with a tweak, or their own instruction): record it, then resume the issue, exactly as
   /factory does:
-  1. `{h} factory decide --question "<the question, from What I need>" --answer "<their answer, with the tweak>" --by user --kind <product|implementation> [--why "<their reasoning>"]`
+  1. `{h} factory decide --question "<the question, from What I need>" --answer "<their answer, with the tweak>" --by user --kind <product|implementation|process> [--why "<their reasoning>"]`
   2. If the supervisor is running (`{h} factory status` says so): `{h} factory queue {issue}`. If it is not running:
      `{h} factory start --issues {issue}` (it queues the issue itself; don't run both).
   If the answer is "skip it", "not now" or leave it, record it and don't queue.
+  "retry" or "fixed" for a blocker that had nothing to decide: there is nothing to record, only step 2.
 - A question: answer it from the files. `{h} factory status --issue {issue}` shows the full message; the run
   directories are under .harness/runs/ (plan.md, review-*.json, notes-*.md, summary.md) and the issue session logs
   under .factory/sessions/. Don't act on it.
@@ -305,13 +431,24 @@ Reply for a phone screen: plain text, at most 6 short lines, no markdown. The fi
 RESOLVED (you recorded an answer) or OPEN (anything else), and the rest is what the user reads."""
 
 
+AUTO_NOTE = """
+The factory decided this one itself (it took option {k}) and went on with the issue. The user is now overruling it or
+asking about it. To overrule: record their decision as in step 1 (`--by user`; it replaces the assumption). Then look
+at `{h} factory status`: only if the issue is still open and is not being worked on right now, do step 2. Otherwise
+don't queue; say the decision is recorded, that the work so far used the automatic choice, and that changing it
+needs the issue run again or a follow-up issue.
+"""
+
+
 def history_text(turns: list[dict]) -> str:
     return "\n".join(f"- user: {t['user']}\n  you: {t['bot']}" for t in turns) or "(nothing yet)"
 
 
 def answer_command(p: dict, message: str, harness_prefix: str) -> list[str]:
-    prompt = ANSWER_PROMPT.format(project=p["project"], kind=p["kind"], issue=p["issue"], text=p["text"],
-                                  history=history_text(p["turns"]), message=message, h=harness_prefix)
+    note = AUTO_NOTE.format(k=p["recommended"], h=harness_prefix) if p["state"] == "auto" else ""
+    prompt = ANSWER_PROMPT.format(project=p["project"], kind="QUESTION" if p["state"] == "auto" else p["kind"],
+                                  issue=p["issue"], text=p["text"], note=note, history=history_text(p["turns"]),
+                                  message=message, h=harness_prefix)
     allowed = [f"Bash({harness_prefix} factory {sub} *)" for sub in ("decide", "queue", "start", "status")]
     return [os.environ.get("HARNESS_CLAUDE", "claude"), "-p", prompt, "--model", "sonnet",
             "--add-dir", str(PLUGIN_DIR), "--allowedTools", *allowed, "Read", "Grep", "Glob"]
@@ -363,32 +500,41 @@ class Bridge:
         reply_to = (msg.get("reply_to_message") or {}).get("message_id")
         pid, why = self.target(reply_to, thread)
         if pid:
-            self.answer(pid, text, msg["message_id"])
+            self.answer(pid, text, msg["message_id"], text)
         else:
             self.bot.send(why, thread, reply_to=msg["message_id"])
 
     def on_tap(self, q: dict) -> None:
-        m = re.fullmatch(r"a:([0-9a-f]+):(\d)", q.get("data") or "")
+        m = re.fullmatch(r"([ad]):([0-9a-f]+)(?::(\d))?", q.get("data") or "")
         try:
             self.bot.call("answerCallbackQuery", callback_query_id=q["id"])
         except TelegramError:
             pass
         if not m:
             return
-        pid, i = m.group(1), int(m.group(2))
-        p = _read("pending.json", {}).get(pid)
+        pid, p = m.group(2), _read("pending.json", {}).get(m.group(2))
+        if m.group(1) == "d":  # Details: the full standard message, no model
+            if p:
+                mark_seen(p["root"])
+            self.bot.send(p["text"] if p else "That one is no longer on file.", (p or {}).get("thread"),
+                          reply_to=(p or {}).get("message_id"))
+            return
+        i = int(m.group(3) or 0)
         if not p or p["state"] != "open" or not 1 <= i <= len(p["options"]):
             self.bot.send("That one is already settled.", (p or {}).get("thread"))
             return
-        self.answer(pid, f"Option {i}: {p['options'][i - 1]}", None)
+        label = option_label(p, i)
+        self.answer(pid, f"Option {i}: {p['options'][i - 1]}" if label == p["options"][i - 1]
+                    else f"Option {i} ({label}): {p['options'][i - 1]}", None, f"{i}. {label}")
 
     def target(self, reply_to: int | None, thread: int | None) -> tuple[str | None, str]:
         """(the pending id a message is for, "") or (None, why there isn't one, for the user)."""
-        pending = {k: v for k, v in _read("pending.json", {}).items() if v["state"] == "open"}
-        if reply_to:
-            for k, v in pending.items():
-                if v["message_id"] == reply_to or reply_to in v.get("replies", []):
+        every = _read("pending.json", {})
+        if reply_to:  # a reply also reaches a decision the factory took itself (to overrule it)
+            for k, v in every.items():
+                if v["state"] in ("open", "auto") and (v["message_id"] == reply_to or reply_to in v.get("replies", [])):
                     return k, ""
+        pending = {k: v for k, v in every.items() if v["state"] == "open"}
         here = {k: v for k, v in pending.items() if thread is None or v.get("thread") == thread}
         if len(here) == 1:
             return next(iter(here)), ""
@@ -398,23 +544,26 @@ class Bridge:
         return None, f"Several things are waiting ({names}). Reply to the message you're answering."
 
     # ---- answering
-    def answer(self, pid: str, message: str, user_msg: int | None) -> None:
+    def answer(self, pid: str, message: str, user_msg: int | None, choice: str) -> None:
+        """`choice` is what the message shows once this settles it: the option tapped, or the user's words."""
         with self.guard:
             if pid in self.busy:
                 self.bot.send("Still working on your last reply to this one.", None, reply_to=user_msg)
                 return
             self.busy.add(pid)
         p = _read("pending.json", {})[pid]
+        mark_seen(p["root"])
         if len(p["turns"]) >= MAX_TURNS:
             self.busy.discard(pid)
             self.bot.send("That's as far as I go from the phone. Pick it up at the computer with /factory.",
                           p.get("thread"), reply_to=user_msg or p["message_id"])
             return
         self.bot.typing(p.get("thread"))
-        self.spawn(lambda: self._answer(pid, p, message, user_msg))
+        self.spawn(lambda: self._answer(pid, p, message, user_msg, choice))
 
-    def _answer(self, pid: str, p: dict, message: str, user_msg: int | None) -> None:
+    def _answer(self, pid: str, p: dict, message: str, user_msg: int | None, choice: str) -> None:
         entry = _read("projects.json", {}).get(p["root"]) or {}
+        since = iso()
         prefix = " ".join(["python3", str(HARNESS), "--root", p["root"]])
         try:
             r = self.run(answer_command(p, message, prefix), cwd=p["root"], env=project_env(entry), timeout=ANSWER_TIMEOUT)
@@ -436,14 +585,23 @@ class Bridge:
                     cur["state"] = "answered"
                 _write("pending.json", pending)
         if resolved:
-            self.bot.clear_buttons(p["message_id"])
+            self.settle(pid, p, outcome_line(p, choice, since))
         with self.guard:
             self.busy.discard(pid)
+
+    def settle(self, pid: str, p: dict, line: str) -> bool:
+        """Show on the message itself how it ended; only Details stays tappable."""
+        if self.bot.edit(p["message_id"], f"{p.get('shown') or p['text']}\n\n{line}", [details_button(pid)]):
+            return True
+        self.bot.clear_buttons(p["message_id"])
+        return False
 
     # ---- status
     def status(self, thread: int | None, user_msg: int) -> None:
         projects = _read("projects.json", {})
         roots = [r for r, e in projects.items() if thread is None or e.get("thread") == thread]
+        for root in roots:
+            mark_seen(root)
         if not roots:
             self.bot.send("No factory project has talked to this bot yet.", thread, reply_to=user_msg)
             return
@@ -475,12 +633,13 @@ class Bridge:
                     continue
                 if settled_elsewhere(v):
                     v["state"] = "settled"
-                    done.append(v)
+                    done.append((k, v))
                 elif v["ts"] < cutoff:
                     v["state"] = "expired"
             _write("pending.json", pending)
-        for v in done:
-            self.bot.clear_buttons(v["message_id"])
+        for k, v in done:
+            if self.settle(k, v, f"✓ Picked up at the computer {time.strftime('%H:%M')}."):
+                continue
             try:
                 self.bot.send(f"#{v['issue']} was picked up at the computer.", v.get("thread"), reply_to=v["message_id"])
             except TelegramError:
@@ -520,6 +679,8 @@ class KeepAwake:
 
 HELP = ("I pass the factory's questions and blockers to you.\n"
         "- Tap an option, or reply to the message: \"2\", \"2, but keep the old endpoint\", or a question.\n"
+        "- Details: the full message, with the files and logs it points to.\n"
+        "- A note that something was decided for you: reply to it to overrule.\n"
         "- \"status\": where the factory is (in a project's topic: that project; here: all of them).")
 
 

@@ -42,13 +42,33 @@ changes where humans were involved.
    - `ASSUMED: ... | WHY: ...`: record it with `H factory decide --question "<q>" --answer "<a>" --by assumed
      --kind implementation --why "<why>"`, give the answer to whoever asked, and add an `## Assumptions` section
      with the question and answer to the PR draft (`<run_dir>/pr-<repo>.md`) so it is visible in review. Continue.
-   - `ESCALATE: ...`: run `H factory block N --kind QUESTION --situation "<at most 3 sentences>" --need "<the
-     decision>" --option ... --option ... --recommend <k> --detail "<run dir path>"` using its options, then stop.
-     (Use `--kind BLOCKER` when it is an action, not a decision.)
-   If the resolver itself fails or gives no outcome line, treat it as ESCALATE.
-   Do the same as ESCALATE, without trying a workaround, for: a dirty tree you didn't create, changed
-   dependencies, gates still failing after the retries /ship allows, an ESCALATE verdict, two failed fix attempts,
-   a command the guard blocked, or any error you can't fix by following /ship.
+   - `ESCALATE: <category> | IMPACT: <impact> | ...`: run `H factory block N --kind QUESTION --category <category>
+     --impact <impact> --summary "<plain summary>" --situation "<at most 3 sentences>" --need "<the decision>"
+     --option "<choice>" --label "<short name>" --option ... --label ... --recommend <k> --detail "<run dir path>"`
+     using its category, impact and options. What happens next is in the command's output:
+     - It prints `AUTO-ACCEPTED: ...`: the project lets the factory settle this kind of minor question. The issue is
+       **not** blocked and the answer is already recorded. Treat it as ASSUMED with that answer (give it to whoever
+       asked, add it to `## Assumptions` in the PR draft, don't run `factory decide`) and continue.
+     - Otherwise the issue is blocked and the user has been told. Stop.
+   If the resolver itself fails or gives no outcome line, treat it as ESCALATE with `--category product`.
+   Block the same way, without trying a workaround, for: a dirty tree you didn't create, changed dependencies,
+   gates still failing after the retries /ship allows, an ESCALATE verdict, two failed fix attempts, a command the
+   guard blocked, or any error you can't fix by following /ship. Choose the category by what is needed:
+   - Nothing to choose, the factory's own tooling is in the way (dirty tree, refused command, failed push, an error
+     in the harness): `--category infrastructure`, no options, the action in `--need`. It reaches the user as a
+     report, never as a question.
+   - A choice about how to handle this issue (accept the findings or run another round, what evidence is enough):
+     `--category process` with `--impact`, options and a recommendation.
+   - A choice about the product or the code: `product`, or `implementation` with `--impact`.
+   **Write the message for someone reading it on a phone who cannot open the repo.** `H factory block` refuses a
+   message that breaks these:
+   - `--summary`: 1 or 2 plain sentences a non-engineer could answer from: what the choice changes for the product
+     or the people using it, and what happens if they take the recommendation. No file names, paths, line numbers,
+     AC numbers or code formatting; describe the thing instead of naming its identifier.
+   - `--label`: one per `--option`, in the same order, at most 35 characters, readable with nothing around it
+     ("Tests + I check screenshots", "I pick the visual cue"). The `--option` text is the longer description.
+   - `--situation` and `--detail` are where file paths, AC numbers and identifiers go; the user sees them only when
+     they ask for details.
    **A refused command is not a blocker yet.** Before blocking on one (yours or an engineer's `NEEDS USER: ...
    denied`), look for an allowed way to run the same thing: a `package.json` script (`npm run *` is pre-approved,
    so `npm run format:check` instead of `npx prettier --check .`), a Makefile target or `scripts/*` entry, or the
