@@ -5522,7 +5522,9 @@ def event_line(e: dict) -> str | None:
         "message": lambda: f"{e.get('message_kind')} #{n}: {e.get('text', '')}".rstrip(": "),
         "usage_pause": lambda: "paused for plan usage" + (
             f" until {dt.datetime.fromtimestamp(e['resume_at']).strftime('%H:%M')}" if e.get("resume_at") else ""),
-        "usage_resume": lambda: "usage back, resuming",
+        "usage_resume": lambda: "settings changed, re-checking usage" if e.get("why") else "usage back, resuming" + (
+            f" ({e['late_min']} min after the reset: the machine was asleep)" if e.get("late_min") else ""),
+        "setting_changed": lambda: f"{e.get('setting')} switched {'on' if e.get('on') else 'off'}",
         "usage_unknown": lambda: f"usage unreadable ({e.get('count')} in a row)",
         "orphan_blocked": lambda: f"#{n} was in progress when the factory stopped: blocked",
         "usage_requeued": lambda: f"#{n} stopped at the plan usage limit: back to todo, retried after the reset",
@@ -5956,6 +5958,37 @@ def acquire_supervisor(issues: list[int]) -> None:
 def release_supervisor() -> None:
     (ROOT / ".factory" / "supervisor.json").unlink(missing_ok=True)
     (ROOT / ".factory" / "stop").unlink(missing_ok=True)
+    (ROOT / ".factory" / "run-settings.json").unlink(missing_ok=True)
+
+
+# The running supervisor's switchable settings, in .factory/run-settings.json: written at start from the flags and
+# [factory], changed by `factory set`, re-read by the loop before each issue and during usage waits.
+RUN_SETTINGS = {"nighttime": "nighttime", "auto-queue": "auto_queue", "until-limit": "until_limit"}
+
+
+def start_settings(a, fc: dict) -> dict:
+    return {"nighttime": bool(getattr(a, "nighttime", False) or fc.get("nighttime", False)),
+            "auto_queue": bool(getattr(a, "auto_queue", False)), "until_limit": bool(getattr(a, "until_limit", False)),
+            "merge": a.merge}
+
+
+def run_settings(fallback: dict | None = None) -> dict:
+    s = read_json(ROOT / ".factory" / "run-settings.json", None)
+    return s if isinstance(s, dict) else dict(fallback or {})
+
+
+def cmd_factory_set(a, cfg):
+    """Switch a setting of the running factory; it applies before the next issue (and wakes a usage pause)."""
+    if not supervisor_info():
+        sys.exit("no factory is running; pass the flag to `factory start` instead (e.g. --nighttime)")
+    s = run_settings()
+    key, on = RUN_SETTINGS[a.setting], a.value == "on"
+    if key == "auto_queue" and on and s.get("merge") != "auto":
+        sys.exit("auto-queue needs merge auto, and this run merges manually: the next issue would start on unmerged code.")
+    s[key] = on
+    (ROOT / ".factory" / "run-settings.json").write_text(json.dumps(s))
+    factory_log({"kind": "setting_changed", "setting": a.setting, "on": on})
+    print(f"{a.setting} {a.value}: applies before the next issue")
 
 
 def cmd_factory_start(a, cfg):
@@ -5982,6 +6015,8 @@ def cmd_factory_start(a, cfg):
         cmd += ["--until-limit"]
     if a.auto_queue:
         cmd += ["--auto-queue"]
+    if a.nighttime:
+        cmd += ["--nighttime"]
     if shutil.which("caffeinate"):
         cmd = ["caffeinate", "-i", *cmd]
     with open(d / "supervisor.log", "a", encoding="utf-8") as out:
@@ -6054,6 +6089,10 @@ def cmd_factory_status(a, cfg):
     if info:
         mins = int((time.time() - info["started"]) / 60)
         print(f"supervisor: running (pid {info['pid']}, {mins} min)" + ("; stopping after the current issue" if (d / "stop").exists() else ""))
+        rs = run_settings()
+        if rs:
+            print("settings: " + ", ".join(f"{name} {'on' if rs.get(key) else 'off'}" for name, key in RUN_SETTINGS.items())
+                  + f", merge {rs.get('merge', '?')}")
     else:
         print("supervisor: not running")
     fc = cfg.get("factory") or {}
@@ -6228,6 +6267,7 @@ def cmd_factory_run(a, cfg):
         print(f"{len(pool)} issue(s) could run now: " + (", ".join(f"#{p['number']} {p['title']}" for p in pool) or "none"))
         return
     acquire_supervisor(a.issues or [])
+    (ROOT / ".factory" / "run-settings.json").write_text(json.dumps(start_settings(a, fc)))
     phone_start(cfg)
     why = "error"
     try:
@@ -6341,9 +6381,20 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
     plugin_root = str(Path(__file__).resolve().parent.parent)
     if "--add-dir" not in claude_args:  # headless sessions must read the plugin's skills (/ship) and agents
         claude_args += ["--add-dir", plugin_root]
-    limits = {"five_hour": float(fc.get("max_five_hour", 85)), "seven_day": float(fc.get("max_weekly", 90))}
-    if getattr(a, "until_limit", False):  # opt-in: work until a window is really full, then pause until it resets
-        limits = {"five_hour": 100.0, "seven_day": 100.0}
+    started = start_settings(a, fc)
+
+    def settings():
+        return {**started, **run_settings()}
+
+    def limits():
+        if settings()["until_limit"]:  # opt-in: work until a window is really full, then pause until it resets
+            return {"five_hour": 100.0, "seven_day": 100.0}
+        return {"five_hour": float(fc.get("max_five_hour", 85)), "seven_day": float(fc.get("max_weekly", 90))}
+
+    def unknown_window():  # minutes of unreadable usage before the factory stops
+        if settings()["nighttime"]:
+            return float(fc.get("nighttime_unknown_hours", 6)) * 60
+        return float(fc.get("unknown_minutes", 30))
 
     def ask_selector(pool):
         command, sid = metered_command("-p", "Pick the next issue. Candidates:\n" + json.dumps(pool, indent=1),
@@ -6518,18 +6569,23 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
         set_issue_state(slug, n, "todo")
 
     refill = None
-    if getattr(a, "auto_queue", False):
-        refill = fl.make_refill(fetch, planned_issue_numbers, promote, discover, factory_log,
-                                max_rounds=int(fc.get("auto_queue_rounds", 3)))
-        factory_log({"kind": "auto_queue_on"})
+    if a.merge == "auto":  # built for every auto-merge run, so `factory set auto-queue on` can switch it on mid-run
+        auto = fl.make_refill(fetch, planned_issue_numbers, promote, discover, factory_log,
+                              max_rounds=int(fc.get("auto_queue_rounds", 3)))
+        refill = lambda: settings()["auto_queue"] and auto()
+        if started["auto_queue"]:
+            factory_log({"kind": "auto_queue_on"})
 
     def read_usage():
-        return usage.check(limits, config_dir=project_account_dir(cfg))
+        return usage.check(limits(), config_dir=project_account_dir(cfg))
+
+    def gate():
+        return fl.usage_gate(read_usage, log=factory_log, unknown_minutes=unknown_window, wake=fl.changed(settings))
 
     summary = fl.run_loop(
         after_issue=cleanup, park=park, refill=refill,
         land_pr=make_lander() if a.merge == "auto" else None,
-        gate=lambda: fl.usage_gate(read_usage, log=factory_log, unknown_minutes=float(fc.get("unknown_minutes", 30))),
+        gate=gate,
         usage_hit=lambda: read_usage().get("decision") == "pause",
         fetch_issues=fetch, select=lambda pool: fl.choose(pool, ask_selector),
         set_state=lambda n, st: set_issue_state(slug, n, st), run_issue=run_issue,
@@ -7113,6 +7169,7 @@ def main(argv=None):
     f.add_argument("--dry-run", action="store_true", help="only show what could run")
     f.add_argument("--until-limit", action="store_true", help="ignore the [factory] usage caps and keep going until the plan limit itself is hit")
     f.add_argument("--auto-queue", action="store_true", help="when the queue is empty, queue the factory's own planned and backlog issues, then discover new ones from the project documents. Off by default; this run only")
+    f.add_argument("--nighttime", action="store_true", help="unattended run: tolerate unreadable usage for [factory] nighttime_unknown_hours before stopping")
     f.add_argument("--repo")
     f.set_defaults(fn=cmd_factory_run)
     f = fsub.add_parser("start", help="start the factory loop detached and return (what /factory uses)")
@@ -7121,8 +7178,13 @@ def main(argv=None):
     f.add_argument("--merge", choices=["manual", "auto"], help="auto (default): wait for CI and squash-merge each PR when green; manual: leave PRs for the user")
     f.add_argument("--until-limit", action="store_true", help="ignore the [factory] usage caps and keep going until the plan limit itself is hit")
     f.add_argument("--auto-queue", action="store_true", help="when the queue is empty, queue the factory's own planned and backlog issues, then discover new ones from the project documents. Off by default; this run only")
+    f.add_argument("--nighttime", action="store_true", help="unattended run: tolerate unreadable usage for [factory] nighttime_unknown_hours before stopping")
     f.add_argument("--repo")
     f.set_defaults(fn=cmd_factory_start)
+    f = fsub.add_parser("set", help="switch a setting of the running factory; applies before the next issue")
+    f.add_argument("setting", choices=list(RUN_SETTINGS))
+    f.add_argument("value", choices=["on", "off"])
+    f.set_defaults(fn=cmd_factory_set)
     f = fsub.add_parser("docs", help="record the MVP (and vision) documents that auto-queue discovers work from")
     f.add_argument("mvp")
     f.add_argument("--vision")

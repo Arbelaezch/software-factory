@@ -334,6 +334,12 @@ Usage gate
 - An issue whose session ends without an outcome while usage is over the cap most likely ran into the limit.
   It goes back to `todo` (logged as `usage_requeued`) and runs again after the reset, once per run; a second
   failure blocks it as usual.
+- Nighttime mode (`factory start --nighttime`, or `[factory] nighttime = true`) is for unattended runs: unreadable
+  usage stops the factory only after `nighttime_unknown_hours` (default 6). A resume that came more than 10
+  minutes after the reset logs `late_min` (the Mac was asleep), so the night can be checked in the morning.
+- Run settings (`nighttime`, `auto-queue`, `until-limit`) live in `.factory/run-settings.json` while a supervisor
+  runs. `factory set <setting> on|off` changes them without a restart: the loop re-reads them before each issue
+  and at each usage reading, and a usage wait ends early when they change. `factory status` shows them.
 - The factory runs as a long-lived process on my Mac under `caffeinate`. If the lid closes it pauses and
   resumes when the machine wakes. A supervisor lock whose pid is dead, or was reused by a process started
   after the lock was written (a reboot), is cleared on the next start.

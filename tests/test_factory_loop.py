@@ -100,6 +100,38 @@ class GateTests(unittest.TestCase):
     def test_a_past_reset_time_still_waits_the_retry_interval(self):
         self.assertEqual(self.gate([{"decision": "pause", "resume_at": 10.0}, {"decision": "go"}])[1], [60])
 
+    def test_a_late_resume_after_machine_sleep_is_logged(self):
+        _, _, events = self.gate([{"decision": "pause", "resume_at": 4600.0}, {"decision": "go"}], jumps={0: 4 * 3600})
+        self.assertEqual(events[-1], {"kind": "usage_resume", "late_min": 184})  # woke at 15700, reset + buffer at 4660
+
+    def test_a_settings_change_ends_a_pause_early(self):
+        changed = iter([False, False, True])
+        out, sleeps, events = self.gate([{"decision": "pause", "resume_at": 9000.0}, {"decision": "go"}],
+                                        wake=lambda: next(changed))
+        self.assertEqual((out, sleeps), ("go", [300, 300]))
+        self.assertEqual(events[-1], {"kind": "usage_resume", "why": "settings changed"})
+
+    def test_changed_fires_once_per_change(self):
+        value = [1]
+        wake = fl.changed(lambda: value[0])
+        self.assertFalse(wake())
+        value[0] = 2
+        self.assertEqual((wake(), wake()), (True, False))  # a second wait after the change sleeps normally
+
+    def test_the_unknown_window_is_read_at_each_reading(self):
+        window = [30]
+        readings = iter([{"decision": "unknown"}] * 10 + [{"decision": "go"}])
+
+        def check():  # nighttime switched on after the first unreadable reading
+            r = next(readings)
+            window[0] = 360
+            return r
+
+        clock = [1000.0]
+        out = fl.usage_gate(check, sleep=lambda t: clock.__setitem__(0, clock[0] + t), now=lambda: clock[0],
+                            unknown_minutes=lambda: window[0])
+        self.assertEqual(out, "go")  # with 30 minutes it would have stopped at the sixth reading
+
     def test_pause_without_reset_time_retries_later(self):
         self.assertEqual(self.gate([{"decision": "pause"}, {"decision": "go"}])[1], [60])
 
@@ -446,10 +478,11 @@ class AutoQueueWiringTests(unittest.TestCase):
             h.cmd_factory_run(a, {})
         self.assertIn("--merge auto", str(cm.exception))
 
-    def test_empty_queue_runs_discovery_files_todo_issues_and_runs_them(self):
-        import os
+    def discovery_run(self, auto_queue=True, on_check=None):
+        """A full `factory run` against a fake claude and gh. `on_check(root, n)` runs at each usage reading."""
         import tempfile
         import types
+        checks = []
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "proj"
             (root / ".factory").mkdir(parents=True)
@@ -485,8 +518,15 @@ echo "args: $@"
             def set_state(slug, n, st):
                 issues[n] = (issues[n] - set(fl.STATE_LABELS)) | {st}
 
-            usage = types.SimpleNamespace(check=lambda limits, **kw: {"decision": "go"})
-            a = mock.Mock(merge="auto", issues=None, dry_run=False, max_issues=5, repo=None, auto_queue=True, until_limit=False)
+            def check(limits, **kw):
+                checks.append(limits)
+                if on_check:
+                    on_check(root, len(checks))
+                return {"decision": "go"}
+
+            usage = types.SimpleNamespace(check=check)
+            a = mock.Mock(merge="auto", issues=None, dry_run=False, max_issues=5, repo=None, auto_queue=auto_queue,
+                          until_limit=False, nighttime=False)
             env = {"HARNESS_CLAUDE": str(fake), "SOFTWARE_FACTORY_HOME": tmp, "CLAUDE_CONFIG_DIR": tmp}
             with mock.patch.dict("os.environ", env), mock.patch.object(h, "ROOT", root), \
                     mock.patch.object(h, "factory_repo", lambda a, c: "o/r"), \
@@ -499,7 +539,13 @@ echo "args: $@"
             events = [json.loads(x) for x in (root / ".factory" / "log.jsonl").read_text().splitlines()]
             discovers = [f.read_text() for f in (root / ".factory" / "sessions").glob("discover-*.log")]
             issue_runs = list((root / ".factory" / "sessions").glob("issue-7-*.log"))
+            settings_left = (root / ".factory" / "run-settings.json").exists()
+        return events, created, discovers, issue_runs, checks, settings_left
+
+    def test_empty_queue_runs_discovery_files_todo_issues_and_runs_them(self):
+        events, created, discovers, issue_runs, _, settings_left = self.discovery_run()
         kinds = [e["kind"] for e in events]
+        self.assertFalse(settings_left)  # the run's settings go with the supervisor
         self.assertEqual(created, [{"enhancement", "todo"}])  # filed ready to run
         self.assertEqual(len(discovers), 2)  # one round that found an issue, one that found nothing
         self.assertTrue(all("--agent harness:factory-discoverer" in d for d in discovers))
@@ -509,6 +555,21 @@ echo "args: $@"
         self.assertEqual([e["source"] for e in events if e["kind"] == "auto_queued"], ["discovered"])
         self.assertIn("auto_queue_exhausted", kinds)
         self.assertEqual(kinds.count("harness_started"), 1)
+
+    def test_auto_queue_off_ends_the_run_when_the_queue_is_empty(self):
+        events, created, discovers, issue_runs, _, _ = self.discovery_run(auto_queue=False)
+        self.assertEqual((created, discovers, issue_runs), ([], [], []))
+        self.assertNotIn("auto_queue_on", [e["kind"] for e in events])
+
+    def test_settings_switched_mid_run_apply_to_the_next_reading_and_refill(self):
+        def switch(root, n):  # `factory set auto-queue on` and `until-limit on`, while the first gate is reading
+            if n == 1:
+                f = root / ".factory" / "run-settings.json"
+                f.write_text(json.dumps({**json.loads(f.read_text()), "auto_queue": True, "until_limit": True}))
+        events, created, discovers, issue_runs, checks, _ = self.discovery_run(auto_queue=False, on_check=switch)
+        self.assertEqual(checks[0], {"five_hour": 85.0, "seven_day": 90.0})
+        self.assertEqual(checks[-1], {"five_hour": 100.0, "seven_day": 100.0})
+        self.assertEqual((created, len(issue_runs)), ([{"enhancement", "todo"}], 1))  # auto-queue found and ran #7
 
     def test_docs_are_recorded_for_discovery(self):
         import tempfile
@@ -775,6 +836,28 @@ class FrontDoorTests(unittest.TestCase):
         for r in (mock.Mock(returncode=1, stdout=""), mock.Mock(returncode=0, stdout="junk")):
             with mock.patch.object(h.subprocess, "run", lambda *a, **k: r):
                 self.assertIsNone(h.process_age(1))
+
+    def test_factory_set_switches_a_running_supervisors_settings(self):
+        import os
+        settings = self.root / ".factory" / "run-settings.json"
+        with self.assertRaises(SystemExit) as cm:
+            h.cmd_factory_set(mock.Mock(setting="nighttime", value="on"), {})
+        self.assertIn("no factory is running", str(cm.exception))
+        h.acquire_supervisor([])
+        settings.write_text(json.dumps({"nighttime": False, "auto_queue": False, "until_limit": False, "merge": "manual"}))
+        with self.assertRaises(SystemExit) as cm:
+            h.cmd_factory_set(mock.Mock(setting="auto-queue", value="on"), {})
+        self.assertIn("merges manually", str(cm.exception))
+        with contextlib.redirect_stdout(io.StringIO()):
+            h.cmd_factory_set(mock.Mock(setting="nighttime", value="on"), {})
+            h.cmd_factory_set(mock.Mock(setting="auto-queue", value="off"), {})  # off is always allowed
+        self.assertEqual(json.loads(settings.read_text()),
+                         {"nighttime": True, "auto_queue": False, "until_limit": False, "merge": "manual"})
+        events = [json.loads(x) for x in (self.root / ".factory" / "log.jsonl").read_text().splitlines()]
+        self.assertIn({"setting": "nighttime", "on": True}, [{k: e.get(k) for k in ("setting", "on")} for e in events])
+        self.assertEqual(h.event_line({"kind": "setting_changed", "setting": "nighttime", "on": True}), "nighttime switched on")
+        h.release_supervisor()
+        self.assertFalse(settings.exists())
 
     def test_stop_is_graceful_by_default_and_signals_with_now(self):
         import os
