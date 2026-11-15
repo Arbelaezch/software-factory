@@ -226,6 +226,7 @@ ci_poll = 30              # seconds between CI checks
 ci_timeout = 1800         # give up waiting for CI after this many seconds
 allowed_tools = []        # extra Bash(...) rules for issue sessions; set per project, see docs/factory-allowlist.md
 ci_grace = 90             # seconds to wait for checks to appear before treating the repo as having no CI
+max_runs_per_issue = 3    # most sessions one issue gets per run; it is picked again each time it is re-queued (answered blocker), up to this
 auto_queue_rounds = 3     # with --auto-queue: discovery rounds per run (a round that finds nothing ends auto-queue)
 auto_queue_per_round = 5  # with --auto-queue: most issues one discovery round may file
 phone = true              # send QUESTION / BLOCKER messages to the phone once `harness phone setup` is done (one bot for every project)

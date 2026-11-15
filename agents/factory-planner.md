@@ -34,6 +34,10 @@ Draft the issues:
   source, so the engineer and the `question-resolver` find it where they work.
 - **Dependencies only where real**: issue B cannot be built or tested without A merged. Prefer fewer. The
   factory builds sequentially, so a long chain is slow, but a wrong guess forces rework; when unsure, depend.
+- **Issues that already exist** (a project that already has some) are pointed at by number, in one of two fields:
+  `depends_on_issues` (this issue cannot be built until that one is merged; becomes a `Depends on #N` line) or
+  `related_issues` (context only; becomes a `Related to #N` line). Every open issue you name as `#N` in a body or
+  criterion must be in exactly one of them; the dry run rejects the list otherwise. Prose decides nothing.
 - **Stay inside the MVP.** Anything the documents defer is not an issue. Put it in `notes`.
 - **A question the documents still don't settle** goes in `notes` with the issue it affects. Don't invent an
   answer in an issue body.
@@ -53,6 +57,8 @@ Write `issues.json` to the output path:
       "body": "Why this exists and what is in scope, 2 to 6 sentences. Name the files or areas you expect, the decisions that apply, and what is out of scope.",
       "acceptance": ["Observable criterion", "Another"],
       "depends_on": ["other-key"],
+      "depends_on_issues": [],
+      "related_issues": [],
       "labels": ["enhancement"]
     }
   ]

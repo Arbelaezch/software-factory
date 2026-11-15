@@ -25,10 +25,19 @@ For each concern, check quickly (a few reads or greps, not an investigation):
 
 Write the survivors to the output path as a JSON list, at most 5 items, most important first:
 `[{"title": "<imperative, specific, under 80 chars>", "body": "<what and where, why it matters, how to tell it is
-fixed (acceptance criteria as a short list)>"}]`. If none survive, write `[]`. Keep bodies self-contained: the
-reader has not seen this run. When a criterion names a command, use the repo's own script (`npm run
-format:check`), not the raw tool (`npx prettier --check .`), which factory sessions are refused. The factory adds
-the link back to the issue and the `backlog` label.
+fixed (acceptance criteria as a short list)>", "depends_on_issues": [], "related_issues": []}]`. If none survive,
+write `[]`.
+
+Existing issues go in one of the two fields, by number. `depends_on_issues`: the item cannot be built or tested
+until that issue is merged (it becomes a `Depends on #N` line and the factory won't start the item before then).
+`related_issues`: context only (it becomes a `Related to #N` line; nothing waits). Prose decides nothing. Every
+open issue you name as `#N` in a body must be in exactly one of the two fields, or the list is rejected and you are
+asked to fix it; an item still wrong after that is not filed. The issue this run worked on is the exception: the
+factory links it, so leave it out of both fields unless the item truly depends on it.
+
+Keep bodies self-contained: the reader has not seen this run. When a criterion names a command, use the repo's own
+script (`npm run format:check`), not the raw tool (`npx prettier --check .`), which factory sessions are refused.
+The factory adds the link back to the issue and the `backlog` label.
 
 Rules: read-only except the output file; never commit, push, comment or create issues; stop after about 25 tool
 calls and write what you have.

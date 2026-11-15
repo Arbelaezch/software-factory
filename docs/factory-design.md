@@ -383,8 +383,16 @@ When the pool is empty the loop calls a refill step, in this order, and goes on 
    cut), files it with the `todo` label and logs `discovered`. No documents recorded means no discovery.
 
 Limits: `auto_queue_rounds` discovery rounds per run (default 3); a round that finds nothing ends auto-queue for the
-run, which is the normal way a run finishes; `--max-issues` still caps the total; the usage gate, blockers and the
-one-attempt-per-issue rule are unchanged. Every step is logged (`auto_queue_on`, `auto_queued` with its source,
+run, which is the normal way a run finishes; `--max-issues` still caps the total; the usage gate and blockers are
+unchanged. An issue that is `todo` again after its session (a blocker answered and re-queued mid-run) is picked again
+before any refill, at most `max_runs_per_issue` times per run (default 3); issues left over by that cap are logged
+(`issues_skipped`), named in the stop line, and hold back refill and discovery. A drafted issue (discovered,
+planned or a cleanup backlog item) points at existing issues by number in one of two fields: `depends_on_issues` becomes `Depends on #N` lines,
+so a follow-up waits for unfinished work, and `related_issues` becomes `Related to #N` lines, which nothing waits for.
+Validation rejects a number that is not an issue and any open issue the text names as `#N` without listing it in one
+of the fields; a rejected discovery draft or cleanup list goes back to its agent once with the problems (a discovery draft still
+invalid after that ends auto-queue with "discovery failed", not "nothing left to build") (cleanup items still
+wrong after that are dropped, logged as `cleanup_rejected`; the issue the cleanup ran for needs no listing). Every step is logged (`auto_queue_on`, `auto_queued` with its source,
 `discovered`, `auto_queue_exhausted`) and shown in `factory status` events, but none wake the manager. Anything the
 documents leave open goes in the discoverer's `notes`, not into an invented issue. A refill failure is logged and ends
 the run cleanly.
