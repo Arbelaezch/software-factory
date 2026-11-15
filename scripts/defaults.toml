@@ -217,7 +217,7 @@ long_cache_read = 0.05
 [factory]
 max_five_hour = 85     # pause at this % of the 5-hour usage window
 max_weekly = 90         # pause at this % of the weekly window
-unknown_limit = 3       # unreadable usage this many times in a row stops the factory
+unknown_minutes = 30    # unreadable usage for this long (retries back off) stops the factory
 claude_args = ["--permission-mode", "acceptEdits"]   # passed to every headless session the factory starts
 merge = "auto"            # "auto": wait for CI, then squash-merge each PR (one ci-fixer attempt on a failure); "manual": stop at awaiting-merge. /ship is always manual
 ci_poll = 30              # seconds between CI checks
