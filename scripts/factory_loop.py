@@ -101,6 +101,13 @@ def parse_pick(text: str, allowed: set[int]) -> tuple[int, str] | None:
     return (int(n), reason.strip() or "no reason given") if int(n) in allowed else None
 
 
+FALLBACK = "fallback:"  # how a pick's reason starts when it was not a judgement (no selector answer, or no data)
+
+
+def is_fallback(reason: str) -> bool:
+    return (reason or "").strip().lower().startswith(FALLBACK)
+
+
 def choose(pool: list[dict], ask: Callable[[list[dict]], str | None]) -> tuple[int, str]:
     """One candidate needs no judgement. Otherwise ask the selector; on any failure take the lowest number."""
     if len(pool) == 1:
@@ -109,7 +116,26 @@ def choose(pool: list[dict], ask: Callable[[list[dict]], str | None]) -> tuple[i
         picked = parse_pick(ask(pool) or "", {p["number"] for p in pool})
     except Exception:  # a broken selector must not stop the factory
         picked = None
-    return picked or (pool[0]["number"], "selector unavailable or invalid; lowest number")
+    return picked or (pool[0]["number"], f"{FALLBACK} selector unavailable or invalid; lowest number")
+
+
+def selector_brief(pool: list[dict], issues: list[dict], body_chars: int = 1500) -> dict:
+    """Everything the selector needs to order the pool, so it needs no GitHub access: each candidate with its body
+    (cut to `body_chars`) and `unblocks`, the open issues whose `Depends on` lines name it; and the open issues
+    awaiting merge."""
+    by = {i["number"]: i for i in issues}
+    opened = [i for i in issues if str(i.get("state", "")).upper() == "OPEN"]
+
+    def body(n: int) -> str:
+        text = (by.get(n, {}).get("body") or "").strip()
+        return text if len(text) <= body_chars else text[:body_chars] + " [cut]"
+
+    return {
+        "candidates": [{**p, "unblocks": sorted(i["number"] for i in opened if p["number"] in parse_depends(i.get("body"))),
+                        "body": body(p["number"])} for p in pool],
+        "awaiting_merge": [{"number": i["number"], "title": i.get("title", "")}
+                           for i in sorted(opened, key=lambda x: x["number"]) if "awaiting-merge" in label_names(i)],
+    }
 
 
 def sleep_until(deadline: float, sleep: Callable[[float], None] = time.sleep, now: Callable[[], float] = time.time,
@@ -322,7 +348,8 @@ def run_loop(*, gate: Callable[[], str], fetch_issues: Callable[[], list[dict]],
             break
         n, reason = select(pool)
         runs[n] = runs.get(n, 0) + 1
-        log({"kind": "issue_picked", "issue": n, "reason": reason, "pool": [p["number"] for p in pool]})
+        log({"kind": "issue_picked", "issue": n, "reason": reason, "pool": [p["number"] for p in pool],
+             **({"fallback": True} if is_fallback(reason) else {})})
         set_state(n, "in-progress")
         log({"kind": "harness_started", "issue": n})
         code = run_issue(n)
