@@ -324,11 +324,19 @@ How it is built (step 5, decided 2026/11/06)
   `claude_args` passed to each headless session; it defaults to `--permission-mode acceptEdits`).
 
 Usage gate
-- Uses `scripts/usage.py`. Defaults: pause at 85% of the 5-hour window and 90% of the weekly window. `factory start --until-limit` (opt-in, per run) raises both caps to 100%: it works until the plan limit is really hit, then pauses until the window resets. An issue running when the limit hits may fail and be blocked.
-- Checked before every harness launch, and inside a run from the `rate_limit_event` in its stream output.
-- Pausing is silent. The factory sleeps until `resume_at` and continues without prompting.
+- Uses `scripts/usage.py`. Defaults: pause at 85% of the 5-hour window and 90% of the weekly window. `factory start --until-limit` (opt-in, per run) raises both caps to 100%: it works until the plan limit is really hit, then pauses until the window resets. An issue cut off by the limit goes back to `todo` and is retried once after the reset.
+- Checked before every harness launch, and again when an issue's session ends without an outcome (see below).
+- Pausing is silent. The factory sleeps until `resume_at` and continues without prompting. It sleeps in 5-minute
+  steps against the wall clock, because one long sleep does not count the time the Mac is asleep: a pause
+  across a closed lid used to end hours late (court-vision 2026/11/12 and 11/13 never resumed by themselves).
+- Unreadable usage retries with a growing wait (1, 2, 4, 8, then 15 minutes) and stops the factory with a
+  blocker only after `[factory] unknown_minutes` (default 30) without a reading.
+- An issue whose session ends without an outcome while usage is over the cap most likely ran into the limit.
+  It goes back to `todo` (logged as `usage_requeued`) and runs again after the reset, once per run; a second
+  failure blocks it as usual.
 - The factory runs as a long-lived process on my Mac under `caffeinate`. If the lid closes it pauses and
-  resumes when the machine wakes.
+  resumes when the machine wakes. A supervisor lock whose pid is dead, or was reused by a process started
+  after the lock was written (a reboot), is cleared on the next start.
 
 Selector. `issue-selector` reads the `todo` pool, dependencies and the files each issue is likely to touch,
 and picks the next issue with a one-line reason logged. It is advisory about order only. It cannot pick

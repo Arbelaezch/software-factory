@@ -72,30 +72,51 @@ class SelectorTests(unittest.TestCase):
 
 
 class GateTests(unittest.TestCase):
-    def gate(self, readings, now=1000.0, **kw):
+    def gate(self, readings, now=1000.0, jumps=None, **kw):
+        """`jumps` maps a sleep's index to extra seconds the clock moves during it (a Mac asleep with the lid shut)."""
         it = iter(readings)
-        sleeps, events = [], []
-        out = fl.usage_gate(lambda: next(it), sleep=sleeps.append, now=lambda: now, log=events.append, **kw)
+        clock, sleeps, events = [now], [], []
+
+        def sleep(s):
+            clock[0] += s + (jumps or {}).get(len(sleeps), 0)
+            sleeps.append(s)
+
+        out = fl.usage_gate(lambda: next(it), sleep=sleep, now=lambda: clock[0], log=events.append, **kw)
         return out, sleeps, events
 
     def test_go(self):
         self.assertEqual(self.gate([{"decision": "go"}])[0], "go")
 
-    def test_pause_sleeps_until_reset_plus_buffer_then_continues(self):
+    def test_pause_sleeps_until_reset_plus_buffer_in_steps_then_continues(self):
         out, sleeps, events = self.gate([{"decision": "pause", "resume_at": 1600.0, "reasons": ["x"]}, {"decision": "go"}])
-        self.assertEqual((out, sleeps), ("go", [660.0]))
+        self.assertEqual((out, sleeps), ("go", [300, 300, 60.0]))
         self.assertEqual([e["kind"] for e in events], ["usage_pause", "usage_resume"])
+
+    def test_a_machine_sleep_during_a_pause_does_not_delay_the_resume(self):
+        # the first step's sleep lasted 4 hours of wall-clock time: the gate re-checks at once
+        out, sleeps, _ = self.gate([{"decision": "pause", "resume_at": 4600.0}, {"decision": "go"}], jumps={0: 4 * 3600})
+        self.assertEqual((out, sleeps), ("go", [300]))
+
+    def test_a_past_reset_time_still_waits_the_retry_interval(self):
+        self.assertEqual(self.gate([{"decision": "pause", "resume_at": 10.0}, {"decision": "go"}])[1], [60])
 
     def test_pause_without_reset_time_retries_later(self):
         self.assertEqual(self.gate([{"decision": "pause"}, {"decision": "go"}])[1], [60])
 
-    def test_unknown_three_times_in_a_row_stops(self):
-        out, sleeps, _ = self.gate([{"decision": "unknown"}] * 3)
-        self.assertEqual((out, sleeps), ("stop", [60, 60]))
+    def test_unknown_retries_with_a_growing_wait_and_stops_after_the_window(self):
+        out, sleeps, events = self.gate([{"decision": "unknown"}] * 10, unknown_minutes=30)
+        self.assertEqual(out, "stop")
+        self.assertEqual(sleeps, [60, 120, 240, 300, 180, 300, 300, 300])  # 60, 120, 240, 480, 900 in 300s steps
+        self.assertEqual([e["count"] for e in events if e["kind"] == "usage_unknown"], [1, 2, 3, 4, 5, 6])
 
-    def test_unknown_counter_resets(self):
+    def test_a_short_unreadable_spell_recovers(self):
         unknown = {"decision": "unknown"}
-        out, _, _ = self.gate([unknown, unknown, {"decision": "pause", "resume_at": 1100.0}, unknown, unknown, {"decision": "go"}])
+        self.assertEqual(self.gate([unknown] * 4 + [{"decision": "go"}])[0], "go")
+
+    def test_unknown_window_restarts_after_a_good_reading(self):
+        unknown = {"decision": "unknown"}
+        out, _, _ = self.gate([unknown] * 5 + [{"decision": "pause", "resume_at": 1100.0}] + [unknown] * 5 + [{"decision": "go"}],
+                              unknown_minutes=30)
         self.assertEqual(out, "go")
 
 
@@ -294,6 +315,24 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(calls["states"][0], (1, "blocked"))
         self.assertEqual(calls["blockers"][0][0], 1)
         self.assertEqual(calls["ran"], [2])
+
+    def test_a_session_cut_off_by_the_usage_limit_is_requeued_once(self):
+        result, calls, labels = self.make([issue(1), issue(2)], {2: "awaiting-merge"}, usage_hit=lambda: True)
+        self.assertEqual(calls["ran"], [1, 1, 2])  # back in the pool after the gate's pause, then blocked the second time
+        self.assertEqual([r["outcome"] for r in result["results"]], ["requeued", "blocked", "awaiting-merge"])
+        self.assertIn((1, "todo"), calls["states"])
+        self.assertEqual([b[0] for b in calls["blockers"]], [1])
+        self.assertEqual([e["issue"] for e in calls["log"] if e["kind"] == "usage_requeued"], [1])
+
+    def test_a_session_failure_under_the_usage_cap_still_blocks(self):
+        for hit in (lambda: False, lambda: 1 / 0):  # a failed usage read counts as "not the limit"
+            result, calls, labels = self.make([issue(1)], usage_hit=hit)
+            self.assertEqual(result["results"], [{"issue": 1, "outcome": "blocked"}])
+            self.assertEqual(len(calls["blockers"]), 1)
+
+    def test_a_blocked_outcome_is_never_requeued(self):
+        result, calls, _ = self.make([issue(1)], {1: "blocked"}, usage_hit=lambda: True)
+        self.assertEqual((calls["ran"], result["results"]), ([1], [{"issue": 1, "outcome": "blocked"}]))
 
     def test_usage_stop_halts_and_raises_a_blocker(self):
         result, calls, _ = self.make([issue(1)], gate=lambda: "stop")
@@ -714,6 +753,28 @@ class FrontDoorTests(unittest.TestCase):
         (self.root / ".factory" / "supervisor.json").write_text(json.dumps({"pid": 2 ** 22 + 99, "started": 0, "issues": []}))
         self.assertIsNone(h.supervisor_info())  # a dead supervisor's lock is cleaned up
         self.assertFalse((self.root / ".factory" / "supervisor.json").exists())
+
+    def test_a_lock_whose_pid_was_reused_is_cleaned_up(self):
+        import json
+        import os
+        lock = self.root / ".factory" / "supervisor.json"
+        lock.parent.mkdir(exist_ok=True)
+        # a live pid (ours) whose process started long after the lock was written: a reboot reused the pid
+        lock.write_text(json.dumps({"pid": os.getpid(), "started": 1000.0, "issues": []}))
+        self.assertIsNone(h.supervisor_info())
+        self.assertFalse(lock.exists())
+        h.acquire_supervisor([])
+        with mock.patch.object(h, "process_age", lambda pid: None):  # ps can't say: trust the live pid
+            self.assertIsNotNone(h.supervisor_info())
+        h.release_supervisor()
+
+    def test_process_age_parses_ps_elapsed_time(self):
+        for out, want in (("   05:07\n", 307), ("1:02:03", 3723), ("2-01:00:00", 176400)):
+            with mock.patch.object(h.subprocess, "run", lambda *a, **k: mock.Mock(returncode=0, stdout=out)):
+                self.assertEqual(h.process_age(1), want)
+        for r in (mock.Mock(returncode=1, stdout=""), mock.Mock(returncode=0, stdout="junk")):
+            with mock.patch.object(h.subprocess, "run", lambda *a, **k: r):
+                self.assertIsNone(h.process_age(1))
 
     def test_stop_is_graceful_by_default_and_signals_with_now(self):
         import os

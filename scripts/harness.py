@@ -5525,6 +5525,7 @@ def event_line(e: dict) -> str | None:
         "usage_resume": lambda: "usage back, resuming",
         "usage_unknown": lambda: f"usage unreadable ({e.get('count')} in a row)",
         "orphan_blocked": lambda: f"#{n} was in progress when the factory stopped: blocked",
+        "usage_requeued": lambda: f"#{n} stopped at the plan usage limit: back to todo, retried after the reset",
         "queued": lambda: f"#{n} queued",
         "ci_failed": lambda: f"#{n} CI failed; trying one fix",
         "ci_fix_pushed": lambda: f"#{n} fix pushed; waiting for CI again",
@@ -5911,12 +5912,30 @@ def cmd_factory_done(a, cfg):
 
 
 # Supervisor lifecycle: one detached `factory run` per project, found through .factory/supervisor.json.
+def process_age(pid: int) -> float | None:
+    """Seconds since `pid` started (`ps -o etime=`, `[[dd-]hh:]mm:ss`), or None when ps can't say."""
+    try:
+        r = subprocess.run(["ps", "-p", str(pid), "-o", "etime="], capture_output=True, text=True, timeout=5)
+        days, _, clock = r.stdout.strip().rpartition("-")
+        parts = [int(x) for x in clock.split(":")]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0 or not 2 <= len(parts) <= 3:
+        return None
+    h, m, s = ([0] * (3 - len(parts)) + parts)
+    return (int(days or 0) * 24 + h) * 3600 + m * 60 + s
+
+
 def supervisor_info() -> dict | None:
-    """The running supervisor ({pid, started, issues}), or None. A lock whose process is gone is removed."""
+    """The running supervisor ({pid, started, issues}), or None. A lock whose process is gone is removed, and so is
+    one whose pid now belongs to a process started after the lock was written (pid reuse after a reboot)."""
     f = ROOT / ".factory" / "supervisor.json"
     try:
         info = json.loads(f.read_text())
         os.kill(int(info["pid"]), 0)
+        age = process_age(int(info["pid"]))
+        if age is not None and time.time() - age > float(info.get("started", 0)) + 60:
+            raise ValueError("pid reused")
         return info
     except PermissionError:
         return info
@@ -6504,11 +6523,14 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
                                 max_rounds=int(fc.get("auto_queue_rounds", 3)))
         factory_log({"kind": "auto_queue_on"})
 
+    def read_usage():
+        return usage.check(limits, config_dir=project_account_dir(cfg))
+
     summary = fl.run_loop(
         after_issue=cleanup, park=park, refill=refill,
         land_pr=make_lander() if a.merge == "auto" else None,
-        gate=lambda: fl.usage_gate(lambda: usage.check(limits, config_dir=project_account_dir(cfg)), log=factory_log,
-                                   max_unknown=int(fc.get("unknown_limit", 3))),
+        gate=lambda: fl.usage_gate(read_usage, log=factory_log, unknown_minutes=float(fc.get("unknown_minutes", 30))),
+        usage_hit=lambda: read_usage().get("decision") == "pause",
         fetch_issues=fetch, select=lambda pool: fl.choose(pool, ask_selector),
         set_state=lambda n, st: set_issue_state(slug, n, st), run_issue=run_issue,
         fetch_labels=lambda n: issue_labels(slug, n),

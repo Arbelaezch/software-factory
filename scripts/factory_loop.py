@@ -110,30 +110,41 @@ def choose(pool: list[dict], ask: Callable[[list[dict]], str | None]) -> tuple[i
     return picked or (pool[0]["number"], "selector unavailable or invalid; lowest number")
 
 
+def sleep_until(deadline: float, sleep: Callable[[float], None] = time.sleep, now: Callable[[], float] = time.time,
+                step: float = 300) -> None:
+    """Sleep until wall-clock `deadline` in short steps. One long time.sleep does not count the time a Mac spends
+    asleep, so a pause across a closed lid would end hours late (court-vision 2026/11/12 and 11/13)."""
+    while (left := deadline - now()) > 0:
+        sleep(min(step, left))
+
+
 def usage_gate(check: Callable[[], dict], sleep: Callable[[float], None] = time.sleep,
                now: Callable[[], float] = time.time, log: Callable[[dict], None] = lambda e: None,
-               max_unknown: int = 3, retry_wait: float = 60, resume_buffer: float = 60) -> str:
-    """Block until plan usage allows work. Returns "go", or "stop" after `max_unknown` unknown readings in a row
-    (the caller raises a blocker). A pause sleeps until the blocking window resets and continues silently."""
-    unknown = 0
+               unknown_minutes: float = 30, retry_wait: float = 60, max_retry_wait: float = 900,
+               resume_buffer: float = 60, step: float = 300) -> str:
+    """Block until plan usage allows work. Returns "go", or "stop" once usage has been unreadable for
+    `unknown_minutes` (the caller raises a blocker); unknown readings retry with a growing wait. A pause sleeps
+    until the blocking window resets and continues silently."""
+    unknown, first_unknown = 0, None
     while True:
         r = check()
         decision = r.get("decision")
         if decision == "go":
             return "go"
         if decision == "pause":
-            unknown = 0
+            unknown, first_unknown = 0, None
             resume_at = r.get("resume_at")
-            wait = max(resume_at - now() + resume_buffer, retry_wait) if resume_at else retry_wait
+            deadline = max(resume_at + resume_buffer, now() + retry_wait) if resume_at else now() + retry_wait
             log({"kind": "usage_pause", "reasons": r.get("reasons"), "resume_at": resume_at})
-            sleep(wait)
+            sleep_until(deadline, sleep, now, step)
             log({"kind": "usage_resume"})
             continue
         unknown += 1
+        first_unknown = first_unknown if first_unknown is not None else now()
         log({"kind": "usage_unknown", "count": unknown, "reasons": r.get("reasons")})
-        if unknown >= max_unknown:
+        if now() - first_unknown >= unknown_minutes * 60:
             return "stop"
-        sleep(retry_wait)
+        sleep_until(now() + min(retry_wait * 2 ** (unknown - 1), max_retry_wait), sleep, now, step)
 
 
 FAIL_CONCLUSIONS = {"FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE", "ACTION_REQUIRED", "ERROR"}
@@ -229,6 +240,13 @@ def land(n: int, *, wait: Callable[[], str], fix: Callable[[], bool], merge: Cal
     return "merged"
 
 
+def _safe(probe: Callable[[], bool]) -> bool:
+    try:
+        return bool(probe())
+    except Exception:  # an unreadable answer means "no": the issue blocks as before
+        return False
+
+
 def run_loop(*, gate: Callable[[], str], fetch_issues: Callable[[], list[dict]],
              select: Callable[[list[dict]], tuple[int, str]], set_state: Callable[[int, str], None],
              run_issue: Callable[[int], int], fetch_labels: Callable[[int], set[str]],
@@ -237,9 +255,12 @@ def run_loop(*, gate: Callable[[], str], fetch_issues: Callable[[], list[dict]],
              land_pr: Callable[[int], str] | None = None,
              after_issue: Callable[[int], None] | None = None,
              park: Callable[[int], None] | None = None,
-             refill: Callable[[], bool] | None = None) -> dict:
-    """Work the pool one issue at a time until it is empty (or, with `refill`, until it cannot be refilled). Returns {"results": [...], "stopped": reason|None}."""
-    results, attempted, stopped = [], set(), None
+             refill: Callable[[], bool] | None = None,
+             usage_hit: Callable[[], bool] | None = None) -> dict:
+    """Work the pool one issue at a time until it is empty (or, with `refill`, until it cannot be refilled). Returns {"results": [...], "stopped": reason|None}.
+    `usage_hit` says whether plan usage is over the cap right now: a session that ended without an outcome then
+    most likely ran into the limit, so the issue goes back to `todo` (once per run) instead of blocking."""
+    results, attempted, requeued, stopped = [], set(), set(), None
     for i in fetch_issues():  # a crashed earlier run leaves issues in-progress; never guess, hand them back
         if "in-progress" in label_names(i) and str(i.get("state", "")).upper() == "OPEN":
             set_state(i["number"], "blocked")
@@ -251,7 +272,7 @@ def run_loop(*, gate: Callable[[], str], fetch_issues: Callable[[], list[dict]],
             stopped = "stop requested"
             break
         if gate() == "stop":
-            raise_blocker("Plan usage could not be read three times in a row, so the factory stopped.", None,
+            raise_blocker("Plan usage could not be read for the whole retry window ([factory] unknown_minutes), so the factory stopped.", None,
                           "Check the statusline capture or run `usage.py --probe`, then start the factory again.")
             stopped = "usage unknown"
             break
@@ -271,7 +292,13 @@ def run_loop(*, gate: Callable[[], str], fetch_issues: Callable[[], list[dict]],
         log({"kind": "harness_started", "issue": n})
         code = run_issue(n)
         labels = fetch_labels(n)
-        if "in-progress" in labels:  # the session ended without recording an outcome
+        if "in-progress" in labels and n not in requeued and usage_hit and _safe(usage_hit):
+            requeued.add(n)
+            attempted.discard(n)  # the gate pauses until the window resets, then the issue may run again
+            set_state(n, "todo")
+            log({"kind": "usage_requeued", "issue": n, "exit": code})
+            outcome = "requeued"
+        elif "in-progress" in labels:  # the session ended without recording an outcome
             set_state(n, "blocked")
             raise_blocker(f"The session for this issue ended (exit code {code}) without finishing or blocking it.",
                           n, "Read the session output, then relabel the issue `todo` to retry.")
