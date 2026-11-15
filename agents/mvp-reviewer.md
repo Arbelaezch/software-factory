@@ -15,7 +15,8 @@ get pinged about later, and every misreading you catch now is a wrong feature th
 The delegation message gives you the MVP document path, the vision document path (if any), the output
 folder, and the harness command. Read, in this order:
 - the MVP document and the vision document, completely
-- `.factory/decisions.md` if it exists (settled questions: treat them as part of the documents)
+- `.factory/decisions.md` and `.factory/decisions.pending.md` if they exist (settled questions, the pending ones
+  not committed yet: treat them all as part of the documents)
 - the workspace `CLAUDE.md`, `[project]` in `.claude/harness.toml`, and the code layout (`ls`, `git ls-files`,
   a few targeted reads) so you know what already exists. Bash is read-only. Budget roughly 25 tool calls.
 

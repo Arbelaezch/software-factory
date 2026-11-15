@@ -13,8 +13,8 @@ you plan from them as they stand; you do not reopen settled questions.
 
 The delegation message gives you the MVP document path, the vision document path (if any), the output path for
 `issues.json`, and the harness command. Read, in this order:
-- the MVP document, the vision document, and `.factory/decisions.md` (settled questions: they are as binding as
-  the documents)
+- the MVP document, the vision document, and `.factory/decisions.md` plus `.factory/decisions.pending.md` if it
+  exists (settled questions, the pending ones not committed yet: all as binding as the documents)
 - the workspace `CLAUDE.md` and `[project]` in `.claude/harness.toml`
 - the existing issues: `gh issue list --state all --limit 200 --json number,title,state,labels`. Don't draft an
   issue that already exists, open or closed.

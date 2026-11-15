@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import datetime as dt
 import difflib
 import fnmatch
@@ -525,7 +526,8 @@ FACTORY_EXCLUDED: set[Path] = set()
 
 def factory_dir() -> Path:
     """The project's .factory/ directory, created if needed. Its run files are kept out of git (local exclude),
-    except decisions.md and docs.json, which the owner may want to commit."""
+    except docs.json, which the owner may want to commit, and decisions.md, which the factory commits itself
+    (see DECISIONS_PENDING)."""
     d = ROOT / ".factory"
     d.mkdir(exist_ok=True)
     if ROOT not in FACTORY_EXCLUDED:
@@ -2202,6 +2204,13 @@ def branch_name(cfg: dict, run: dict, btype: str | None, slug: str | None) -> st
     return gcfg.get("branch_template_no_issue", "{type}/{slug}").format(type=btype, slug=slug)
 
 
+def tracked_dirt(path: Path) -> str:
+    """Uncommitted changes to tracked files, as `git status --porcelain` lines. The factory's decisions file is left
+    out: an answer recorded there must never be what stops the next branch (the supervisor commits it on its own)."""
+    return git(path, "status", "--porcelain", "--untracked-files=no", "--", ".",
+               ":(exclude,top,glob)**/.factory/decisions.md").strip()
+
+
 def cmd_branch(a, cfg):
     """Fetch origin and create the work branch from a fresh origin/<base>. Never touches the user's
     other branches; refuses to carry over uncommitted tracked changes unless --allow-dirty."""
@@ -2224,7 +2233,7 @@ def cmd_branch(a, cfg):
             continue
         base = base_branch_for(cfg, rname)
         cur = git(path, "branch", "--show-current").strip()
-        dirty = git(path, "status", "--porcelain", "--untracked-files=no").strip()
+        dirty = tracked_dirt(path)
         info = run["repos"].get(rname) or {}
         if cur != name and dirty and not a.allow_dirty:
             print(f"{rname}: has uncommitted changes to tracked files on '{cur}':\n{dirty}\n"
@@ -5588,6 +5597,10 @@ def event_line(e: dict) -> str | None:
         "discover_failed": lambda: "auto-queue discovery gave an invalid issue list; " + (
             "asking once more" if e.get("retrying") else "nothing was filed"),
         "supervisor_started": lambda: "supervisor started",
+        "decisions_committed": lambda: "decisions committed to the base branch" + (f" ({e.get('url')})" if e.get("url") else ""),
+        "decisions_pr_waiting": lambda: f"decisions PR needs your merge: {e.get('url')}",
+        "decisions_flush_skipped": lambda: f"decisions not committed yet: {e.get('why')}",
+        "decisions_flush_failed": lambda: f"decisions not committed yet: {e.get('error')}",
         "issues_skipped": lambda: "not picked again (already run {} times this run): ".format(e.get("max_runs")) + ", ".join(
             f"#{x}" for x in e.get("issues") or []),
         "supervisor_stopped": lambda: f"supervisor stopped ({e.get('why')})",
@@ -5654,16 +5667,200 @@ DECISIONS_HEADER = ("# Decisions\n\nQuestions about the product or its implement
                     "factory; `question-resolver` and the planners treat these as source documents.\n")
 
 
+# Where decisions are written. decisions.md is the committed record. Inside one of the project's git repos a new
+# entry must not touch the working tree (whatever branch is checked out would carry it into an unrelated PR, or the
+# base branch would be left dirty and stop the next issue), so it goes to decisions.pending.md, which git never
+# sees and every reader also reads; the supervisor moves pending entries into decisions.md on the base branch
+# between issues and commits them, the file's first commit included (flush_decisions). Outside a repo, or where
+# the project gitignores decisions.md, there is nothing to leak and entries go straight into decisions.md.
+DECISIONS_PENDING = "decisions.pending.md"
+
+
+@contextlib.contextmanager
+def decisions_lock():
+    """One writer at a time for the pending file: the phone bridge may record an answer while the supervisor flushes."""
+    import fcntl
+    with open(factory_dir() / "decisions.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def decisions_repo(cfg: dict) -> tuple[Path, str, str, str] | None:
+    """(repo root, decisions.md path inside it, base branch, GitHub slug or "") when decisions.md lives in one of
+    the project's git repos and is not gitignored there; None when git has no part in it."""
+    r = run_cmd(["git", "-C", str(ROOT), "rev-parse", "--show-toplevel"])
+    if r.returncode != 0:
+        return None
+    top = Path(r.stdout.strip()).resolve()
+    rel = (ROOT.resolve() / ".factory" / "decisions.md").relative_to(top).as_posix()
+    factory_dir()  # the local exclude must be in place first: it is what keeps decisions.md itself visible to git
+    if run_cmd(["git", "-C", str(top), "check-ignore", "-q", "--", rel]).returncode == 0:
+        return None
+    rname = next((n for n, x in repos(cfg).items() if Path(x["abs"]).resolve() == top), None)
+    if not rname:
+        return None
+    return top, rel, base_branch_for(cfg, rname), repos(cfg)[rname].get("github") or repo_slug(top) or ""
+
+
 def cmd_factory_decide(a, cfg):
-    """Append one settled question to .factory/decisions.md (the user's answer, or a recorded assumption)."""
+    """Record one settled question (the user's answer, or a recorded assumption): in decisions.pending.md inside a
+    git repo, else straight in .factory/decisions.md (see DECISIONS_PENDING)."""
     d = factory_dir()
-    f = d / "decisions.md"
     one = lambda t: " ".join(t.split())
     entry = (f"\n## {one(a.question)}\n- Kind: {a.kind}\n- Decision: {one(a.answer)}\n- Decided by: {a.by} on {iso()[:10]}\n"
              + (f"- Why: {one(a.why)}\n" if a.why else "") + (f"- Source: {one(a.source)}\n" if a.source else ""))
-    f.write_text((f.read_text(encoding="utf-8") if f.exists() else DECISIONS_HEADER) + entry, encoding="utf-8")
+    if decisions_repo(cfg):
+        f = d / DECISIONS_PENDING
+        with decisions_lock(), open(f, "a", encoding="utf-8") as out:
+            out.write(entry)
+    else:
+        f = d / "decisions.md"
+        f.write_text((f.read_text(encoding="utf-8") if f.exists() else DECISIONS_HEADER) + entry, encoding="utf-8")
     factory_log({"kind": "decision", "question": one(a.question)[:200], "by": a.by, "decision_kind": a.kind})
     print(f"recorded in {f}")
+
+
+def branch_protected(slug: str, branch: str) -> bool | None:
+    """Whether GitHub refuses direct pushes to the branch (classic protection or a ruleset). None = could not tell."""
+    try:
+        gh("api", f"repos/{slug}/branches/{branch}/protection")
+        return True
+    except RuntimeError as e:
+        if "404" not in str(e):
+            return None
+    try:
+        return bool(gh_json("api", f"repos/{slug}/rules/branches/{branch}"))
+    except RuntimeError:
+        return None
+
+
+def flush_decisions(cfg: dict, merge: str = "auto") -> str:
+    """Move the pending decisions into decisions.md on the base branch, as one commit. Only on a clean base branch
+    (the supervisor calls this between issues). An unprotected base branch is pushed to directly; a protected one,
+    or a refused push, gets a pull request, squash-merged when the merge policy is auto. Whatever fails, the pending
+    file stays and readers keep seeing it. Returns what happened: nothing | skipped | committed | pr-open."""
+    where = decisions_repo(cfg)
+    d = ROOT / ".factory"
+    pending, state_file = d / DECISIONS_PENDING, d / "decisions-pr.json"
+    if not where:
+        return "nothing"
+    top, rel, base, slug = where
+    f = top / rel
+    g = lambda *args: run_cmd(["git", "-C", str(top), *args])
+    if g("branch", "--show-current").stdout.strip() != base:
+        return "skipped"
+
+    def restore() -> None:
+        """Put decisions.md back to what the checked-out commit has (gone, if that commit does not have it)."""
+        if g("cat-file", "-e", f"HEAD:{rel}").returncode == 0:
+            g("checkout", "HEAD", "--", rel)
+        else:
+            g("rm", "-q", "--cached", "--ignore-unmatch", "--", rel)
+            f.unlink(missing_ok=True)
+
+    head = g("show", f"HEAD:{rel}").stdout  # empty while the file has never been committed
+    work = f.read_text(encoding="utf-8") if f.exists() else ""
+    if work != head:  # entries written straight into the file (never committed, older versions, by hand): make them pending
+        if not work.startswith(head):
+            factory_log({"kind": "decisions_flush_skipped", "why": f"{rel} has edits that are not new entries; commit or discard them"})
+            return "skipped"
+        extra = work[len(head):]
+        with decisions_lock(), open(pending, "a", encoding="utf-8") as out:  # at the end: an open pull request
+            out.write(extra.removeprefix(DECISIONS_HEADER) if not head else extra)  # counts on the start staying put
+        restore()
+    if g("status", "--porcelain", "--untracked-files=no").stdout.strip():
+        return "skipped"  # someone's work is in the tree; the next quiet point will do
+
+    def done(size: int) -> None:
+        """Drop the first `size` characters (now committed) from the pending file; later entries stay."""
+        with decisions_lock():
+            rest = pending.read_text(encoding="utf-8")[size:] if pending.exists() else ""
+            pending.write_text(rest, encoding="utf-8") if rest.strip() else pending.unlink(missing_ok=True)
+        state_file.unlink(missing_ok=True)
+
+    def merge_pr(st: dict) -> bool:
+        try:
+            gh("pr", "merge", st["url"], "--squash", "--delete-branch")
+        except RuntimeError as e:
+            if not st.get("told"):  # say it once; the pull request stays open for the user
+                factory_log({"kind": "decisions_pr_waiting", "url": st["url"], "error": str(e)[:200]})
+                state_file.write_text(json.dumps({**st, "told": True}))
+            return False
+        return landed(st)
+
+    def landed(st: dict) -> bool:
+        """The pull request is merged: bring it into the local base branch, then drop what it carried from pending."""
+        if not git_net(top, "pull", "--ff-only", "-q", "origin", base)[0]:
+            return False  # the next quiet point finds it merged and finishes
+        g("branch", "-D", st["branch"])
+        done(st["size"])
+        factory_log({"kind": "decisions_committed", "via": "pull request", "url": st["url"]})
+        return True
+
+    st = read_json(state_file, None)
+    if isinstance(st, dict) and st.get("url"):  # an earlier flush left a pull request open
+        try:
+            pr = (gh_json("pr", "view", st["url"], "--json", "state") or {}).get("state")
+        except RuntimeError:
+            return "skipped"
+        if pr == "MERGED":
+            if not landed(st):
+                return "skipped"
+        elif pr == "OPEN":
+            if merge != "auto" or not merge_pr(st):
+                return "pr-open"
+        else:  # closed without merging: its entries are still pending and go out again
+            state_file.unlink(missing_ok=True)
+    text = pending.read_text(encoding="utf-8") if pending.exists() else ""
+    if not text.strip():
+        return "nothing"
+    count = text.count("\n## ") or 1
+    message = f"Record {count} factory decision{'s' if count != 1 else ''}"
+
+    def commit() -> bool:
+        f.write_text((f.read_text(encoding="utf-8") if f.exists() else DECISIONS_HEADER) + text, encoding="utf-8")
+        return g("add", "--", rel).returncode == 0 and g("commit", "-q", "-m", message, "--", rel).returncode == 0
+
+    has_origin = g("remote", "get-url", "origin").returncode == 0
+    if has_origin:  # the commit must sit directly on origin's base: nothing else of the user's may be pushed with it
+        git_net(top, "pull", "--ff-only", "-q", "origin", base)
+        if g("rev-parse", "HEAD").stdout != g("rev-parse", f"origin/{base}").stdout:
+            factory_log({"kind": "decisions_flush_skipped", "why": f"local {base} is not the same as origin/{base}"})
+            return "skipped"
+    protected = branch_protected(slug, base) if has_origin and slug else False
+    if protected is None:
+        factory_log({"kind": "decisions_flush_skipped", "why": f"could not read the protection of {base}"})
+        return "skipped"
+    if not protected:
+        if not commit():
+            restore()
+            factory_log({"kind": "decisions_flush_failed", "error": "could not commit the decisions file"})
+            return "skipped"
+        if not has_origin or git_net(top, "push", "-q", "origin", base)[0]:
+            done(len(text))
+            factory_log({"kind": "decisions_committed", "via": "push" if has_origin else "local commit", "count": count})
+            return "committed"
+        g("reset", "-q", "--keep", "HEAD~1")  # the push was refused: undo (the tree was clean) and use a pull request
+    branch = f"factory/decisions-{time.strftime('%Y%m%d-%H%M%S')}"
+    ok = g("switch", "-q", "-c", branch).returncode == 0 and commit()
+    pushed, why = git_net(top, "push", "-q", "-u", "origin", branch) if ok else (False, "could not commit on a new branch")
+    restore()
+    g("switch", "-q", base)
+    if not pushed:
+        g("branch", "-D", branch)
+        factory_log({"kind": "decisions_flush_failed", "error": why[:200]})
+        return "skipped"
+    try:
+        url = gh("pr", "create", "--repo", slug, "--base", base, "--head", branch, "--title", message, "--body",
+                 "Answers recorded by the factory (`harness factory decide`), moved from the working copy into "
+                 "`.factory/decisions.md`. No code changes.").strip().splitlines()[-1]
+    except RuntimeError as e:
+        factory_log({"kind": "decisions_flush_failed", "error": str(e)[:200]})
+        return "skipped"
+    st = {"url": url, "branch": branch, "size": len(text)}
+    state_file.write_text(json.dumps(st))
+    factory_log({"kind": "decisions_pr_opened", "url": url, "count": count})
+    return "committed" if merge == "auto" and merge_pr(st) else "pr-open"
 
 
 def cmd_factory_issues_create(a, cfg):
@@ -5814,7 +6011,7 @@ def cmd_factory_queue(a, cfg):
         print(f"#{n} is in the pool")
 
 
-WATCH_PATTERN = re.compile(r"BLOCKER|QUESTION|finished|paused|resumed|unreadable|stopped|orphaned")
+WATCH_PATTERN = re.compile(r"BLOCKER|QUESTION|finished|paused|resumed|unreadable|stopped|orphaned|needs your")
 
 
 def cmd_factory_watch(a, cfg):
@@ -6596,6 +6793,14 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
                     raise RuntimeError(f"{rname}: could not switch to {base}: {sw.stderr.strip()}")
             if run_cmd(["git", "-C", str(path), "remote", "get-url", "origin"]).returncode == 0:
                 run_cmd(["git", "-C", str(path), "pull", "--ff-only", "-q", "origin", base])  # pick up merged PRs
+        commit_decisions()
+
+    def commit_decisions():
+        """A quiet point (clean tree, base branch): move the answers recorded meanwhile into decisions.md."""
+        try:
+            flush_decisions(cfg, a.merge)
+        except Exception as e:  # housekeeping must never stop the factory; the pending file keeps the answers
+            factory_log({"kind": "decisions_flush_failed", "error": str(e)[:200]})
 
     def cleanup(n):
         """After an issue's PR: have harness-cleanup re-check the run's out-of-scope concerns and file the
@@ -6684,6 +6889,7 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
     def gate():
         return fl.usage_gate(read_usage, log=factory_log, unknown_minutes=unknown_window, wake=fl.changed(settings))
 
+    commit_decisions()  # answers recorded while no supervisor was running
     summary = fl.run_loop(
         after_issue=cleanup, park=park, refill=refill,
         land_pr=make_lander() if a.merge == "auto" else None,
@@ -7317,7 +7523,7 @@ def main(argv=None):
     f.add_argument("--note")
     f.add_argument("--repo")
     f.set_defaults(fn=cmd_factory_done)
-    f = fsub.add_parser("decide", help="record a settled question in .factory/decisions.md")
+    f = fsub.add_parser("decide", help="record a settled question (in .factory/decisions.pending.md inside a git repo; the factory commits it to decisions.md)")
     f.add_argument("--question", required=True)
     f.add_argument("--answer", required=True)
     f.add_argument("--by", choices=["user", "assumed"], required=True)
