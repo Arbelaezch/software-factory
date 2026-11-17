@@ -1,8 +1,7 @@
 # Software Factory: design
 
 Status: built and in use on personal projects (callback, court-vision). This began as the design draft of
-2026/11/06 and is kept as the reference for how the factory works. Section 12 says what was not built and what
-has not been checked on a real run yet.
+2026/11/06 and is kept as the reference for how the factory works. Section 12 says what was not built.
 
 ## 1. What this is
 
@@ -536,13 +535,6 @@ marker with the wrong directory, and a subagent without push rights.
 ## 12. Status
 
 Everything in sections 4 to 11 is built and merged, with one exception: recipes as TOML files (section 5).
-
-Not checked on a real run yet (unit tested only):
-- A blocker answered from the phone, the plain-language phone messages (#116) and the `--remote` switch (#122).
-- Nighttime mode over a real night: `usage_resume` with `late_min`, and `usage_requeued`.
-- The fixes for re-queued issues, decisions outside the working tree and the selector's data (#113 to #115).
-- Listed as unseen on 2026/11/09 and not re-checked for this document: the `ci-fixer` and `conflict-resolver`
-  sessions, `question-resolver` on a real question, and `harness-cleanup` filing backlog issues.
 
 Worth knowing when running it
 - Updating the plugin is not enough: restart the `/factory` session and stop any old supervisor, because the
