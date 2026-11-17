@@ -520,14 +520,16 @@ class NotifyTests(unittest.TestCase):
     def test_blockers_go_to_the_phone_and_done_does_not(self):
         ph = mock.Mock()
         ph.configured.return_value = True
-        cfg = {"project": {"name": "alpha"}, "accounts": {"claude": "personal", "dirs": {"personal": "/acc/p"}}}
+        cfg = {"project": {"name": "alpha"}, "accounts": {"claude": "personal", "dirs": {"personal": "/acc/p"}},
+               "factory": {"remote": True}}
         with mock.patch.object(h, "phone_module", return_value=ph), mock.patch.object(h, "factory_comment"), \
+                mock.patch.object(h, "run_settings", lambda fallback=None: dict(fallback or {})), \
                 mock.patch.object(h, "gh_json", return_value={"title": "Add export"}) as gh_json, \
                 mock.patch.object(h, "factory_log"), contextlib.redirect_stdout(io.StringIO()):
             h.factory_raise_blocker(cfg, "o/r", "QUESTION", 5, "Which one.", "Pick one", ["A", "B"], 2,
                                     summary="Two ways to do it.", labels=["First", "Second"], category="product")
             h.factory_raise_blocker(cfg, "o/r", "DONE", 5, "The PR is open.", "")
-            h.factory_raise_blocker({**cfg, "factory": {"phone": False}}, "o/r", "BLOCKER", 6, "Stuck.", "Help")
+            h.factory_raise_blocker({**cfg, "factory": {}}, "o/r", "BLOCKER", 6, "Stuck.", "Help")  # not remote: the default
         ph.send_blocker.assert_called_once()
         args = ph.send_blocker.call_args.args
         self.assertEqual((args[1], args[2], args[3], args[5], args[6], args[7], args[8]),
@@ -539,6 +541,55 @@ class NotifyTests(unittest.TestCase):
         gh_json.assert_called_once_with("issue", "view", "5", "--repo", "o/r", "--json", "title")  # only when it is sent
         ph.ensure_bridge.assert_called_once()
 
+    def test_remote_switched_mid_run_decides_the_next_blocker(self):
+        ph = mock.Mock()
+        ph.configured.return_value = True
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(h, "ROOT", Path(tmp)), \
+                mock.patch.object(h, "phone_module", return_value=ph), mock.patch.object(h, "factory_comment"), \
+                mock.patch.object(h, "gh_json", return_value={"title": "Add export"}), \
+                mock.patch.object(h, "supervisor_info", return_value={"pid": 1}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            settings = Path(tmp) / ".factory" / "run-settings.json"
+            settings.parent.mkdir()
+            settings.write_text(json.dumps({"remote": False, "merge": "auto"}))
+            raise_one = lambda cfg: h.factory_raise_blocker(cfg, "o/r", "BLOCKER", 6, "Stuck.", "Help")
+            raise_one({"factory": {"remote": True}})  # the run's setting wins over the project's while it runs
+            self.assertEqual(ph.send_blocker.call_count, 0)
+            h.cmd_factory_set(mock.Mock(setting="remote", value="on"), {})
+            ph.register_project.assert_called_once()  # the project's topic and the bridge are ready at once
+            raise_one({})
+            self.assertEqual(ph.send_blocker.call_count, 1)
+            h.cmd_factory_set(mock.Mock(setting="remote", value="off"), {})
+            raise_one({})
+            self.assertEqual(ph.send_blocker.call_count, 1)
+            ph.configured.return_value = False
+            with self.assertRaises(SystemExit) as cm:
+                h.cmd_factory_set(mock.Mock(setting="remote", value="on"), {})
+            self.assertIn("harness phone setup", str(cm.exception))
+            self.assertFalse(json.loads(settings.read_text())["remote"])
+
+    def test_remote_comes_from_the_flag_the_project_or_a_phone_start(self):
+        a = lambda **kw: types.SimpleNamespace(merge="auto", **kw)
+        with mock.patch.dict("os.environ"):
+            os.environ.pop("FACTORY_REMOTE", None)
+            self.assertFalse(h.start_settings(a(), {})["remote"])
+            self.assertTrue(h.start_settings(a(remote=True), {})["remote"])
+            self.assertTrue(h.start_settings(a(), {"remote": True})["remote"])
+            os.environ["FACTORY_REMOTE"] = "1"  # the phone bridge's answer session started the supervisor
+            self.assertTrue(h.start_settings(a(), {})["remote"])
+
+    def test_remote_start_is_refused_without_the_phone(self):
+        ph = mock.Mock()
+        ph.configured.return_value = False
+        a = types.SimpleNamespace(merge="auto", remote=True, issues=None, repo=None, max_issues=5, until_limit=False,
+                                  auto_queue=False, nighttime=False)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(h, "ROOT", Path(tmp)), \
+                mock.patch.object(h, "phone_module", return_value=ph), mock.patch.object(h, "supervisor_info", return_value=None), \
+                mock.patch.object(h.subprocess, "Popen") as popen, self.assertRaises(SystemExit) as cm:
+            h.cmd_factory_start(a, {})
+        self.assertIn("harness phone setup", str(cm.exception))
+        popen.assert_not_called()
+
     def test_a_phone_failure_never_stops_the_factory(self):
         ph = mock.Mock()
         ph.configured.return_value = True
@@ -548,7 +599,7 @@ class NotifyTests(unittest.TestCase):
                 mock.patch.object(h, "factory_log", side_effect=logged.append), \
                 mock.patch.object(h, "gh_json", side_effect=RuntimeError("gh issue view failed")), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
-            h.factory_raise_blocker({}, "o/r", "BLOCKER", 6, "Stuck.", "Help")
+            h.factory_raise_blocker({"factory": {"remote": True}}, "o/r", "BLOCKER", 6, "Stuck.", "Help")
         ph.send_blocker.assert_called_once()  # an unreadable title is left out, the message still goes
         self.assertEqual(ph.send_blocker.call_args.kwargs["title"], "")
         self.assertIn("network down", err.getvalue())

@@ -6118,7 +6118,11 @@ def phone_module():
 
 
 def phone_enabled(cfg) -> bool:
-    return bool((cfg.get("factory") or {}).get("phone", True)) and phone_module().configured()
+    """Whether blockers also go to the phone: the run is remote (`factory start --remote`, `factory set remote on`,
+    or [factory] remote) and the phone is set up. Read each time a blocker is raised, so a switch mid-run applies to
+    the next one, the current issue's included."""
+    remote = run_settings({"remote": (cfg.get("factory") or {}).get("remote", False)}).get("remote", False)
+    return bool(remote) and phone_module().configured()
 
 
 def project_claude_dir(cfg) -> str | None:
@@ -6355,13 +6359,19 @@ def release_supervisor() -> None:
 
 
 # The running supervisor's switchable settings, in .factory/run-settings.json: written at start from the flags and
-# [factory], changed by `factory set`, re-read by the loop before each issue and during usage waits.
-RUN_SETTINGS = {"nighttime": "nighttime", "auto-queue": "auto_queue", "until-limit": "until_limit"}
+# [factory], changed by `factory set`, re-read by the loop before each issue and during usage waits. `remote` is
+# read by whoever raises a blocker (phone_enabled), so it applies at once.
+RUN_SETTINGS = {"nighttime": "nighttime", "auto-queue": "auto_queue", "until-limit": "until_limit", "remote": "remote"}
+PHONE_NOT_SET_UP = ("remote sends blockers to the phone, and the phone is not set up: create a bot with @BotFather, "
+                    "then run `harness phone setup --token <token>`")
 
 
 def start_settings(a, fc: dict) -> dict:
     return {"nighttime": bool(getattr(a, "nighttime", False) or fc.get("nighttime", False)),
             "auto_queue": bool(getattr(a, "auto_queue", False)), "until_limit": bool(getattr(a, "until_limit", False)),
+            # FACTORY_REMOTE: set by the phone bridge, so a run started from a phone answer keeps reaching the phone
+            "remote": bool(getattr(a, "remote", False) or fc.get("remote", False)
+                           or os.environ.get("FACTORY_REMOTE") == "1"),
             "merge": a.merge}
 
 
@@ -6371,16 +6381,24 @@ def run_settings(fallback: dict | None = None) -> dict:
 
 
 def cmd_factory_set(a, cfg):
-    """Switch a setting of the running factory; it applies before the next issue (and wakes a usage pause)."""
+    """Switch a setting of the running factory; it applies before the next issue (and wakes a usage pause). `remote`
+    applies to the next blocker."""
     if not supervisor_info():
         sys.exit("no factory is running; pass the flag to `factory start` instead (e.g. --nighttime)")
     s = run_settings()
     key, on = RUN_SETTINGS[a.setting], a.value == "on"
     if key == "auto_queue" and on and s.get("merge") != "auto":
         sys.exit("auto-queue needs merge auto, and this run merges manually: the next issue would start on unmerged code.")
+    if key == "remote" and on and not phone_module().configured():
+        sys.exit(PHONE_NOT_SET_UP)
     s[key] = on
     (ROOT / ".factory" / "run-settings.json").write_text(json.dumps(s))
     factory_log({"kind": "setting_changed", "setting": a.setting, "on": on})
+    if key == "remote":
+        if on:
+            phone_start(cfg)
+        print(f"remote {a.value}: applies to the next blocker, the current issue's included")
+        return
     print(f"{a.setting} {a.value}: applies before the next issue")
 
 
@@ -6395,6 +6413,8 @@ def cmd_factory_start(a, cfg):
         sys.exit("Engineer sessions cannot prompt, so these commands would be denied and block the first issue: "
                  + ", ".join(missing) + f".\nAdd to .claude/harness.toml under [factory]: allowed_tools = [{rules}]\n"
                  "then run factory start again. See docs/factory-allowlist.md.")
+    if start_settings(a, cfg.get("factory") or {})["remote"] and not phone_module().configured():
+        sys.exit(PHONE_NOT_SET_UP)
     d = factory_dir()
     cmd = [sys.executable, str(Path(__file__).resolve()), "--root", str(ROOT), "factory", "run",
            "--max-issues", str(a.max_issues)]
@@ -6410,6 +6430,8 @@ def cmd_factory_start(a, cfg):
         cmd += ["--auto-queue"]
     if a.nighttime:
         cmd += ["--nighttime"]
+    if a.remote:
+        cmd += ["--remote"]
     if shutil.which("caffeinate"):
         cmd = ["caffeinate", "-i", *cmd]
     with open(d / "supervisor.log", "a", encoding="utf-8") as out:
@@ -7634,6 +7656,7 @@ def main(argv=None):
     f.add_argument("--until-limit", action="store_true", help="ignore the [factory] usage caps and keep going until the plan limit itself is hit")
     f.add_argument("--auto-queue", action="store_true", help="when the queue is empty, queue the factory's own planned and backlog issues, then discover new ones from the project documents. Off by default; this run only")
     f.add_argument("--nighttime", action="store_true", help="unattended run: tolerate unreadable usage for [factory] nighttime_unknown_hours before stopping")
+    f.add_argument("--remote", action="store_true", help="also send QUESTION / BLOCKER messages to the phone (Telegram); without it they stay in the /factory session")
     f.add_argument("--repo")
     f.set_defaults(fn=cmd_factory_run)
     f = fsub.add_parser("start", help="start the factory loop detached and return (what /factory uses)")
@@ -7643,9 +7666,10 @@ def main(argv=None):
     f.add_argument("--until-limit", action="store_true", help="ignore the [factory] usage caps and keep going until the plan limit itself is hit")
     f.add_argument("--auto-queue", action="store_true", help="when the queue is empty, queue the factory's own planned and backlog issues, then discover new ones from the project documents. Off by default; this run only")
     f.add_argument("--nighttime", action="store_true", help="unattended run: tolerate unreadable usage for [factory] nighttime_unknown_hours before stopping")
+    f.add_argument("--remote", action="store_true", help="also send QUESTION / BLOCKER messages to the phone (Telegram); without it they stay in the /factory session")
     f.add_argument("--repo")
     f.set_defaults(fn=cmd_factory_start)
-    f = fsub.add_parser("set", help="switch a setting of the running factory; applies before the next issue")
+    f = fsub.add_parser("set", help="switch a setting of the running factory; applies before the next issue (remote: to the next blocker)")
     f.add_argument("setting", choices=list(RUN_SETTINGS))
     f.add_argument("value", choices=["on", "off"])
     f.set_defaults(fn=cmd_factory_set)

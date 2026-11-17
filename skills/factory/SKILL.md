@@ -34,8 +34,9 @@ Event stream: `${CLAUDE_PROJECT_DIR}/.factory/events.log`
   message the factory sent. Put it to the user the way the phone does: the `In short` line, `What I need`, then the
   numbered options by their short labels with the recommended one marked. Leave `What is going on` and `Detail`
   (file paths, logs) out unless they ask for details. A blocker with no options is an action for them, not a
-  question: say what it needs. Never answer a product question for them. Blockers also reach the user's phone
-  (Telegram, `H phone status`); if the issue is no longer `blocked`, it was answered there, so don't ask again.
+  question: say what it needs. Never answer a product question for them. In a remote run (below) blockers also
+  reach the user's phone (Telegram, `H phone status`); if the issue is no longer `blocked`, it was answered there, so
+  don't ask again.
 - **The user answers** (picks an option or says what to do): record it with
   `H factory decide --question "<the question>" --answer "<their answer>" --by user --kind <product|implementation|process>
   --why "<their reasoning if given>"`, then re-queue the issue: `H factory queue N`. If the supervisor has stopped
@@ -56,11 +57,16 @@ Event stream: `${CLAUDE_PROJECT_DIR}/.factory/events.log`
   `H factory start`. It keeps going through hours of unreadable plan usage (`[factory] nighttime_unknown_hours`,
   default 6) instead of stopping after 30 minutes; pauses, re-queues and blockers work as usual. Suggest combining it
   with `--auto-queue` and `--until-limit` only if they asked for those too.
-- **Switching a setting while it runs** ("turn on auto-queue", "go until the limit", "switch to nighttime", or the
-  same with off): if the supervisor is running, `H factory set <nighttime|auto-queue|until-limit> <on|off>` instead
-  of stopping and restarting. It applies before the next issue, and a usage pause wakes to re-check with the new
-  setting. Auto-queue can't be switched on in a run that merges manually; the command says so. Not running: use the
-  start flags above.
+- **"send blockers to my phone" / "remote" / "I'm heading out"** (only when the user says so; never by default): add
+  `--remote` to `H factory start`. Questions and blockers then also go to their Telegram bot, where they can answer
+  them; without it they only come to this session. It needs `H phone setup` done once; the command says so if not.
+- **Switching a setting while it runs** ("turn on auto-queue", "go until the limit", "switch to nighttime", "turn on
+  remote", or the same with off): if the supervisor is running,
+  `H factory set <nighttime|auto-queue|until-limit|remote> <on|off>` instead of stopping and restarting. It applies
+  before the next issue, and a usage pause wakes to re-check with the new setting. `remote` applies to the next
+  blocker, even one from the issue being worked on; blockers raised before the switch are not sent again, so put any
+  that are still open to the user here. Auto-queue can't be switched on in a run that merges manually; the command
+  says so. Not running: use the start flags above.
 - **"stop" / "pause"**: `H factory stop` (after the current issue). Use `--now` only if they say now or it is
   clearly stuck; warn that the in-progress issue will be marked blocked at the next start.
 - **"continue" / "next batch"**: `H factory start`, with `--issues` if they name more.

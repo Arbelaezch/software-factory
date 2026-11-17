@@ -200,6 +200,7 @@ class AnswerTests(PhoneTestCase):
         self.assertIn("Option 1: Retry", cmd[2])
         self.assertEqual(kw["cwd"], root)
         self.assertEqual(kw["env"]["CLAUDE_CONFIG_DIR"], "/acc/personal")
+        self.assertEqual(kw["env"]["FACTORY_REMOTE"], "1")  # a supervisor it starts keeps sending blockers to the phone
         allowed = cmd[cmd.index("--allowedTools") + 1:]
         self.assertIn(f"Bash(python3 {ph.HARNESS} --root {root} factory decide *)", allowed)
         self.assertFalse(any("git" in a for a in allowed))

@@ -246,6 +246,11 @@ Phone access (decided 2026/11/14, issue #9)
   attach to. Keeping one open per blocker would spend plan usage while waiting.
 - QUESTION and BLOCKER messages go to a Telegram bot (`scripts/phone.py`), on top of the terminal and the issue
   comment. DONE stays on the terminal. Each option is a button, the recommended one starred.
+- Only a remote run sends them (issue #122): by default blockers stay in the `/factory` manager session.
+  `factory start --remote` or `[factory] remote = true` turns the phone on for a run, and `factory set remote on|off`
+  switches a running one. The setting is read each time a blocker is raised, so a switch applies to the next blocker,
+  including one from the issue in progress; earlier blockers are not re-sent. Asking for remote without the phone set
+  up is refused. A supervisor started from a phone answer is remote, so the issue's next blocker reaches the phone too.
 - What a phone message shows (issue #116): the project, the issue's number and title, the summary, what to decide,
   then each option's label with its
   description under the number its button carries. A button is `<n>. <label>` plus the star, 40 characters at most.
@@ -266,9 +271,9 @@ Phone access (decided 2026/11/14, issue #9)
   `harness phone setup --token <token>`. State lives in `~/.config/software-factory/phone`, outside the projects.
 - Each project gets its own topic in the chat. Without topics, every message still names the project and a reply is
   matched by the message it replies to.
-- The bridge is a small long-polling process (outgoing HTTPS only, so it works from any network). `factory run`
-  and every blocker start it if it isn't running; it exits after 30 minutes with no supervisor running and nothing
-  waiting on me. While a blocker waits it holds `caffeinate -i`, because the supervisor stops (and lets the Mac
+- The bridge is a small long-polling process (outgoing HTTPS only, so it works from any network). A remote
+  `factory run` and every blocker sent start it if it isn't running; it exits after 30 minutes with no supervisor
+  running and nothing waiting on me. While a blocker waits it holds `caffeinate -i`, because the supervisor stops (and lets the Mac
   sleep) once every queued issue is blocked; an idle Mac still sleeps, and a closed lid on battery still sleeps.
   `harness phone serve --forever` keeps it up (for a launchd agent).
 - A tap or a reply goes to a short Sonnet session in that project, under the project's Claude account, allowed only
@@ -280,7 +285,7 @@ Phone access (decided 2026/11/14, issue #9)
   it covers every project. No model is used.
 - A blocker answered at the computer (the issue is queued or started again) is closed out on the phone, on the
   message itself.
-- Only my Telegram user, in the chat found at setup, is listened to. `[factory] phone = false` turns it off for a project.
+- Only my Telegram user, in the chat found at setup, is listened to.
 
 A blocker stops only the blocked issue and anything that depends on it. The factory keeps working other
 independent issues in my directed group. I am pinged less because fewer questions reach me (section 6), not because
@@ -386,9 +391,10 @@ Usage gate
 - Nighttime mode (`factory start --nighttime`, or `[factory] nighttime = true`) is for unattended runs: unreadable
   usage stops the factory only after `nighttime_unknown_hours` (default 6). A resume that came more than 10
   minutes after the reset logs `late_min` (the Mac was asleep), so the night can be checked in the morning.
-- Run settings (`nighttime`, `auto-queue`, `until-limit`) live in `.factory/run-settings.json` while a supervisor
-  runs. `factory set <setting> on|off` changes them without a restart: the loop re-reads them before each issue
-  and at each usage reading, and a usage wait ends early when they change. `factory status` shows them.
+- Run settings (`nighttime`, `auto-queue`, `until-limit`, `remote`) live in `.factory/run-settings.json` while a
+  supervisor runs. `factory set <setting> on|off` changes them without a restart: the loop re-reads them before each
+  issue and at each usage reading, and a usage wait ends early when they change (`remote` is read when a blocker is
+  raised, section 7). `factory status` shows them.
 - The factory runs as a long-lived process on my Mac under `caffeinate`. If the lid closes it pauses and
   resumes when the machine wakes. A supervisor lock whose pid is dead, or was reused by a process started
   after the lock was written (a reboot), is cleared on the next start.

@@ -647,7 +647,7 @@ echo "args: $@"
 
             usage = types.SimpleNamespace(check=check)
             a = mock.Mock(merge="auto", issues=None, dry_run=False, max_issues=5, repo=None, auto_queue=auto_queue,
-                          until_limit=False, nighttime=False)
+                          until_limit=False, nighttime=False, remote=False)
             env = {"HARNESS_CLAUDE": str(fake), "SOFTWARE_FACTORY_HOME": tmp, "CLAUDE_CONFIG_DIR": tmp}
             with mock.patch.dict("os.environ", env), mock.patch.object(h, "ROOT", root), \
                     mock.patch.object(h, "factory_repo", lambda a, c: "o/r"), \
@@ -906,7 +906,8 @@ class HarnessWiringTests(unittest.TestCase):
                 labels[n] = (labels[n] - set(fl.STATE_LABELS)) | {st}
 
             usage = types.SimpleNamespace(check=lambda limits, **kw: {"decision": "go"})
-            a = mock.Mock(merge="manual", issues=None, dry_run=False, max_issues=5, repo=None, auto_queue=False, until_limit=False)
+            a = mock.Mock(merge="manual", issues=None, dry_run=False, max_issues=5, repo=None, auto_queue=False, until_limit=False,
+                          remote=False)
             env = {"HARNESS_CLAUDE": str(fake), "SOFTWARE_FACTORY_HOME": tmp}
             with mock.patch.dict("os.environ", env), mock.patch.object(h, "ROOT", root), \
                     mock.patch.object(h, "factory_repo", lambda a, c: "o/r"), \
