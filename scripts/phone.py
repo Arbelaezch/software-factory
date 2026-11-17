@@ -395,6 +395,7 @@ def project_env(entry: dict) -> dict:
            if k not in ("CLAUDE_CONFIG_DIR", "GH_TOKEN", "HARNESS_ROOT", "CLAUDE_PROJECT_DIR", "CLAUDECODE")}
     if entry.get("config_dir"):
         env["CLAUDE_CONFIG_DIR"] = entry["config_dir"]
+    env["FACTORY_REMOTE"] = "1"  # a supervisor started from a phone answer keeps sending its blockers to the phone
     return env
 
 

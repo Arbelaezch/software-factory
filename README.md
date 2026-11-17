@@ -192,7 +192,9 @@ session-start hook warns when a session is on a different account than its proje
 <summary><b>Optional: factory blockers on your phone (Telegram)</b></summary>
 
 The factory's questions and blockers can reach your phone, and you answer them there. Set it up once per machine;
-every project and every Claude or GitHub account shares the one bot.
+every project and every Claude or GitHub account shares the one bot. They are sent only in a remote run: start it
+with `factory start --remote` (or tell `/factory` you are heading out), or switch a running one with
+`factory set remote on|off`, which applies to the next blocker. Without it they stay in the `/factory` session.
 
 1. In Telegram, message [@BotFather](https://t.me/BotFather): `/newbot`, then copy the token. In its bot settings,
    turn on topics (threaded mode), so each project gets its own thread.
@@ -209,7 +211,7 @@ You are asked about the product, and about implementation or process only when i
 two kinds are settled by the factory with its recommended option and arrive as a silent one-line note you can reply
 to and overrule (`[factory] auto_accept`, `[]` to be asked everything). A blocker with nothing to decide (the
 factory's own tooling is in the way) arrives as a report, not a question.
-`harness phone status` shows the bridge and what is waiting; `[factory] phone = false` turns it off for a project.
+`harness phone status` shows the bridge and what is waiting; `[factory] remote = true` makes every run of a project remote.
 See section 7 of [`docs/factory-design.md`](docs/factory-design.md).
 </details>
 
