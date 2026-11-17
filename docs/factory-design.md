@@ -1,6 +1,8 @@
 # Software Factory: design
 
-Status: draft, 2026/11/06. Nothing here is built yet except `scripts/usage.py` and `scripts/statusline_capture.py`.
+Status: built and in use on personal projects (callback, court-vision). This began as the design draft of
+2026/11/06 and is kept as the reference for how the factory works. Section 12 says what was not built and what
+has not been checked on a real run yet.
 
 ## 1. What this is
 
@@ -38,68 +40,74 @@ Rules that keep this modular
 
 ## 3. Repository layout
 
-Everything lives in one repo, `software-factory` (renamed from `claude-harness`, section 14).
+Everything lives in one repo, `software-factory` (renamed from `claude-harness` on 2026/11/06; the plugin name
+stays `harness`, so `/ship` and the `harness:` agent prefix did not change).
 
 ```
-agents/              one markdown file per role (existing five plus the new ones)
-harnesses/           one TOML recipe per harness: ship, review-pr, ci-fix, conflict-resolve
-factory/             the engine (Python, standard library only)
-scripts/             harness.py (existing), usage.py, statusline_capture.py
-skills/              /ship, /review-pr and so on (existing)
-docs/                this file
+agents/              one markdown file per role
+skills/              /ship, /factory, /factory-plan, /factory-issue, /review-pr and so on
+scripts/             harness.py (CLI, guard, supervisor), factory_loop.py (the loop engine), phone.py,
+                     usage.py, statusline_capture.py, defaults.toml
+docs/                this file, factory-allowlist.md, context-cost.md
 tests/
 ```
 
 Per-project files live in the **target repo**, not here:
 
 ```
-<project>/.factory/project.toml     MVP doc path, vision doc path, check command, merge policy, labels
+<project>/.claude/harness.toml      project config; `[factory]` overrides the defaults in scripts/defaults.toml
 <project>/.factory/log.jsonl        append-only factory log (state for resume, section 8)
+<project>/.factory/docs.json        the MVP and vision documents recorded by /factory-plan
+<project>/.factory/decisions.md     my answers and the factory's assumptions (section 4)
 <project>/CLAUDE.md                 project conventions the agents read
 ```
 
-The factory takes a project path as an argument. One factory run handles one project.
+One supervisor handles one project (`harness --root <project> factory ...`).
 
 ## 4. Roles
 
-| Role | Job | Status |
-|---|---|---|
-| `scout` | Maps relevant code for a task | exists |
-| `planner` | Turns an issue plus scout context into a task plan | exists |
-| `engineer` | Implements one task or fixes review findings | exists |
-| `claude-reviewer` | Fallback reviewer | exists |
-| `verifier` | Checks reviewer findings against the code | exists |
-| `mvp-reviewer` | Checks the MVP, vision and design docs are clear and complete enough to answer builders' questions | exists |
-| `factory-planner` | Drafts issues with acceptance criteria and dependencies from the clarified docs (`/factory-plan`) | exists |
-| `issue-selector` | Picks the next issue from the `todo` pool | exists |
-| `question-resolver` | Answers a question from the source docs, or decides it needs me (section 6) | new |
-| `human-liaison` | Sits between the factory and me for every question and blocker (section 7) | exists |
-| `ci-fixer` | Diagnoses a failed CI run, comments on the PR, attempts one fix | new |
-| `conflict-resolver` | Resolves a merge conflict using both sides' context | new |
-| `factory-discoverer` | With auto-queue on and the queue empty, compares the MVP and vision docs with what is built and filed and drafts what is missing, or nothing (section 10a) | new |
-| `harness-cleanup` | End-of-run cleanup. First job: re-check out-of-scope concerns and file the survivors | new |
+| Role | Job |
+|---|---|
+| `scout` | Maps relevant code for a task |
+| `planner` | Turns an issue plus scout context into a task plan |
+| `engineer` | Implements one task or fixes review findings |
+| `claude-reviewer` | Fallback reviewer |
+| `verifier` | Checks reviewer findings against the code |
+| `mvp-reviewer` | Checks the MVP, vision and design docs are clear and complete enough to answer builders' questions |
+| `factory-planner` | Drafts issues with acceptance criteria and dependencies from the clarified docs (`/factory-plan`) |
+| `issue-selector` | Picks the next issue from the `todo` pool |
+| `question-resolver` | Answers a question from the source docs, or decides it needs me (section 6) |
+| `human-liaison` | Sits between the factory and me for every question and blocker (section 7) |
+| `ci-fixer` | Diagnoses a failed CI run, attempts one fix and writes its diagnosis for the PR comment |
+| `conflict-resolver` | Resolves a merge conflict using both sides' context |
+| `factory-discoverer` | With auto-queue on and the queue empty, compares the MVP and vision docs with what is built and filed and drafts what is missing, or nothing (section 10a) |
+| `harness-cleanup` | End-of-run cleanup. First job: re-check out-of-scope concerns and file the survivors |
 
-Planning from the MVP document (step 4). The care goes into the documents, not into approving issues.
-`/factory-plan <mvp doc>` first has `mvp-reviewer` write an `understanding.md` (what it thinks the project is,
-in and out of scope, decisions the documents already make) and a `gaps.json`: it invents 12 to 20 questions a
-builder would raise, checks whether the documents settle each, and keeps the unsettled ones with a proposed
-answer, whether the question is product or implementation, and whether it cascades. I confirm or correct the
-understanding, then answer the gaps in batches (product questions and cascading ones first; I can accept low-impact
-proposals in bulk, recorded as assumed). Every answer is appended to `.factory/decisions.md` with
-`harness factory decide`; `question-resolver` and the planners treat that file as a source document, so the same
-question is never asked twice. Inside a git repo `factory decide` never touches `decisions.md` (unless the project
-gitignores it): the entry goes to `.factory/decisions.pending.md`, which git never sees and which every reader reads alongside it, so an answer recorded
-while some issue's branch is checked out is visible at once, never rides along in that issue's PR and never leaves
-the base branch dirty. The supervisor moves pending entries into `decisions.md` at quiet points (when it starts and
-after each issue, on a clean base branch that matches origin) as one commit, the file's first commit included: pushed directly when the base branch is unprotected, as a
-pull request when it is protected or the push is refused (squash-merged under merge policy auto; otherwise, or if
-the merge is refused, left open with one `decisions PR needs your merge` line). Until that lands the pending file
-stays. Branch creation ignores uncommitted changes to `.factory/decisions.md`. Only then does `factory-planner` draft the issues and `harness factory
-issues-create` make them, with no approval gate, dependencies first, `Depends on #N` lines, existing titles
-skipped, each logged to `.factory/log.jsonl`. The checks on the draft (unique keys and titles, known dependencies,
-no cycles) run inside `issues-create`; `--dry-run` is the planner's self-check. Issues never get `todo`: I tell
-the manager which issues to work on and the run loop (step 5) labels them. `harness factory labels` creates the
-section 8 state labels.
+Planning from the MVP document. The care goes into the documents, not into approving issues.
+- `/factory-plan <mvp doc>` first has `mvp-reviewer` write an `understanding.md` (what it thinks the project is, in
+  and out of scope, decisions the documents already make) and a `gaps.json`: it invents 12 to 20 questions a builder
+  would raise, checks whether the documents settle each, and keeps the unsettled ones with a proposed answer, whether
+  the question is product or implementation, and whether it cascades.
+- I confirm or correct the understanding, then answer the gaps in batches (product questions and cascading ones
+  first; I can accept low-impact proposals in bulk, recorded as assumed).
+- Every answer is appended to `.factory/decisions.md` with `harness factory decide`; `question-resolver` and the
+  planners treat that file as a source document, so the same question is never asked twice.
+- Only then does `factory-planner` draft the issues and `harness factory issues-create` make them, with no approval
+  gate, dependencies first, `Depends on #N` lines, existing titles skipped, each logged to `.factory/log.jsonl`. The
+  checks on the draft (unique keys and titles, known dependencies, no cycles) run inside `issues-create`; `--dry-run`
+  is the planner's self-check.
+- Issues never get `todo`: I tell the manager which issues to work on and the run loop labels them.
+  `harness factory labels` creates the section 8 state labels.
+
+How decisions reach git. Inside a git repo `factory decide` never touches `decisions.md` (unless the project
+gitignores it): the entry goes to `.factory/decisions.pending.md`, which git never sees and which every reader reads
+alongside it. So an answer recorded while some issue's branch is checked out is visible at once, never rides along in
+that issue's PR and never leaves the base branch dirty. The supervisor moves pending entries into `decisions.md` at
+quiet points (when it starts and after each issue, on a clean base branch that matches origin) as one commit: pushed
+directly when the base branch is unprotected, as a pull request when it is protected or the push is refused
+(squash-merged under merge policy auto; otherwise, or if the merge is refused, left open with one
+`decisions PR needs your merge` line). Until that lands the pending file stays. Branch creation ignores uncommitted
+changes to `.factory/decisions.md`.
 
 Git permissions by role: only the factory manager and the roles below may commit, push, create PRs or
 merge, and only in factory mode (section 11). `scout`, `planner` and the reviewers stay read-only
@@ -108,7 +116,10 @@ PR branch they were launched on. The factory manager creates and merges PRs.
 
 ## 5. Harness recipes
 
-A recipe is a short TOML file. Sketch for `harnesses/ship.toml`:
+Not built as files. The ship pipeline lives in `skills/ship/SKILL.md` (and `skills/factory-issue/SKILL.md` for the
+headless version), its limits in `[loop]` in `scripts/defaults.toml`, and the CI-fix and conflict steps in the
+supervisor. The recipe idea is kept here as the intended shape if the pipeline is ever made data-driven. Sketch for
+a `harnesses/ship.toml`:
 
 ```toml
 name = "ship"
@@ -190,7 +201,7 @@ significant. Implementation freedom is wide, product freedom is narrow: the visi
 Each project needs a vision source (a section in the MVP doc or a `VISION.md`). `question-resolver`
 treats it as authoritative for product questions.
 
-How it is wired (step 7b): `/factory-issue` sends every question that /ship would ask the user to the
+How it is wired: `/factory-issue` sends every question that /ship would ask the user to the
 `question-resolver` agent (opus, read-only) first. `answered` continues with the quoted source; `assumed` is recorded
 with `factory decide --by assumed` and listed under `## Assumptions` in the PR description; `escalate` becomes
 `factory block --kind QUESTION --category ... --impact ...` with the resolver's options, which either blocks the
@@ -224,7 +235,7 @@ Blockers (raised to me, never retried)
 - A gate still failing after the review round cap.
 - CI failing a second time after `ci-fixer`'s attempt.
 - Reviewer and verifier disagreeing at the cap.
-- The usage check returning `unknown` repeatedly (default: 3 times in a row).
+- Plan usage staying unreadable for `[factory] unknown_minutes` (default 30; section 9).
 - A harness run failing or getting blocked.
 
 Not blockers: merge conflicts (go to `conflict-resolver`), a single CI failure (goes to `ci-fixer`), hitting a
@@ -242,7 +253,7 @@ Delivery goes through one function, `notify(message)`, with channels behind it.
 
 Phone access (decided 2026/11/14, issue #9)
 - Claude's own push (Remote Control, `PushNotification`) was dropped: pushes never arrived (tested 2026/11/06), and
-  since step 5 each issue runs in a headless session that exits when it blocks, so there is no live session to
+  each issue runs in a headless session that exits when it blocks, so there is no live session to
   attach to. Keeping one open per blocker would spend plan usage while waiting.
 - QUESTION and BLOCKER messages go to a Telegram bot (`scripts/phone.py`), on top of the terminal and the issue
   comment. DONE stays on the terminal. Each option is a button, the recommended one starred.
@@ -252,8 +263,8 @@ Phone access (decided 2026/11/14, issue #9)
   including one from the issue in progress; earlier blockers are not re-sent. Asking for remote without the phone set
   up is refused. A supervisor started from a phone answer is remote, so the issue's next blocker reaches the phone too.
 - What a phone message shows (issue #116): the project, the issue's number and title, the summary, what to decide,
-  then each option's label with its
-  description under the number its button carries. A button is `<n>. <label>` plus the star, 40 characters at most.
+  then each option's label with its description under the number its button carries. A button is `<n>. <label>`
+  plus the star, 40 characters at most.
   A `Details` button returns the full standard message without a model. A blocker with no options is headed
   `stopped`; an infrastructure one says it needs me at the computer and that there is nothing to decide.
 - The last line of a message says what else is going on in the project: how many more wait on me, and how many
@@ -273,9 +284,9 @@ Phone access (decided 2026/11/14, issue #9)
   matched by the message it replies to.
 - The bridge is a small long-polling process (outgoing HTTPS only, so it works from any network). A remote
   `factory run` and every blocker sent start it if it isn't running; it exits after 30 minutes with no supervisor
-  running and nothing waiting on me. While a blocker waits it holds `caffeinate -i`, because the supervisor stops (and lets the Mac
-  sleep) once every queued issue is blocked; an idle Mac still sleeps, and a closed lid on battery still sleeps.
-  `harness phone serve --forever` keeps it up (for a launchd agent).
+  running and nothing waiting on me. While a blocker waits it holds `caffeinate -i`, because the supervisor stops
+  (and lets the Mac sleep) once every queued issue is blocked; an idle Mac still sleeps, and a closed lid on battery
+  still sleeps. `harness phone serve --forever` keeps it up (for a launchd agent).
 - A tap or a reply goes to a short Sonnet session in that project, under the project's Claude account, allowed only
   `harness factory decide|queue|start|status` and file reads. It records the answer and re-queues the issue the way
   `/factory` does (starting the supervisor if it has stopped), or answers a follow-up question from the run's files.
@@ -311,11 +322,11 @@ Dependencies are written in each issue body as `Depends on #N`. The selector rea
 ## 9. The run loop
 
 ```
-start(project, merge_policy?)             # asks once: auto-merge or wait for my review (overridable per session)
+start(project, merge_policy)              # --merge auto|manual, default [factory] merge (auto)
 loop:
   usage = usage.check()                   # scripts/usage.py
   if pause:   sleep until resume_at, then continue       # no prompt to me
-  if unknown: count it; at 3 in a row raise a blocker
+  if unknown: retry with a growing wait; after unknown_minutes raise a blocker and stop
   pool = issues labelled todo, not blocked, dependencies merged
   if pool is empty: finish
   issue = issue-selector(pool)            # brief assessment; order is not label order
@@ -329,7 +340,7 @@ loop:
   at end of group: harness-cleanup (section 10)
 ```
 
-How it is built (step 5, decided 2026/11/06)
+How it is built
 - The loop is a small Python supervisor, `harness factory run [--issues 12,13] [--max-issues N] [--merge manual]`
   (engine in `scripts/factory_loop.py`, side effects injected). It spends no tokens: it checks usage, computes the
   pool, asks `issue-selector` for the order, and starts one fresh headless session per issue with
@@ -360,25 +371,30 @@ How it is built (step 5, decided 2026/11/06)
   `stop` finishes the current issue first; `stop --now` signals the supervisor, and the interrupted issue becomes
   `blocked` at the next start. Typing `harness factory run` directly still works but is not the intended path.
 - Merge policy is `--merge auto|manual` (`factory start`/`run`; default `[factory] merge`, which is `auto`: using the
-  factory means hands off; `/ship` on its own always leaves the merge to me). With
-  `manual` the issue stops at `awaiting-merge` and I merge. With `auto` the supervisor itself (no tokens) lands each
-  PR (step 6, decided 2026/11/07): `factory done` records the PR URL in `.factory/prs.json`; the supervisor polls
-  `gh pr view` (checks, mergeable) every `ci_poll` seconds up to `ci_timeout`; "no checks" counts as no CI only
-  after `ci_grace` seconds. Green or no CI: `gh pr merge --squash --delete-branch`, which closes the issue through
-  `Closes #N` and unlocks dependants. Failed CI: switch to the PR branch and start one headless `ci-fixer` session
-  (marker role `ci-fixer`, `pr_branch`), which fixes, runs the checks, pushes and writes its diagnosis to
-  `.factory/ci-fix-N.md`; the supervisor posts that as the PR comment, then waits for the new commit's checks
-  (results of the old head commit are ignored). A merge conflict goes the same way (step 7a): one headless `conflict-resolver`
-  session (marker `pr_branch` + `base_branch`) merges `origin/<base>`, keeps both sides' intent, runs the checks, pushes
-  and writes `.factory/conflict-N.md` for the PR comment; the order is conflict, then CI failure, each tried once.
-  A second failure, a conflict that remains, a closed PR, a CI timeout or a refused merge labels the issue `blocked`
-  and raises a blocker. The loop only calls `land` for
-  issues that ended `awaiting-merge`, so a manual-policy run is unchanged.
+  factory means hands off; `/ship` on its own always leaves the merge to me). With `manual` the issue stops at
+  `awaiting-merge` and I merge. With `auto` the supervisor itself (no tokens) lands each PR:
+  - `factory done` records the PR URL in `.factory/prs.json`; the supervisor polls `gh pr view` (checks, mergeable)
+    every `ci_poll` seconds up to `ci_timeout`; "no checks" counts as no CI only after `ci_grace` seconds.
+  - Green or no CI: `gh pr merge --squash --delete-branch`, which closes the issue through `Closes #N` and unlocks
+    dependants.
+  - Failed CI: switch to the PR branch and start one headless `ci-fixer` session (marker role `ci-fixer`,
+    `pr_branch`), which fixes, runs the checks, pushes and writes its diagnosis to `.factory/ci-fix-N.md`; the
+    supervisor posts that as the PR comment, then waits for the new commit's checks (results of the old head commit
+    are ignored).
+  - A merge conflict goes the same way: one headless `conflict-resolver` session (marker `pr_branch` +
+    `base_branch`) merges `origin/<base>`, keeps both sides' intent, runs the checks, pushes and writes
+    `.factory/conflict-N.md` for the PR comment. The order is conflict, then CI failure, each tried once.
+  - A second failure, a conflict that remains, a closed PR, a CI timeout or a refused merge labels the issue
+    `blocked` and raises a blocker.
+  - The loop only calls `land` for issues that ended `awaiting-merge`, so a manual-policy run is unchanged.
 - Tunables are in `[factory]` in `scripts/defaults.toml` (usage limits, the unknown-reading limit, and the
   `claude_args` passed to each headless session; it defaults to `--permission-mode acceptEdits`).
 
 Usage gate
-- Uses `scripts/usage.py`. Defaults: pause at 85% of the 5-hour window and 90% of the weekly window. `factory start --until-limit` (opt-in, per run) raises both caps to 100%: it works until the plan limit is really hit, then pauses until the window resets. An issue cut off by the limit goes back to `todo` and is retried once after the reset.
+- Uses `scripts/usage.py`. Defaults: pause at 85% of the 5-hour window and 90% of the weekly window.
+  `factory start --until-limit` (opt-in, per run) raises both caps to 100%: it works until the plan limit is really
+  hit, then pauses until the window resets. An issue cut off by the limit goes back to `todo` and is retried once
+  after the reset.
 - Checked before every harness launch, and again when an issue's session ends without an outcome (see below).
 - Pausing is silent. The factory sleeps until `resume_at` and continues without prompting. It sleeps in 5-minute
   steps against the wall clock, because one long sleep does not count the time the Mac is asleep: a pause
@@ -414,7 +430,7 @@ doing, not a duplicate. Survivors become issues labelled `backlog`, with context
 that raised them. They are never worked until I change the label to `todo`. `harness-cleanup` is the home
 for other end-of-run chores later.
 
-How it is wired (step 7c): `harness run concern "<text>" [--file F]` appends to `<run_dir>/concerns.jsonl`; the
+How it is wired: `harness run concern "<text>" [--file F]` appends to `<run_dir>/concerns.jsonl`; the
 engineer, reviewers, verifier, scout and planner use it for real out-of-scope problems (at most 3, never fixed).
 After an issue's PR is open or merged, and only when that file exists, the supervisor starts one headless
 `harness-cleanup` session (read-only; Bash limited to `gh issue list|view`, `git log|diff`). It drops concerns that are
@@ -436,24 +452,30 @@ When the pool is empty the loop calls a refill step, in this order, and goes on 
    until I relabel it" rule of section 8 is waived, and only for a run I started with the flag.
 3. **Discovery**: one headless `factory-discoverer` session (read-only; Bash limited to `gh issue list|view` and
    `git log|ls-files|grep`) reads the documents recorded by `factory docs` (written by `/factory-plan`), the
-   decisions, every existing issue and the code, and writes issues only for what the documents call for that is neither built nor filed. The
-   supervisor validates the list, cuts it to `auto_queue_per_round` (default 5, dropping issues whose dependency was
-   cut), files it with the `todo` label and logs `discovered`. No documents recorded means no discovery.
+   decisions, every existing issue and the code, and writes issues only for what the documents call for that is
+   neither built nor filed. The supervisor validates the list, cuts it to `auto_queue_per_round` (default 5, dropping
+   issues whose dependency was cut), files it with the `todo` label and logs `discovered`. No documents recorded
+   means no discovery.
 
-Limits: `auto_queue_rounds` discovery rounds per run (default 3); a round that finds nothing ends auto-queue for the
-run, which is the normal way a run finishes; `--max-issues` still caps the total; the usage gate and blockers are
-unchanged. An issue that is `todo` again after its session (a blocker answered and re-queued mid-run) is picked again
-before any refill, at most `max_runs_per_issue` times per run (default 3); issues left over by that cap are logged
-(`issues_skipped`), named in the stop line, and hold back refill and discovery. A drafted issue (discovered,
-planned or a cleanup backlog item) points at existing issues by number in one of two fields: `depends_on_issues` becomes `Depends on #N` lines,
-so a follow-up waits for unfinished work, and `related_issues` becomes `Related to #N` lines, which nothing waits for.
-Validation rejects a number that is not an issue and any open issue the text names as `#N` without listing it in one
-of the fields; a rejected discovery draft or cleanup list goes back to its agent once with the problems (a discovery draft still
-invalid after that ends auto-queue with "discovery failed", not "nothing left to build") (cleanup items still
-wrong after that are dropped, logged as `cleanup_rejected`; the issue the cleanup ran for needs no listing). Every step is logged (`auto_queue_on`, `auto_queued` with its source,
-`discovered`, `auto_queue_exhausted`) and shown in `factory status` events, but none wake the manager. Anything the
-documents leave open goes in the discoverer's `notes`, not into an invented issue. A refill failure is logged and ends
-the run cleanly.
+Limits
+- `auto_queue_rounds` discovery rounds per run (default 3). A round that finds nothing ends auto-queue for the run,
+  which is the normal way a run finishes. `--max-issues` still caps the total; the usage gate and blockers are
+  unchanged.
+- An issue that is `todo` again after its session (a blocker answered and re-queued mid-run) is picked again before
+  any refill, at most `max_runs_per_issue` times per run (default 3). Issues left over by that cap are logged
+  (`issues_skipped`), named in the stop line, and hold back refill and discovery.
+
+Links between issues. A drafted issue (discovered, planned or a cleanup backlog item) points at existing issues by
+number in one of two fields: `depends_on_issues` becomes `Depends on #N` lines, so a follow-up waits for unfinished
+work, and `related_issues` becomes `Related to #N` lines, which nothing waits for. Validation rejects a number that
+is not an issue and any open issue the text names as `#N` without listing it in one of the fields. A rejected
+discovery draft or cleanup list goes back to its agent once with the problems. A discovery draft still invalid after
+that ends auto-queue with "discovery failed", not "nothing left to build"; cleanup items still wrong after that are
+dropped and logged as `cleanup_rejected` (the issue the cleanup ran for needs no listing).
+
+Every step is logged (`auto_queue_on`, `auto_queued` with its source, `discovered`, `auto_queue_exhausted`) and shown
+in `factory status` events, but none wake the manager. Anything the documents leave open goes in the discoverer's
+`notes`, not into an invented issue. A refill failure is logged and ends the run cleanly.
 
 ## 11. Personal and professional split
 
@@ -474,8 +496,8 @@ This boundary must always hold.
 - Factory mode only lifts the subagent denial, and only for: `engineer` add/commit on `issue_branch` (no
   `add -A`/`.`, no `--no-verify`); `ci-fixer` and `conflict-resolver` `git push [origin [<branch>]]` of
   `pr_branch` (no flags, refspecs or URL remotes). `conflict-resolver` also merges `origin/<base_branch>` (or
-  `--abort`) into `pr_branch` and may add/commit there, so it never rebases or force-pushes. It never skips the account check (a work-account session is
-  still denied), and never lifts force/delete pushes, protected branches, `--amend`, rebase, token/host overrides
+  `--abort`) into `pr_branch` and may add/commit there, so it never rebases or force-pushes. It never skips the
+  account check (a work-account session is still denied), and never lifts force/delete pushes, protected branches, `--amend`, rebase, token/host overrides
   or gh account switching. The manager's own powers are unchanged: they already come from the main-session rules.
 - The launcher is `harness factory launch [--role manager|engineer|ci-fixer|conflict-resolver] [--issue-branch B]
   [--pr-branch B] [--base-branch B] [-- <command...>]` (default command: `claude`). It refuses professional
@@ -511,17 +533,23 @@ This boundary must always hold.
 The guard change is the riskiest part of this design. It gets its own tests, including: marker absent,
 marker with the wrong directory, and a subagent without push rights.
 
-## 12. Build order
+## 12. Status
 
-1. Rename the repo and fix paths (section 14).
-2. Factory-mode guard with tests. Nothing else is safe without it.
-3. `notify()` with the terminal channel, and `human-liaison` with the standard format. (done)
-4. `factory-planner` and issue creation from an MVP doc, with my approval of the issue list. (done)
-5. Run loop with `issue-selector`, the ship recipe, manual merge, and the usage gate with pause and resume. (done; run on callback #17)
-6. Auto-merge, CI wait, `ci-fix` recipe. (done; not yet run on a real project)
-7. `question-resolver`, `conflict-resolve`, `harness-cleanup`. (done; not yet run on a real project)
-8. Phone channel: blockers to a Telegram bot, answered from the phone (#9). (done; not yet run on a real blocker)
-9. First real project: callback. (in progress: issue #17 reached an open PR through the whole pipeline; see section 16)
+Everything in sections 4 to 11 is built and merged, with one exception: recipes as TOML files (section 5).
+
+Not checked on a real run yet (unit tested only):
+- A blocker answered from the phone, the plain-language phone messages (#116) and the `--remote` switch (#122).
+- Nighttime mode over a real night: `usage_resume` with `late_min`, and `usage_requeued`.
+- The fixes for re-queued issues, decisions outside the working tree and the selector's data (#113 to #115).
+- Listed as unseen on 2026/11/09 and not re-checked for this document: the `ci-fixer` and `conflict-resolver`
+  sessions, `question-resolver` on a real question, and `harness-cleanup` filing backlog issues.
+
+Worth knowing when running it
+- Updating the plugin is not enough: restart the `/factory` session and stop any old supervisor, because the
+  supervisor runs the plugin build it was started from.
+- Headless sessions can't prompt, so commands must be plain and one per call (no `&&`, `|`, `cd`, `git -C`) and
+  anything repo-specific has to be allow-listed; see `docs/factory-allowlist.md`.
+- `factory done` refuses a session that skipped the pipeline: it checks for a plan and a review.
 
 ## 13. Not in v1
 
@@ -532,41 +560,10 @@ marker with the wrong directory, and a subagent without push rights.
 - Smart blocker summarising beyond the standard format.
 - Retrying failed harness runs.
 
-## 14. Rename (done 2026/11/06)
+## 14. Open items
 
-The repo was renamed from `claude-harness` to `software-factory` (GitHub repo, remote URL, folder
-`~/code/software-factory`). Places that held the old name or path were updated: `~/.claude/settings.json`
-(marketplace path, guard hook, statusline), the plugin registry, `~/.zshrc`, the personal account config
-in `~/.claude-personal`, the README and `scripts/claude-accounts.sh`.
-
-- The plugin name stays `harness`, so `/ship` and the `harness:` agent prefix are unchanged.
-- Session history under the old folder name does not carry over.
-- Issues and PRs created before the rename keep working through GitHub's redirect.
-
-## 15. Open items
-
-- `ci-fixer` can't comment on the PR itself (`gh pr comment` is blocked for worker sessions), so it writes its diagnosis to `.factory/ci-fix-N.md` and the supervisor posts it. Issue #21 (letting the worker comment) is no longer needed for v1.
+- `ci-fixer` can't comment on the PR itself (`gh pr comment` is blocked for worker sessions), so it writes its
+  diagnosis to `.factory/ci-fix-N.md` and the supervisor posts it.
 - Confirm what the usage probe reports when I am near or over a limit (the `status` field values are unseen).
+- #7 (BM25 ranking for the scout) stays open.
 
-## 16. Where things stand (2026/11/09) and what is next
-
-Steps 1 to 7 are built and merged. Step 9 has started on callback; a few real runs of issue #17 exposed these
-problems, all fixed: headless sessions need the plugin directory (`--add-dir`), commands must be plain and
-one-per-call (no `&&`, `|`, `cd`, `git -C`), a skill's `allowed-tools` does not hold up in print mode so the
-supervisor passes `--allowedTools` for `git add|commit -F|push|status` and `gh pr create`, a session must not skip
-the pipeline (`factory done` checks for a plan and a review), and the fallback reviewer's `review-N.json` counts as a review.
-Updating the plugin is not enough: restart the `/factory` session and stop any old supervisor, because the
-supervisor runs the plugin build it was started from.
-
-Not yet seen on a real run (only unit tested):
-- `factory done` accepting a run, the CI wait, and the auto-merge (callback PR #38 for #17 was merged by hand).
-- The `ci-fixer` and `conflict-resolver` sessions and their `--allowedTools` lists; the guard with `git merge origin/<base>`.
-- `question-resolver` (a session that hits a question), `harness-cleanup` and the backlog issues it files.
-- `/factory-plan` end to end, and the Monitor waking an idle manager session. Subagent permission denials in headless runs.
-
-Next, in order:
-1. Run a small second issue on callback with `/factory work on N`: checks done, CI wait and auto-merge, and the quiet event watch.
-2. Force the other paths once: a throwaway PR with a failing test (ci-fixer) and one that conflicts with the base (conflict-resolver).
-3. Run `/factory-plan` on a real MVP document, then let the factory build a short chain of dependent issues.
-4. Set up the Telegram bot (`harness phone setup`) and answer a real blocker from the phone.
-5. Optional: set `DEEPSEEK_API_KEY` so review uses the external reviewer instead of the Claude fallback; #7 (BM25 for the scout) stays open.
