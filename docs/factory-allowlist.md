@@ -2,7 +2,7 @@
 
 Factory issue sessions run headless, so any Bash command that is not pre-approved is denied
 (subagents cannot prompt). The factory pre-approves a generic set in `scripts/harness.py`
-(`ISSUE_ALLOWED`). Anything specific to one repo belongs in **that repo**, not here:
+(`ISSUE_ALLOWED_RULES`). Anything specific to one repo belongs in **that repo**, not here:
 
 ```toml
 # <repo>/.claude/harness.toml
@@ -44,7 +44,7 @@ the rules below; a rejected rule is dropped and logged as `allow_rule_rejected`.
 
 Read-only git and `gh issue`, `npm run`/`npm test`, `npm install`/`npm ci`, `npx tsc|vitest|vite|jest`, the harness
 gates and the localhost browser checks are already allowed for every project. If several repos need the same new command, add it
-to `ISSUE_ALLOWED` in the factory instead.
+to `ISSUE_ALLOWED_RULES` in the factory instead.
 
 ## Other package managers
 
