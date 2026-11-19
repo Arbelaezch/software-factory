@@ -390,7 +390,7 @@ How it is built
   `claude_args` passed to each headless session; it defaults to `--permission-mode acceptEdits`).
 
 Usage gate
-- Uses `scripts/usage.py`. Defaults: pause at 85% of the 5-hour window and 90% of the weekly window.
+- Uses `scripts/usage.py`. Defaults: pause at 85% of the 5-hour window and 60% of the weekly window.
   `factory start --until-limit` (opt-in, per run) raises both caps to 100%: it works until the plan limit is really
   hit, then pauses until the window resets. An issue cut off by the limit goes back to `todo` and is retried once
   after the reset.
