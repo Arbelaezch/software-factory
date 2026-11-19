@@ -42,7 +42,7 @@ Event stream: `${CLAUDE_PROJECT_DIR}/.factory/events.log`
   --why "<their reasoning if given>"`, then re-queue the issue: `H factory queue N`. If the supervisor has stopped
   (pool was empty), run `H factory start --issues N` instead: it queues the issue itself, so don't run both. If the answer is "skip it" or "not now", don't queue it.
 - **"keep going until the limit" / "use all my usage"** (only when the user says so; never by default): add
-  `--until-limit` to `H factory start`. It ignores the usual usage caps (85% of the 5-hour window, 90% weekly) and
+  `--until-limit` to `H factory start`. It ignores the usual usage caps (85% of the 5-hour window, 60% weekly) and
   pauses only when the plan limit itself is hit, resuming after the reset. Tell them in one line that an issue
   cut off by the limit goes back to `todo` and is retried once after the reset. It applies to that start only.
 - **"keep yourself busy" / "queue your own work" / "let it loose" / "run the whole plan"** (only when the user says

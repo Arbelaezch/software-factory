@@ -695,7 +695,7 @@ echo "args: $@"
                 f = root / ".factory" / "run-settings.json"
                 f.write_text(json.dumps({**json.loads(f.read_text()), "auto_queue": True, "until_limit": True}))
         events, created, discovers, issue_runs, checks, _ = self.discovery_run(auto_queue=False, on_check=switch)
-        self.assertEqual(checks[0], {"five_hour": 85.0, "seven_day": 90.0})
+        self.assertEqual(checks[0], {"five_hour": 85.0, "seven_day": 60.0})
         self.assertEqual(checks[-1], {"five_hour": 100.0, "seven_day": 100.0})
         self.assertEqual((created, len(issue_runs)), ([{"enhancement", "todo"}], 1))  # auto-queue found and ran #7
 

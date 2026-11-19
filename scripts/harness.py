@@ -6512,7 +6512,7 @@ def cmd_factory_status(a, cfg):
         print("supervisor: not running")
     fc = cfg.get("factory") or {}
     u = usage.decide(usage.read_snapshot(usage.snapshot_path(project_account_dir(cfg)), max_age=900),
-                     {"five_hour": float(fc.get("max_five_hour", 85)), "seven_day": float(fc.get("max_weekly", 90))})
+                     {"five_hour": float(fc.get("max_five_hour", 85)), "seven_day": float(fc.get("max_weekly", 60))})
     print(f"usage: {u['decision']}" + (f" ({'; '.join(u['reasons'])})" if u["reasons"] else ""))
 
     issues = gh_json("issue", "list", "--repo", slug, "--state", "all", "--limit", "500",
@@ -6839,7 +6839,7 @@ def run_factory_loop(a, cfg, fl, usage, fc, slug, fetch):
     def limits():
         if settings()["until_limit"]:  # opt-in: work until a window is really full, then pause until it resets
             return {"five_hour": 100.0, "seven_day": 100.0}
-        return {"five_hour": float(fc.get("max_five_hour", 85)), "seven_day": float(fc.get("max_weekly", 90))}
+        return {"five_hour": float(fc.get("max_five_hour", 85)), "seven_day": float(fc.get("max_weekly", 60))}
 
     def unknown_window():  # minutes of unreadable usage before the factory stops
         if settings()["nighttime"]:

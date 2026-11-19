@@ -91,7 +91,7 @@ off by default and apply to that run only.
 |---|---|---|
 | `--issues 12,13` | "work on 12 and 13" | Queue these issues and run them. Without it, runs what is already labelled `todo` |
 | `--merge manual` | "let me merge" | Leave PRs open for me. Default `auto`: wait for CI, one fix attempt, squash-merge |
-| `--until-limit` | "use all my usage" | Ignore the usage caps (85% of the 5-hour window, 90% weekly); pause only at the plan limit itself |
+| `--until-limit` | "use all my usage" | Ignore the usage caps (85% of the 5-hour window, 60% weekly); pause only at the plan limit itself |
 | `--auto-queue` | "keep yourself busy" | When the queue is empty, queue planned and backlog issues, then discover new ones from the MVP documents. Needs `--merge auto` |
 | `--nighttime` | "run overnight" | Keep going through hours of unreadable plan usage instead of stopping after 30 minutes |
 | `--remote` | "I'm heading out" | Also send questions and blockers to my phone (Telegram). Without it they stay in the `/factory` session |
